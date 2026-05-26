@@ -1,0 +1,9 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+jinja2==3.1.4
+python-multipart==0.0.9
+pydantic==2.8.2
+selenium>=4.23,<5
+webdriver-manager>=4.0,<5
+pdfplumber>=0.11,<1
+extract-msg>=0.54,<1
