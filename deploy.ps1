@@ -1,48 +1,47 @@
-# deploy.ps1 — обновить сервер до последней версии из GitHub.
-# Запускать НА СЕРВЕРЕ из папки проекта:  .\deploy.ps1
+# deploy.ps1 - update the server to the latest version from GitHub.
+# Run ON THE SERVER from the project folder:  .\deploy.ps1
 #
-# config.py, *.db, папки data/runs, uploads и т.п. в .gitignore —
-# git их не трогает, локальные данные сервера сохраняются.
+# config.py, *.db, data/runs, uploads etc. are gitignored - git never
+# touches them, local server data is preserved.
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-Write-Host "== Текущая версия ==" -ForegroundColor Cyan
+Write-Host "== Current version ==" -ForegroundColor Cyan
 git log -1 --oneline
 
-Write-Host "`n== Проверяю обновления ==" -ForegroundColor Cyan
+Write-Host "`n== Checking for updates ==" -ForegroundColor Cyan
 git fetch origin
 
-$behind = (git rev-list --count HEAD..origin/master).Trim()
+$behind = (git rev-list --count HEAD..origin/main).Trim()
 if ($behind -eq '0') {
-    Write-Host "Уже актуально, обновлять нечего." -ForegroundColor Green
+    Write-Host "Already up to date." -ForegroundColor Green
     exit 0
 }
-Write-Host "Новых коммитов: $behind" -ForegroundColor Yellow
-git log --oneline HEAD..origin/master
+Write-Host "New commits: $behind" -ForegroundColor Yellow
+git log --oneline HEAD..origin/main
 
 $before = (git rev-parse HEAD).Trim()
 
-git pull --ff-only origin master
+git pull --ff-only origin main
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "`nfast-forward невозможен (история переписана?) — жёсткий сброс на origin/master." -ForegroundColor Yellow
-    Write-Host "Незакоммиченные изменения в отслеживаемых файлах будут потеряны." -ForegroundColor Yellow
-    $ans = Read-Host "Продолжить? (yes/no)"
+    Write-Host "`nFast-forward not possible (history rewritten?) - hard reset to origin/main." -ForegroundColor Yellow
+    Write-Host "Uncommitted changes to TRACKED files will be lost." -ForegroundColor Yellow
+    $ans = Read-Host "Continue? (yes/no)"
     if ($ans -ne 'yes') { exit 1 }
-    git reset --hard origin/master
+    git reset --hard origin/main
 }
 
-# Обновить зависимости, если менялся requirements.txt
 $after = (git rev-parse HEAD).Trim()
 $changed = git diff --name-only $before $after
 if ($changed -match 'requirements\.txt') {
-    Write-Host "`n== requirements.txt изменился — ставлю зависимости ==" -ForegroundColor Cyan
+    Write-Host "`n== requirements.txt changed - installing deps ==" -ForegroundColor Cyan
     $py = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
     if (-not (Test-Path $py)) { $py = 'python' }
     & $py -m pip install -r requirements.txt
 }
 
-Write-Host "`n== Готово. Версия на сервере: ==" -ForegroundColor Green
+Write-Host "`n== Done. Server version: ==" -ForegroundColor Green
 git log -1 --oneline
-Write-Host "`nПерезапустите приложение, чтобы изменения вступили в силу:" -ForegroundColor Yellow
-Write-Host "  - если запущено вручную: закрыть терминал uvicorn и запустить .\run-server.ps1" -ForegroundColor Yellow
-Write-Host "  - если служба: Restart-Service <имя>" -ForegroundColor Yellow
+Write-Host "`nRestart the app to apply changes:" -ForegroundColor Yellow
+Write-Host "  - if run manually: close the uvicorn terminal and run .\run-server.ps1" -ForegroundColor Yellow
+Write-Host "  - if a service:    Restart-Service <name>" -ForegroundColor Yellow
