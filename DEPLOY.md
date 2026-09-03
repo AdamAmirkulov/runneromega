@@ -47,13 +47,22 @@ cd C:\Users\Администратор\Desktop\runneromega-main
 
 ---
 
+## Окружение Python
+
+Изолированный `.venv` (Python 3.14). Все пакеты в `requirements.txt` идут
+с готовыми колёсами под 3.14 — компилятор не нужен. Создать/пересоздать:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup-venv.ps1
+```
+`.venv` в `.gitignore` — на каждой машине свой.
+
 ## Запуск приложения на сервере
 
-Сейчас — вручную:
+Вручную:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run-server.ps1
 ```
-(uvicorn app:app на 0.0.0.0:8000, без auto-reload)
+(uvicorn app:app на 0.0.0.0:8000, без auto-reload; берёт `.venv`, иначе системный python)
 
 Чтобы крутилось само и рестартилось одной командой — можно завести
 службу Windows (NSSM). Тогда `deploy.ps1` сможет делать `Restart-Service`.

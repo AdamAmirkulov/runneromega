@@ -47,10 +47,7 @@ $dirty = (git status --porcelain | Measure-Object).Count
 Write-Host ("uncommitted (expect 0):    " + $dirty)
 
 Write-Host "`n== 6. Rebuild .venv ==" -ForegroundColor Cyan
-if (Test-Path .venv) { Remove-Item -Recurse -Force .venv }
-py -3.14 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip --quiet
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+& (Join-Path $PSScriptRoot 'setup-venv.ps1')
 
 Write-Host "`n== DONE ==" -ForegroundColor Green
 Write-Host "Start the app:  powershell -ExecutionPolicy Bypass -File .\run-server.ps1" -ForegroundColor Yellow

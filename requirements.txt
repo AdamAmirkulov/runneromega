@@ -1,9 +1,49 @@
-fastapi==0.115.0
-uvicorn==0.30.6
-jinja2==3.1.4
-python-multipart==0.0.9
-pydantic==2.8.2
-selenium>=4.23,<5
-webdriver-manager>=4.0,<5
-pdfplumber>=0.11,<1
-extract-msg>=0.54,<1
+# Python 3.14, Windows. Ставится в системный Python:
+#   python -m pip install -r requirements.txt
+
+# --- Веб-приложение ---
+fastapi==0.128.1
+uvicorn==0.40.0
+python-multipart==0.0.22
+jinja2==3.1.6
+pydantic==2.12.5
+SQLAlchemy==2.0.48
+bcrypt==5.0.0
+
+# --- Excel / данные ---
+openpyxl==3.1.5
+pandas==2.3.3
+numpy==2.3.5
+
+# --- Word / PDF ---
+python-docx==1.2.0
+docx2pdf==0.1.8
+PyMuPDF==1.27.1
+pdfplumber==0.11.9
+pdfminer.six==20251230
+pypdf==6.5.0
+pillow==12.0.0
+
+# --- .msg письма ---
+extract-msg==0.55.0
+
+# --- Веб-автоматизация ---
+selenium==4.39.0
+webdriver-manager==4.0.2
+requests==2.32.5
+beautifulsoup4==4.13.5
+lxml==6.0.2
+
+# --- Google Sheets ---
+gspread==6.2.1
+google-auth==2.41.1
+google-auth-oauthlib==1.2.3
+
+# --- CRM (MS SQL) ---
+pyodbc==5.3.0
+
+# --- Нестрогое сравнение ФИО / прочее ---
+rapidfuzz>=3.9
+fuzzywuzzy==0.18.0
+tqdm==4.67.1
+pywin32==311

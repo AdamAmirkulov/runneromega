@@ -24,8 +24,8 @@ $before = (git rev-parse HEAD).Trim()
 
 git pull --ff-only origin main
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "`nFast-forward not possible (history rewritten?) - hard reset to origin/main." -ForegroundColor Yellow
-    Write-Host "Uncommitted changes to TRACKED files will be lost." -ForegroundColor Yellow
+    Write-Host "`nFast-forward not possible - hard reset to origin/main." -ForegroundColor Yellow
+    Write-Host "Uncommitted changes to TRACKED files will be lost (config.py / DBs are safe - gitignored)." -ForegroundColor Yellow
     $ans = Read-Host "Continue? (yes/no)"
     if ($ans -ne 'yes') { exit 1 }
     git reset --hard origin/main
@@ -34,7 +34,7 @@ if ($LASTEXITCODE -ne 0) {
 $after = (git rev-parse HEAD).Trim()
 $changed = git diff --name-only $before $after
 if ($changed -match 'requirements\.txt') {
-    Write-Host "`n== requirements.txt changed - installing deps ==" -ForegroundColor Cyan
+    Write-Host "`n== requirements.txt changed - updating deps ==" -ForegroundColor Cyan
     $py = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
     if (-not (Test-Path $py)) { $py = 'python' }
     & $py -m pip install -r requirements.txt
@@ -42,6 +42,4 @@ if ($changed -match 'requirements\.txt') {
 
 Write-Host "`n== Done. Server version: ==" -ForegroundColor Green
 git log -1 --oneline
-Write-Host "`nRestart the app to apply changes:" -ForegroundColor Yellow
-Write-Host "  - if run manually: close the uvicorn terminal and run .\run-server.ps1" -ForegroundColor Yellow
-Write-Host "  - if a service:    Restart-Service <name>" -ForegroundColor Yellow
+Write-Host "`nRestart the app: close the uvicorn window and run  .\run-server.ps1" -ForegroundColor Yellow
