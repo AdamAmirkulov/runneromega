@@ -1,4 +1,6 @@
 # app.py
+import ast
+import os
 import uuid
 import shutil
 import subprocess
@@ -86,6 +88,74 @@ def runner_loop():
 def render(html: str, **ctx):
     template = env.from_string(html)
     return template.render(**ctx)
+
+
+# ─────────────────────────────────────────────────────────────
+#  Папка-корень для скриптов переименования / конвертации.
+#
+#  Сотрудники запускают эти скрипты с разных компьютеров, где сетевая
+#  шара смонтирована по-разному (Z:\, \\SRVAPP\..., \\192.168.1.x\...).
+#  Скрипт же выполняется на сервере, поэтому путь должен быть таким,
+#  каким его видит СЕРВЕР приложения. Задаётся один раз на сервере —
+#  в переменной окружения RENAME_ROOT или строкой
+#      RENAME_ROOT = r'...'
+#  в scripts/config.py (этот файл свой на каждой машине, см. .gitignore).
+#  В форме сотрудник только выбирает подпапку из выпадающего списка.
+# ─────────────────────────────────────────────────────────────
+def _rename_root() -> Optional[Path]:
+    env_val = os.environ.get("RENAME_ROOT")
+    if env_val:
+        return Path(env_val.strip().strip('"'))
+    cfg = BASE_DIR / "scripts" / "config.py"
+    if cfg.exists():
+        try:
+            tree = ast.parse(cfg.read_text(encoding="utf-8"))
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "RENAME_ROOT" for t in node.targets
+                ):
+                    val = ast.literal_eval(node.value)
+                    return Path(val) if val else None
+        except Exception:
+            return None
+    return None
+
+
+def list_rename_folders() -> list:
+    """Непосредственные подпапки RENAME_ROOT, новые — первыми."""
+    root = _rename_root()
+    if not root:
+        return []
+    try:
+        subs = [p for p in root.iterdir() if p.is_dir()]
+        subs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    return [{"value": p.name, "label": p.name} for p in subs]
+
+
+def resolve_rename_folder(raw: str) -> Optional[str]:
+    """Превращает выбор из формы в абсолютный путь, который получит скрипт.
+
+    Принимает: имя подпапки (или вложенный относительный путь) внутри
+    RENAME_ROOT, либо — как запасной вариант — уже готовый абсолютный путь.
+    Любой относительный путь резолвится строго внутри RENAME_ROOT (защита
+    от '..' и подстановки чужого пути)."""
+    raw = (raw or "").strip().strip('"')
+    if not raw:
+        return None
+    p = Path(raw)
+    if p.is_absolute():
+        return str(p) if p.is_dir() else None
+    root = _rename_root()
+    if not root:
+        return None
+    cand = (root / raw).resolve()
+    try:
+        cand.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return str(cand) if cand.is_dir() else None
 
 
 _scheduler_ran_today = {}  # {(schedule_id, "YYYY-MM-DD"): True}
@@ -973,6 +1043,28 @@ button:hover { background: #0056b3; }
             {% endfor %}
           </select>
 
+        {% elif p.type == 'folder' %}
+          {% if folder_options %}
+            <select name="{{ p.name }}">
+              <option value="">— выберите папку —</option>
+              {% for opt in folder_options %}
+                <option value="{{ opt.value }}">{{ opt.label }}</option>
+              {% endfor %}
+            </select>
+            <small style="display:block;color:#666;margin-top:6px;">
+              Папки на сервере{% if rename_root %} ({{ rename_root }}){% endif %}, новые — сверху.
+              Нет нужной? <a href="javascript:location.reload()">обновить список</a>.
+            </small>
+          {% else %}
+            <div style="padding:10px 12px;background:#fff3cd;border:1px solid #ffe08a;border-radius:4px;color:#7a5b00;">
+              ⚠ Список папок с сервера недоступен{% if rename_root %} (корень: {{ rename_root }}){% endif %}.
+              Задайте <code>RENAME_ROOT</code> в <code>scripts/config.py</code> на сервере
+              или впишите полный путь вручную ниже.
+            </div>
+          {% endif %}
+          <input name="{{ p.name }}__manual" type="text" style="margin-top:8px;"
+                 placeholder="…или вручную: имя подпапки, либо полный путь как его видит сервер">
+
         {% else %}
           <input name="{{ p.name }}" type="text">
         {% endif %}
@@ -1374,6 +1466,10 @@ def run_form(
     # из выбора в шапке сайта (admin/manager) или из привязки пользователя (operator).
     _, active_company = _resolve_active_company(current_user, session_id, None, db)
 
+    has_folder = any(p.get("type") == "folder" for p in script.params)
+    folder_options = list_rename_folders() if has_folder else []
+    rename_root = _rename_root() if has_folder else None
+
     return render(
         RUN_HTML,
         script=script,
@@ -1381,6 +1477,8 @@ def run_form(
         min_datetime=min_datetime,
         needs_company=needs_company,
         active_company=active_company,
+        folder_options=folder_options,
+        rename_root=str(rename_root) if rename_root else None,
     )
 
 
@@ -1418,6 +1516,20 @@ async def run_submit(
                 contents = await upload.read()
                 dest.write_bytes(contents)
                 params[p["name"]] = str(dest)
+        elif p["type"] == "folder":
+            # Из выпадающего списка или из поля ручного ввода (оно приоритетнее)
+            raw = (form.get(p["name"] + "__manual") or form.get(p["name"]) or "").strip()
+            resolved = resolve_rename_folder(raw)
+            if resolved is None:
+                return HTMLResponse(
+                    "⛔ Папка не найдена или путь недопустим: "
+                    f"<b>{raw or '(пусто)'}</b><br><br>"
+                    "Выберите папку из списка. Если списка нет — проверьте RENAME_ROOT "
+                    "в scripts/config.py на сервере.<br>"
+                    '<a href="javascript:history.back()">← назад</a>',
+                    status_code=400,
+                )
+            params[p["name"]] = resolved
         else:
             if field is not None:
                 params[p["name"]] = str(field)

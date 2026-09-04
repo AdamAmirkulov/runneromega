@@ -1,8 +1,15 @@
 import os
 import re
+import argparse
 
-# Папка с PDF-файлами
-base_folder = r'C:\Users\User\Desktop\Отмены'
+# Папка с PDF-файлами: приоритет — аргумент из веб-формы (--source_folder),
+# затем рабочая папка задачи (--workdir), затем локальный дефолт.
+parser = argparse.ArgumentParser()
+parser.add_argument("--source_folder", default=None)
+parser.add_argument("--workdir", default=None)
+args, _ = parser.parse_known_args()
+
+base_folder = args.source_folder or args.workdir or r'C:\Users\User\Desktop\Отмены'
 
 # Обход всех PDF-файлов в папке (без подпапок)
 for root, dirs, files in os.walk(base_folder):

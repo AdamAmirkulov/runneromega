@@ -1,5 +1,6 @@
 import os
 import re
+import argparse
 import fitz  # PyMuPDF
 from datetime import datetime
 import sys
@@ -8,8 +9,14 @@ import io
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-# Путь к папке
-base_folder = r"\\PC002\work folder\Госпошлины"
+
+# Путь к папке: приоритет — аргумент из веб-формы (--source_folder),
+# затем рабочая папка задачи (--workdir), затем локальный дефолт.
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--source_folder", default=None)
+_parser.add_argument("--workdir", default=None)
+_args, _ = _parser.parse_known_args()
+base_folder = _args.source_folder or _args.workdir or r"\\PC002\work folder\Госпошлины"
 def latest_year_dir(root: str) -> str | None:
     now_year = str(datetime.now().year)
     candidates = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]

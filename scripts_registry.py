@@ -290,7 +290,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         description="Переименование файлов для продукта ММ",
         command=["python", "-u", "scripts/rename_mm.py"],
         params=[
-            {"name": "source_folder", "label": "Исходная папка", "type": "text"},
+            {"name": "source_folder", "label": "Исходная папка", "type": "folder"},
         ],
     ),
     
@@ -300,7 +300,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         description="Переименование файлов для продукта Lime",
         command=["python", "-u", "scripts/rename_lime.py"],
         params=[
-            {"name": "source_folder", "label": "Исходная папка", "type": "text"},
+            {"name": "source_folder", "label": "Исходная папка", "type": "folder"},
         ],
     ),
     
@@ -310,7 +310,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         description="Переименование файлов для продукта Vivus",
         command=["python", "-u", "scripts/rename_vivus.py"],
         params=[
-            {"name": "source_folder", "label": "Исходная папка", "type": "text"},
+            {"name": "source_folder", "label": "Исходная папка", "type": "folder"},
         ],
     ),
     
@@ -320,7 +320,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         description="Переименование файлов для продукта Solva",
         command=["python", "-u", "scripts/rename_solva.py"],
         params=[
-            {"name": "source_folder", "label": "Исходная папка", "type": "text"},
+            {"name": "source_folder", "label": "Исходная папка", "type": "folder"},
         ],
     ),
     
@@ -330,7 +330,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         description="Разделяет PDF на Досудебную претензию и Уведомление об уступки права, переименовывает по ФИО и ИИН",
         command=["python", "-u", "scripts/bereke_split_rename.py"],
         params=[
-            {"name": "source_folder", "label": "Исходная папка", "type": "text"},
+            {"name": "source_folder", "label": "Исходная папка", "type": "folder"},
         ],
     ),
 
@@ -340,7 +340,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         description="Переименование файлов госпошлин",
         command=["python", "-u", "scripts/gp_rename.py"],
         params=[
-            {"name": "source_folder", "label": "Исходная папка", "type": "text"},
+            {"name": "source_folder", "label": "Исходная папка", "type": "folder"},
         ],
     ),
     
@@ -350,7 +350,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         description="Переименование исполнительных надписей",
         command=["python", "-u", "scripts/nadpisi_rename.py"],
         params=[
-            {"name": "source_folder", "label": "Исходная папка", "type": "text"},
+            {"name": "source_folder", "label": "Исходная папка", "type": "folder"},
         ],
     ),
     
@@ -360,7 +360,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         description="Переименование постановлений об отмене исполнительных надписей",
         command=["python", "-u", "scripts/rename_otmenanad.py"],
         params=[
-            {"name": "source_folder", "label": "Исходная папка", "type": "text"},
+            {"name": "source_folder", "label": "Исходная папка", "type": "folder"},
         ],
     ),
     
@@ -371,7 +371,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         command=["python", "-u", "scripts/convert_msg.py"],
         params=[
             {"name": "company_id", "label": "Компания", "type": "select"},
-            {"name": "source_folder", "label": "Папка с MSG файлами", "type": "text"},
+            {"name": "source_folder", "label": "Папка с MSG файлами", "type": "folder"},
             {"name": "output_folder", "label": "Папка для PDF (опционально)", "type": "text"},
             {"name": "workers", "label": "Параллельных Chrome (по умолч. 4)", "type": "text"},
         ],

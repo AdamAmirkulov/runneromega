@@ -55,7 +55,7 @@ def contains_target_title(text: str) -> bool:
     )
 
 # --- ИИН/ЖСН: «рваные» цифры 5..40, нормализуем до 12 ---
-IIN_CHUNK_RE = re.compile(rf"((?:\d[ \t{NBSP}\-]?){5,40})")
+IIN_CHUNK_RE = re.compile(rf"((?:\d[ \t{NBSP}\-]?){{5,40}})")
 
 # --- Метки полей (строго по метке) ---
 FIO_LABEL_PTRN = re.compile(
@@ -121,10 +121,19 @@ def extract_fio_after_label(text: str) -> str | None:
     Строго берём ФИО после метки «Аты-жөні/ФИО …».
     Поддержка: перенос ФИО на следующую строку; отсечение хвостов ';', '(' и пр.
     """
+    # Слова-подписи из бланковых подписей вида
+    # «(Толық аты-жөні, қолы / ФИО полностью, подпись)» — не имя.
+    CAPTION_WORDS = {
+        "фио", "таә", "тає", "полностью", "подпись", "қолы", "коли",
+        "аты", "жөні", "жони", "толық", "толык", "имя", "отчество", "фамилия",
+    }
     lines = normalize(text).split("\n")
     for i, line in enumerate(lines):
         m = FIO_LABEL_PTRN.search(line)
         if not m:
+            continue
+        # Строка-подпись бланка: метка внутри скобок с «подпись»/«қолы» — пропускаем
+        if line.lstrip().startswith("(") or re.search(r"подпис|қол[ыи]|полност", line, re.IGNORECASE):
             continue
         rest = line[m.end():].strip()
         # Если на этой строке пусто/слишком коротко — захватим следующую строку
@@ -137,8 +146,10 @@ def extract_fio_after_label(text: str) -> str | None:
         rest = re.sub(r"\s+\d{2,}\s*$", "", rest).strip()
 
         fio = clean_person(rest)
-        # Минимальная проверка: не меньше 2 слов, без цифр
-        if fio and len(fio.split()) >= 2 and not re.search(r"\d", fio):
+        toks = fio.split()
+        # Минимальная проверка: не меньше 2 слов, без цифр, без слов-подписей
+        if (fio and len(toks) >= 2 and not re.search(r"\d", fio)
+                and not any(t.lower() in CAPTION_WORDS for t in toks)):
             return fio
     return None
 
