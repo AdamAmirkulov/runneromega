@@ -69,6 +69,68 @@ COMPANY_DB_FILTER = {
     '4': 'ТОО "..."',
 }
 
+# Вход на portal-sot.kz через ЭЦП — для scripts/sud_fio_zayavlenie.py.
+# Требует физического ЭЦП-сертификата компании на этой машине и отдельного
+# Chrome-профиля с уже нажатым «Разрешить» для portal-sot.kz → NCALayer —
+# см. подробный комментарий в реальном scripts/config.py. Компанию без
+# записи здесь скрипт не запустит (явная ошибка вместо чужого сертификата).
+PORTAL_SOT_BY_COMPANY = {
+    '1': {
+        'eds_password': '...',
+        'portal_password': COMPANY_CREDENTIALS['1']['sk_password'],
+        'chrome_profile': r'C:\...\ChromePortalSot',
+    },
+    # '2': { ... }, '3': { ... }, '4': { ... } — добавить по мере настройки
+}
+
+# ═══════════════════════════════════════════════════════════════
+# SMTP для рассылок по отчётам (scripts/mailing_send.py) — свой ящик
+# отправителя на каждую компанию (ключ = ID компании в users.db).
+# ═══════════════════════════════════════════════════════════════
+MAILING_SMTP = {
+    '1': {
+        'host': 'smtp.example.kz', 'port': 587,
+        'user': 'info@example.kz', 'password': 'SMTP_PASSWORD',
+        'from_name': 'ТОО «...»',
+        'use_tls': True, 'bcc': '', 'send_delay_sec': 5,
+    },
+    # '2': { ... }, '3': { ... }, '4': { ... }  — по образцу выше
+}
+
+# ═══════════════════════════════════════════════════════════════
+# Заявления на выдачу ИЛ (scripts/sk_zayavlenie_il.py)
+# По каждой компании: истец в тексте заявления (project_name), ФИО
+# директора (director) и имя .docx-шаблона в scripts/templates/.
+# Компании без записи здесь скрипт для ИЛ запускать не даст.
+# ═══════════════════════════════════════════════════════════════
+IL_DECISION_CONFIG = {
+    '1': {
+        'project_name': 'ТОО «...»',
+        'director': 'Фамилия И.',
+        'template': 'OMEGA_IL_DECISION_TEMPLATE.docx',
+    },
+    # '2': { ... }, '3': { ... }, '4': { ... }
+}
+
+# ═══════════════════════════════════════════════════════════════
+# PORTAL-SOT.KZ — новый Судебный кабинет (вход через ЭЦП)
+# scripts/poiskvsk.py, блок «Поиск адреса в СК» — ПОКА ТОЛЬКО ОМЕГА
+# (company_id=1). Вход не по компаниям — один аккаунт-представитель.
+# chrome_profile — постоянный профиль Chrome, в котором ОДИН РАЗ вручную
+# нажато «Разрешить» для portal-sot.kz → NCALayer (иначе запрос всплывает
+# при каждом входе и автоматика застревает). Отдельный автономный скрипт
+# входа — scripts/login_newsud.py (там же env PORTAL_EDS_PASSWORD /
+# PORTAL_PASSWORD / PORTAL_CHROME_PROFILE, приоритетнее этого словаря).
+# ═══════════════════════════════════════════════════════════════
+PORTAL_SOT = {
+    'eds_password':    'EDS_FILE_PASSWORD',      # пароль от файла ЭЦП (ключа)
+    'portal_password': 'PORTAL_SOT_PASSWORD',    # пароль от portal-sot.kz
+    'chrome_profile':  r'C:\Users\User\Documents\ChromePortalSot',
+    # необязательно:
+    # 'chrome_path':    r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+    # 'ncalayer_path':  r'C:\Users\User\AppData\Local\Programs\NCALayer\NCALayer.exe',
+}
+
 # ═══════════════════════════════════════════════════════════════
 # WhatsApp (Wamm Chat) — теги при отправке реестра на возврат ГП
 # ═══════════════════════════════════════════════════════════════

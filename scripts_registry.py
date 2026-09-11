@@ -13,6 +13,8 @@ class ScriptDef:
     command: list
     params: list
     allow_scheduled_start: bool = False   # ✅ новое поле, по умолчанию выключено
+    hidden: bool = False                  # не показывать в списке скриптов / в правах пользователей
+                                          # (запускается только служебными механизмами, напр. рассылки)
 
 SCRIPTS: Dict[str, ScriptDef] = {
     
@@ -48,9 +50,16 @@ SCRIPTS: Dict[str, ScriptDef] = {
     "ogranichenie": ScriptDef(
         key="ogranichenie",
         title="🔍АИС ОИП - Ограничение на выезд",
-        description="Проверка постановлений на ограничение выезда в системе АИС ОИП",
+        description=(
+            "Проверка постановлений на ограничение выезда в системе АИС ОИП. "
+            "Список должников без постановления берётся из БД по выбранной "
+            "компании; итоговый файл и SanctionsImport.xlsx для автоимпорта "
+            "формируются в конце. Если указан ИИН — проверяется только он "
+            "(без изменения общего отчёта)."
+        ),
         command=["python", "-u", "scripts/ogranichenie.py"],
         params=[
+            {"name": "company_id", "label": "Компания", "type": "select"},
             {"name": "iin", "label": "ИИН (если нужен)", "type": "text"},
             {"name": "login", "label": "Логин системы", "type": "text"},
             {"name": "password", "label": "Пароль системы", "type": "password"},
@@ -69,18 +78,29 @@ SCRIPTS: Dict[str, ScriptDef] = {
     "sudFIO": ScriptDef(
         key="sudFIO",
         title="⚖️ Судебный кабинет - ФИО, адрес",
-        description="Выгрузка ФИО и адреса через СК",
-        # Раньше этот пункт был захардкожен на scripts/sud.py — тот файл
-        # раньше содержал именно эту логику (подача иска + добавление
-        # участника + автоподстановка ФИО/адреса по ИИН), а не выгрузку
-        # статусов дел. scripts/sud.py теперь заменён на новую выгрузку
-        # с СК по талонам (см. ключ "sud" выше), поэтому старое содержимое
-        # перенесено без изменений в scripts/sud_fio_zayavlenie.py, чтобы
-        # эта кнопка продолжала работать как раньше.
+        description=(
+            "ФИО и адрес по ИИН через portal-sot.kz (ГБД ФЛ) + формирование "
+            "AddressesImport.xlsx для автоимпорта в CRM компании. Вход по ЭЦП "
+            "через NCALayer — пока настроен только для Омеги, для остальных "
+            "компаний нужно сначала добавить сертификат и профиль (см. "
+            "PORTAL_SOT_BY_COMPANY в scripts/config.py)."
+        ),
+        # Раньше здесь была старая логика подачи иска в office.sud.kz +
+        # автоподстановка ФИО/адреса участника (office.sud.kz для этого
+        # больше не используется, см. scripts/podacha_iska_v2.py). Заменено
+        # на перенос из ноутбука fio_address_parsing_SK.ipynb: ФИО/адрес по
+        # ИИН через portal-sot.kz + сборка AddressesImport.xlsx, оба этапа
+        # ноутбука объединены в один проход без ручного шага-копии файла.
         command=["python", "-u", "scripts/sud_fio_zayavlenie.py"],
         params=[
-            {"name": "date_from", "label": "Дата с", "type": "date"},
-            {"name": "date_to", "label": "Дата по", "type": "date"},
+            {"name": "company_id", "label": "Компания", "type": "select"},
+            {
+                "name": "excel_file",
+                "label": "Excel с ИИН (колонка B, со 2-й строки)",
+                "type": "file",
+                "accept": ".xlsx,.xls",
+                "save_to": "uploads/sud_fio_input.xlsx",
+            },
         ],
     ),
 
@@ -131,6 +151,25 @@ SCRIPTS: Dict[str, ScriptDef] = {
             allow_scheduled_start=True,
             params=[
                 {"name": "company_id", "label": "Компания", "type": "select"},
+            ],
+        ),
+
+        "sk_zayavlenie_il": ScriptDef(
+            key="sk_zayavlenie_il",
+            title="⚖️ СК — заявления на выдачу ИЛ",
+            description=(
+                "Отбирает из БД сделки с вынесенным решением суда, формирует по "
+                "шаблону заявление на выдачу исполнительного листа (DOCX→PDF), "
+                "заходит в Судебный кабинет, создаёт черновик заявления, "
+                "подставляет регион/суд, прикладывает PDF и доводит до "
+                "sign.xhtml. ОСТАНАВЛИВАЕТСЯ до подписания ЭЦП — подписывает "
+                "человек. Результат: out/SK_IL_results.xlsx + PDF-файлы."
+            ),
+            command=["python", "-u", "scripts/sk_zayavlenie_il.py"],
+            allow_scheduled_start=True,
+            params=[
+                {"name": "company_id", "label": "Компания", "type": "select"},
+                {"name": "max_rows", "label": "Макс. сделок (пусто = все; для теста поставьте 1)", "type": "text"},
             ],
         ),
 
@@ -413,5 +452,27 @@ SCRIPTS: Dict[str, ScriptDef] = {
         description="Устаревшая версия сбора документов (используйте основной 'Сбор документов')",
         command=["python", "-u", "scripts/sbor_documentov.py"],
         params=[],
+    ),
+
+    # ═══════════════════════════════════════════════════════════════
+    # СЛУЖЕБНЫЕ (не показываются в списке — запускаются из админки)
+    # ═══════════════════════════════════════════════════════════════
+
+    "mailing_send": ScriptDef(
+        key="mailing_send",
+        title="📨 Рассылка по отчёту (ЧСИ)",
+        description=(
+            "Выполняет SQL-отчёт рассылки, группирует строки по ЧСИ и отправляет "
+            "каждому ЧСИ письмо с его строками во вложении. Настраивается в "
+            "Админке → Рассылки по отчётам."
+        ),
+        command=["python", "-u", "scripts/mailing_send.py"],
+        allow_scheduled_start=True,
+        hidden=True,
+        params=[
+            {"name": "company_id", "label": "Компания", "type": "select"},
+            {"name": "mailing_id", "label": "ID рассылки", "type": "text"},
+            {"name": "mode", "label": "Режим (test/real)", "type": "text"},
+        ],
     ),
 }

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 Полный объединённый скрипт:
 
 1) Логинится в office.sud.kz
@@ -48,6 +48,7 @@ if not args.company_id or not args.company_id.strip():
 os.environ['COMPANY_ID'] = args.company_id.strip()
 
 import time
+import json
 import logging
 import datetime as _dt
 import re
@@ -111,6 +112,13 @@ VIEWSTATE_NAMES = ("javax.faces.ViewState", "jakarta.faces.ViewState")
 WAIT   = 1.0
 RETRY  = 8
 
+# ========= PORTAL-SOT.KZ (новый Судебный кабинет) =========
+# office.sud.kz для поиска адреса больше не используется — блок 4 работает
+# через JSON REST API нового портала. Вход (ЭЦП) выполняет scripts/login_newsud.py,
+# адрес по ИИН отдаёт GET /api/secure/gbdfl/v2/byIin/<ИИН>.
+PORTAL_SOT_BASE = "https://portal-sot.kz"
+GBDFL_BY_IIN_URL = PORTAL_SOT_BASE + "/api/secure/gbdfl/v2/byIin/"
+
 # ========= ПУТИ =========
 BASE_DIR   = rf"{ROOT}\Документы для подачи Исков"
 INPUT_XLSX = args.excel_file
@@ -167,6 +175,20 @@ def log_err(msg):
 def log4(msg):
     print(time.strftime("[%H:%M:%S]"), msg, flush=True)
     logging.info(msg)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LEGACY / office.sud.kz  (строки ниже до «БЛОК 5»)
+# ───────────────────────────────────────────────────────────────────────────
+# Весь код входа и поиска адреса через office.sud.kz (init_driver, login,
+# go_to_send_docs, send_claim, block3_*, SudHttpClient, parse_people_*)
+# БОЛЬШЕ НЕ ВЫЗЫВАЕТСЯ: office.sud.kz для подачи/поиска умер, блок 4 работает
+# через parse_people_via_portal_sot() (portal-sot.kz JSON API, см. БЛОК 4 ниже).
+# Оставлено для истории / быстрого отката. ВНИМАНИЕ при чистке: несколько
+# мелких хелперов из этого диапазона всё ещё используются новым кодом и
+# блоками 5–6 — _norm_iin(), _safe_save(), extract_region_from_address(),
+# REGION_NAMES, AUTOSAVE_EVERY. Их при удалении legacy нужно сохранить.
+# Блоки 5–6 (суды, УГД) — офлайн-обработка Excel, актуальны.
+# ═══════════════════════════════════════════════════════════════════════════
 
 # ========= DRIVER =========
 def init_driver() -> webdriver.Chrome:
@@ -1688,6 +1710,725 @@ def parse_people_via_pure_http():
     return processed, failed_rows
 
 
+# ========= БЛОК 4 (PORTAL-SOT.KZ): адрес по ИИН через JSON REST API =========
+# Портировано 1:1 из ноутбука poiskvsk_portal_sot_v7_OMEGA_FINAL_ONE_RUN.ipynb.
+# office.sud.kz для поиска адреса умер. Новый портал portal-sot.kz — SPA поверх
+# JSON REST API. Схема:
+#   1. _portal_init_driver() поднимает Chrome на ПОСТОЯННОМ профиле (в нём один
+#      раз выдано разрешение portal-sot.kz → NCALayer, иначе оно всплывает каждый раз);
+#   2. _portal_login() — если сессия ещё жива, берём access_token из localStorage;
+#      иначе «Войти» → окно NCALayer (пароль ЭЦП вводит pywinauto) → «Подписать» →
+#      пароль портала → «Войти» → ждём /cabinet → читаем access_token/refresh_token;
+#   3. _portal_make_session() — requests.Session с Authorization: Bearer +
+#      cookie из Chrome + ЗАГОЛОВОК Origin: https://portal-sot.kz (критично:
+#      на запрос без Origin портал отвечает пустым 200; из вкладки браузера
+#      same-origin запрос Origin не несёт, поэтому качаем через requests);
+#   4. по каждому ИИН из колонки D: GET /api/secure/gbdfl/v2/byIin/<ИИН>,
+#      собираем адрес регистрации → колонка O, регион → колонка P.
+#   При 401 / стабильном пустом 200 — повторный ЭЦП-логин в том же Chrome.
+#
+# ПОКА ТОЛЬКО ОМЕГА (company_id="1"). Реквизиты — PORTAL_SOT в scripts/config.py
+# (eds_password / portal_password / chrome_profile), фолбэк — значения из ноутбука.
+
+def _portal_omega_cfg(key: str, default: str) -> str:
+    try:
+        from config import PORTAL_SOT as _ps
+        v = _ps.get(key)
+        return v if v else default
+    except Exception:
+        return default
+
+
+PORTAL_EDS_PASSWORD   = _portal_omega_cfg("eds_password", "Qwerty1981")
+PORTAL_LOGIN_PASSWORD = _portal_omega_cfg("portal_password", "n3y&pAM5mD&4zKZ")
+PORTAL_CHROME_PROFILE = _portal_omega_cfg("chrome_profile", r"C:\Users\User\Documents\ChromePortalSot")
+# NCALayer — приложение в трее, слушает ws://127.0.0.1:13579. Портал через него
+# подписывает ЭЦП. Если оно не запущено, клик «Войти» на портале молча ничего не
+# делает и окно NCALayer не появляется — поэтому запускаем его сами.
+NCALAYER_PATH = _portal_omega_cfg(
+    "ncalayer_path", r"C:\Users\User\AppData\Local\Programs\NCALayer\NCALayer.exe"
+)
+NCALAYER_WS_PORT = 13579
+
+GBDFL_BY_IIN_TMPL = PORTAL_SOT_BASE + "/api/secure/gbdfl/v2/byIin/{iin}"
+
+
+def _portal_attach_debug_chrome(port: int = 9333):
+    """Запасной путь: если webdriver.Chrome(options) падает в окружении
+    job-раннера (DevToolsActivePort / Chrome crashed), поднимаем chrome.exe
+    отдельным процессом с remote-debugging и подключаемся по debuggerAddress —
+    как в podacha_iska_v2.py."""
+    import socket
+    import subprocess
+
+    def _port_open() -> bool:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return True
+        except OSError:
+            return False
+
+    if not _port_open():
+        chrome_exe = _portal_omega_cfg(
+            "chrome_path", r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        )
+        os.makedirs(PORTAL_CHROME_PROFILE, exist_ok=True)
+        subprocess.Popen(
+            [
+                chrome_exe,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={PORTAL_CHROME_PROFILE}",
+                "--start-maximized",
+                "--disable-notifications",
+                "--disable-popup-blocking",
+                PORTAL_SOT_BASE,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 30
+        while time.time() < deadline and not _port_open():
+            time.sleep(0.5)
+        if not _port_open():
+            raise RuntimeError(f"Chrome не открыл порт remote-debugging {port}")
+
+    o = webdriver.ChromeOptions()
+    o.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+    return webdriver.Chrome(options=o)
+
+
+def _portal_init_driver():
+    opts = webdriver.ChromeOptions()
+    opts.add_argument("--start-maximized")
+    opts.add_argument("--disable-notifications")
+    opts.add_argument("--disable-popup-blocking")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    # Постоянный профиль, где уже нажато «Разрешить» для portal-sot.kz → NCALayer.
+    opts.add_argument(r"--user-data-dir=" + PORTAL_CHROME_PROFILE)
+    try:
+        drv = webdriver.Chrome(options=opts)
+    except Exception as e:
+        log_warn(f"Прямой запуск Chrome не удался ({e}); пробую через remote-debugging")
+        drv = _portal_attach_debug_chrome()
+    drv.set_page_load_timeout(120)
+    return drv
+
+
+def _ncalayer_ws_open() -> bool:
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", NCALAYER_WS_PORT), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _portal_ensure_ncalayer(timeout=70):
+    """NCALayer должен быть запущен ДО клика «Войти» на портале, иначе окно
+    подписи не появится вовсе. Если ws-порт 13579 закрыт — запускаем NCALayer.exe
+    и ждём, пока он поднимется (Java/OSGi стартует небыстро)."""
+    if _ncalayer_ws_open():
+        log_step("NCALayer уже запущен (порт 13579)")
+        return
+
+    import subprocess
+    if os.path.isfile(NCALAYER_PATH):
+        log_step(f"Запускаю NCALayer: {NCALAYER_PATH}")
+        try:
+            subprocess.Popen([NCALAYER_PATH],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            log_warn(f"Не смог запустить NCALayer ({e}) — запустите его вручную")
+    else:
+        log_warn(f"NCALayer.exe не найден: {NCALAYER_PATH}. "
+                 f"Задайте PORTAL_SOT['ncalayer_path'] или запустите NCALayer вручную.")
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _ncalayer_ws_open():
+            log_step("✅ NCALayer готов (порт 13579)")
+            time.sleep(3)  # даём модулям подгрузиться
+            return
+        time.sleep(1)
+    raise RuntimeError(
+        f"NCALayer не поднялся за {timeout}s (порт {NCALAYER_WS_PORT} закрыт). "
+        f"Запустите NCALayer вручную и перезапустите скрипт."
+    )
+
+
+def _portal_wait_ncalayer(timeout=60):
+    from pywinauto import Desktop
+    desktop = Desktop(backend="uia")
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            nca = desktop.window(title="NCALayer")
+            if nca.exists() and nca.is_visible():
+                return nca
+        except Exception:
+            pass
+        time.sleep(0.4)
+    raise RuntimeError("NCALayer не появился")
+
+
+def _portal_wait_nca_button(title, timeout=60):
+    from pywinauto import Desktop
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            nca = Desktop(backend="uia").window(title="NCALayer")
+            if nca.exists() and nca.is_visible():
+                btn = nca.child_window(title=title, control_type="Button")
+                if btn.exists():
+                    return nca, btn
+        except Exception:
+            pass
+        time.sleep(0.4)
+    raise RuntimeError(f"Кнопка NCALayer «{title}» не появилась")
+
+
+def _portal_click_login(driver):
+    wait = WebDriverWait(driver, 30)
+    btn = wait.until(EC.element_to_be_clickable((
+        By.XPATH,
+        "//*[self::button or self::a][contains(normalize-space(.),'Войти')]",
+    )))
+    try:
+        btn.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", btn)
+
+
+def _portal_jwt_claims(token: str) -> dict:
+    try:
+        import base64
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return {}
+
+
+def _portal_login(driver, force_fresh=False):
+    # NCALayer обязан работать ДО клика «Войти».
+    _portal_ensure_ncalayer()
+
+    driver.get(PORTAL_SOT_BASE + "/cabinet")
+    time.sleep(3)
+
+    # Профиль уже авторизован и токен ещё жив?
+    if not force_fresh:
+        access = driver.execute_script("return localStorage.getItem('access_token');")
+        has_pwd_field = driver.execute_script(
+            "return !!document.querySelector(\"input[type='password']\");"
+        )
+        if access and "/cabinet" in driver.current_url.lower() and not has_pwd_field:
+            claims = _portal_jwt_claims(access)
+            exp = claims.get("exp", 0) or 0
+            if exp and exp > time.time() + 30:
+                refresh = driver.execute_script("return localStorage.getItem('refresh_token');")
+                log_step(f"✅ Сессия portal-sot.kz жива (токен действует до "
+                         f"{_dt.datetime.fromtimestamp(exp):%H:%M:%S})")
+                return access, refresh
+            log_warn("access_token в localStorage просрочен/битый — полный вход через ЭЦП")
+
+    driver.get(PORTAL_SOT_BASE)
+    time.sleep(2)
+
+    nca = None
+    for attempt in range(1, 3):
+        _portal_click_login(driver)
+        log_step(f"Нажал «Войти» (попытка {attempt}), жду NCALayer…")
+        try:
+            nca = _portal_wait_ncalayer(45)
+            break
+        except RuntimeError:
+            log_warn("Окно NCALayer не появилось — проверяю службу и пробую ещё раз")
+            _portal_ensure_ncalayer()
+            time.sleep(2)
+    if nca is None:
+        raise RuntimeError(
+            "Окно подписи NCALayer так и не появилось после клика «Войти». "
+            "Убедитесь, что NCALayer запущен и в нём для portal-sot.kz нажато «Разрешить»."
+        )
+    nca.set_focus()
+
+    pwd = nca.child_window(title="Пароль", control_type="Edit")
+    if not pwd.exists():
+        pwd = nca.child_window(auto_id="JavaFX39", control_type="Edit")
+    open_btn = nca.child_window(title="Открыть", control_type="Button")
+    if not open_btn.exists():
+        open_btn = nca.child_window(auto_id="JavaFX47", control_type="Button")
+
+    pwd.click_input()
+    time.sleep(0.2)
+    pwd.type_keys("^a{BACKSPACE}")
+    pwd.type_keys(PORTAL_EDS_PASSWORD, with_spaces=True, pause=0.03)
+    time.sleep(0.3)
+    open_btn.click_input()
+
+    nca, sign_btn = _portal_wait_nca_button("Подписать", 60)
+    nca.set_focus()
+    time.sleep(0.3)
+    sign_btn.click_input()
+    log_step("✅ ЭЦП подписана")
+
+    portal_pwd = WebDriverWait(driver, 60).until(
+        EC.visibility_of_element_located((By.XPATH, "//input[@type='password']"))
+    )
+    portal_pwd.clear()
+    portal_pwd.send_keys(PORTAL_LOGIN_PASSWORD)
+
+    final_btn = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((
+        By.XPATH, "//button[contains(normalize-space(.),'Войти')]",
+    )))
+    final_btn.click()
+
+    WebDriverWait(driver, 60).until(lambda d: "/cabinet" in d.current_url.lower())
+
+    access = driver.execute_script("return localStorage.getItem('access_token');")
+    refresh = driver.execute_script("return localStorage.getItem('refresh_token');")
+    if not access:
+        raise RuntimeError("access_token не найден после входа")
+
+    log_step("✅ Вход на portal-sot.kz выполнен, access_token получен")
+    return access, refresh
+
+
+# Запрос к ГБД ФЛ — через requests (как в рабочем ноутбуке v7). Ключевое:
+# заголовок Origin: https://portal-sot.kz. Из вкладки портала тот же запрос
+# same-origin, и браузер Origin НЕ добавляет — а сервер на запрос без Origin
+# отвечает пустым 200 (проверено: content-length:0, vary: Origin, ...).
+# requests позволяет Origin выставить явно.
+_PORTAL_WIZARD_REFERER = (
+    PORTAL_SOT_BASE +
+    "/cabinet/declarations/REQUEST_TYPE2?step=create&caseType=CIVIL&instanceType=FIRSTINSTANCE"
+)
+
+
+def _portal_make_session(driver, access_token):
+    """requests.Session ровно как в ноутбуке v7 (без Content-Type / Sec-Fetch-*).
+    Плюс Accept-Encoding: gzip, deflate — БЕЗ zstd/br: пакеты zstandard/brotli
+    не установлены, urllib3 2.6.2 в этой сборке битый (см. RequestsDependency
+    Warning), и на ответ, сжатый zstd, r.text приходил пустым."""
+    s = requests.Session()
+    try:
+        ua = driver.execute_script("return navigator.userAgent")
+    except Exception:
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
+    s.headers.update({
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru",
+        "Accept-Encoding": "gzip, deflate",
+        "Origin": PORTAL_SOT_BASE,
+        "Referer": PORTAL_SOT_BASE + "/",
+        "User-Agent": ua,
+    })
+    try:
+        for c in driver.get_cookies():
+            s.cookies.set(
+                c["name"], c["value"],
+                domain=c.get("domain") or "portal-sot.kz",
+                path=c.get("path", "/"),
+            )
+    except Exception:
+        pass
+    return s
+
+
+def _portal_gbdfl_raw(session, iin):
+    """GET /api/secure/gbdfl/v2/byIin/<iin> через requests-сессию.
+    Возвращает dict {status, statusText, respURL, headers, bodyLen, body}."""
+    url = PORTAL_SOT_BASE + "/api/secure/gbdfl/v2/byIin/" + str(iin)
+    r = session.get(url, timeout=(10, 60), allow_redirects=True)
+    body = r.text or ""
+    return {
+        "status": r.status_code,
+        "statusText": r.reason or "",
+        "respURL": r.url,
+        "headers": "\n".join(f"{k}: {v}" for k, v in r.headers.items()),
+        "bodyLen": len(body),
+        # ВАЖНО: тело НЕ обрезаем — оно идёт в json.loads() ниже как реальные
+        # данные, а не только в лог. Раньше здесь стояло body[:3000], и любой
+        # ответ ГБД ФЛ длиннее 3000 символов (полный профиль с адресом,
+        # документами и т.д. — обычное дело) превращался в обрезанный,
+        # невалидный JSON: json.loads() падал, попытка считалась "не-JSON",
+        # хотя сервер на самом деле вернул корректный полный ответ.
+        # bodyLen при этом всегда считался от ПОЛНОГО body — то есть
+        # несовпадение bodyLen и фактической длины body было верным признаком
+        # именно этой обрезки.
+        "body": body,
+    }
+
+
+_PORTAL_BROWSER_GBDFL_JS = r"""
+var cb = arguments[arguments.length - 1], iin = arguments[0], tok = arguments[1];
+if (!tok) { try { tok = localStorage.getItem('access_token'); } catch(e){} }
+var h = {'Accept': 'application/json, text/plain, */*'};
+if (tok) h['Authorization'] = 'Bearer ' + tok;
+fetch('/api/secure/gbdfl/v2/byIin/' + encodeURIComponent(iin), {headers: h, credentials: 'include'})
+  .then(function(r){ return r.text().then(function(t){
+     cb(JSON.stringify({status: r.status, type: r.type, redirected: r.redirected, url: r.url, len: t.length, body: t.slice(0,1000)})); }); })
+  .catch(function(e){ cb(JSON.stringify({status: -1, body: String(e)})); });
+"""
+
+
+def _portal_diagnose(driver, session, access_token, iin):
+    """Одноразовая диагностика пустых 200: пробуем запрос ГБД ФЛ множеством
+    способов и всё логируем, чтобы понять, что портал хочет."""
+    iin = _norm_iin(iin)
+    log4("─" * 60)
+    log4("🔬 ДИАГНОСТИКА portal-sot.kz (пустые 200)")
+    log4(f"   access_token claims={_portal_jwt_claims(access_token)}")
+    log4(f"   driver.current_url = {driver.current_url}")
+
+    # Полный дамп localStorage + все токены, какие удастся выудить.
+    extra_tokens = {}
+    try:
+        full_ls = driver.execute_script(
+            "var o={};for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);o[k]=localStorage.getItem(k);}return o;")
+        for k, v in (full_ls or {}).items():
+            log4(f"   localStorage[{k!r}] = {str(v)[:400]}")
+            for m in re.finditer(r'(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,})', str(v)):
+                tk = m.group(1)
+                if tk != access_token:
+                    extra_tokens[tk[:24]] = tk
+        log4(f"   найдено доп.JWT в localStorage: {list(extra_tokens.keys())}")
+    except Exception as e:
+        log4(f"   localStorage dump err: {e}")
+
+    # Что SPA реально шлёт: перехватываем свой же fetch/XHR на минуту.
+    try:
+        driver.execute_script(r"""
+          window.__cap=[];
+          var of=window.fetch;
+          window.fetch=function(u,o){ try{window.__cap.push({u:''+u,h:(o&&o.headers)||null});}catch(e){} return of.apply(this,arguments); };
+        """)
+    except Exception:
+        pass
+
+    base = PORTAL_SOT_BASE
+    gbdfl = f"{base}/api/secure/gbdfl/v2/byIin/{iin}"
+    pub = f"{base}/api/public/dictionary/request_type/enum"
+    MINIMAL = {"__minimal__": True}  # спец-маркер: не брать заголовки сессии вообще
+    probes = [
+        ("PUBLIC session-headers",   "get", pub,   None, {}),
+        ("PUBLIC minimal (как curl)","get", pub,   None, MINIMAL),
+        ("PUBLIC minimal +AE:ident", "get", pub,   None, {"__minimal__": True, "Accept-Encoding": "identity"}),
+        ("PUBLIC no Accept-Encoding","get", pub,   None, {"Accept-Encoding": None}),
+        ("PUBLIC no Authorization",  "get", pub,   None, {"Authorization": None}),
+        ("GBDFL session-headers",    "get", gbdfl, None, {}),
+        ("GBDFL minimal +Bearer",    "get", gbdfl, None, {"__minimal__": True, "Authorization": session.headers.get("Authorization")}),
+        ("GBDFL no Accept-Encoding", "get", gbdfl, None, {"Accept-Encoding": None}),
+        ("GBDFL Accept:*/*",         "get", gbdfl, None, {"Accept": "*/*"}),
+        ("GBDFL v3",                 "get", f"{base}/api/secure/gbdfl/v3/byIin/{iin}", None, {}),
+        ("GBDFL POST {iin}",         "post", f"{base}/api/secure/gbdfl/v2/byIin", {"iin": iin}, {}),
+    ]
+    public_ok = False
+    for name, method, url, jbody, hdr_override in probes:
+        try:
+            ovr = dict(hdr_override)
+            minimal = ovr.pop("__minimal__", False)
+            hdrs = {"Accept": "*/*"} if minimal else dict(session.headers)
+            for k, v in ovr.items():
+                if v is None:
+                    hdrs.pop(k, None)
+                else:
+                    hdrs[k] = v
+            if method == "get":
+                rr = requests.get(url, headers=hdrs, cookies=session.cookies, timeout=(10, 40))
+            else:
+                rr = requests.post(url, headers=hdrs, cookies=session.cookies, json=jbody, timeout=(10, 40))
+            ct = rr.headers.get("Content-Type", "")
+            ce = rr.headers.get("Content-Encoding", "")
+            log4(f"   [{name}] {rr.status_code} len={len(rr.text)} ct={ct!r} ce={ce!r} body[:160]={rr.text[:160]!r}")
+            if name.startswith("PUBLIC") and rr.status_code == 200 and rr.text.strip():
+                public_ok = True
+        except Exception as e:
+            log4(f"   [{name}] EXC {type(e).__name__}: {e}")
+
+    # gbdfl с каждым альтернативным токеном из localStorage
+    for tk_id, tk in extra_tokens.items():
+        try:
+            h = {k: v for k, v in session.headers.items() if k != "Authorization"}
+            h["Authorization"] = f"Bearer {tk}"
+            rr = requests.get(gbdfl, headers=h, timeout=(10, 40))
+            log4(f"   [GBDFL alt-token {tk_id}…] {rr.status_code} len={len(rr.text)} "
+                 f"claims={_portal_jwt_claims(tk)} body[:160]={rr.text[:160]!r}")
+        except Exception as e:
+            log4(f"   [GBDFL alt-token {tk_id}…] EXC {e}")
+
+    # gbdfl совсем без Authorization (вдруг API на cookie)
+    try:
+        h = {k: v for k, v in session.headers.items() if k != "Authorization"}
+        rr = requests.get(gbdfl, headers=h, cookies=session.cookies, timeout=(10, 40))
+        log4(f"   [GBDFL no-Auth cookie-only] {rr.status_code} len={len(rr.text)} body[:160]={rr.text[:160]!r}")
+    except Exception as e:
+        log4(f"   [GBDFL no-Auth] EXC {e}")
+
+    try:
+        raw = driver.execute_async_script(_PORTAL_BROWSER_GBDFL_JS, iin, access_token or "")
+        log4(f"   [browser fetch access_token] {raw}")
+    except Exception as e:
+        log4(f"   [browser fetch] EXC {type(e).__name__}: {e}")
+
+    # что реально ушло в заголовках нашего основного запроса
+    try:
+        prepped = requests.Request("GET", f"{base}/api/secure/gbdfl/v2/byIin/{iin}",
+                                   headers=dict(session.headers)).prepare()
+        log4(f"   наши request-headers: {dict(prepped.headers)}")
+        log4(f"   наши cookies: {[c.name for c in session.cookies]}")
+    except Exception:
+        pass
+
+    log4("   (curl с этой машины публичный endpoint отдаёт JSON — портал ЖИВ; "
+         "смотри выше, какая комбинация заголовков в requests сработала)")
+    log4("─" * 60)
+    return public_ok
+
+
+def _portal_build_address(result: dict) -> str:
+    """'Место жительства' из ответа /api/secure/gbdfl/v2/byIin/{iin}.
+    Отличие от ноутбука: страну (regCountryNameRu) НЕ включаем — блок 5
+    (pick_court → extract_locality_from_address) берёт 2-й элемент адреса
+    через запятую как район/город, а «КАЗАХСТАН» в начале сдвинул бы его на
+    название области."""
+    if not result:
+        return ""
+    parts = []
+    for x in (result.get("regDistrictNameRu"),
+              result.get("regRegionNameRu"),
+              result.get("regCity"),
+              result.get("regStreet")):
+        if x is None:
+            continue
+        s = str(x).strip()
+        if s and s.lower() != "null":
+            parts.append(s)
+    building = result.get("regBuilding")
+    flat = result.get("regFlat")
+    if building:
+        parts.append(f"дом {str(building).strip()}")
+    if flat:
+        parts.append(f"кв. {str(flat).strip()}")
+    return ", ".join(parts)
+
+
+def _portal_fetch_by_iin(session, iin, retries=3):
+    """Аналог fillPersonData() на portal-sot.kz — GET /api/secure/gbdfl/v2/byIin/{iin}.
+    При 401 бросает RuntimeError('PORTAL_TOKEN_EXPIRED'); при стабильном пустом
+    200 — RuntimeError('PORTAL_EMPTY_200') — верхний цикл делает повторный
+    ЭЦП-логин. Логирует реальные status/заголовки/тело."""
+    iin = _norm_iin(iin)
+    if len(iin) != 12:
+        raise ValueError(f"Некорректный ИИН: {iin!r}")
+
+    last_error = None
+    empty_200_only = True
+    for attempt in range(1, retries + 1):
+        try:
+            env = _portal_gbdfl_raw(session, iin)
+        except Exception as e:
+            last_error = e
+            empty_200_only = False
+            log4(f"   ⚠ запрос ГБД ФЛ упал (попытка {attempt}/{retries}): "
+                 f"{type(e).__name__}: {e}")
+            time.sleep(min(1.5 * attempt, 5))
+            continue
+
+        status = int(env.get("status", 0) or 0)
+        body = env.get("body") or ""
+        body_stripped = body.strip()
+
+        if status == 401:
+            raise RuntimeError("PORTAL_TOKEN_EXPIRED")
+
+        if not (status == 200 and not body_stripped):
+            empty_200_only = False
+
+        if status in (0, -1, -2, -3, -9, 429, 500, 502, 503, 504) or not body_stripped:
+            hdrs = " | ".join(l.strip() for l in (env.get("headers") or "").splitlines() if l.strip())
+            last_error = RuntimeError(f"HTTP {status} ({env.get('statusText','')}), bodyLen={env.get('bodyLen')}")
+            log4(f"   ⚠ ГБД ФЛ ответ невалиден (попытка {attempt}/{retries}): "
+                 f"status={status} statusText={env.get('statusText','')!r} "
+                 f"bodyLen={env.get('bodyLen')} respURL={env.get('respURL','')!r}")
+            if hdrs:
+                log4(f"      resp-headers: {hdrs}")
+            if body_stripped:
+                log4(f"      body[:300]={body_stripped[:300]!r}")
+            time.sleep(min(2 * attempt, 8))
+            continue
+
+        try:
+            js = json.loads(body)
+        except Exception:
+            last_error = RuntimeError(f"не JSON, status={status}, body[:300]={body_stripped[:300]!r}")
+            log4(f"   ⚠ ГБД ФЛ вернул не-JSON (попытка {attempt}/{retries}): "
+                 f"status={status}, body[:300]={body_stripped[:300]!r}")
+            time.sleep(min(2 * attempt, 8))
+            continue
+
+        result = js.get("result") or {}
+        code = str((js.get("status") or {}).get("code") or "").strip()
+        if not result:
+            log4(f"   ✗ ИИН не найден в ГБД ФЛ (status={status}, code={code})")
+            return {"iin": iin, "sur": "", "name": "", "patr": "",
+                    "live": "", "raw": {}, "status_code": code}
+
+        return {
+            "iin":  str(result.get("iin") or iin),
+            "sur":  str(result.get("lastName") or "").strip(),
+            "name": str(result.get("firstName") or "").strip(),
+            "patr": str(result.get("patronymic") or "").strip(),
+            "live": _portal_build_address(result),
+            "raw":  result,
+            "status_code": code,
+        }
+
+    if empty_200_only:
+        # Все попытки: HTTP 200 с пустым телом. portal-sot.kz так отвечает,
+        # когда Bearer-токен не принят (вместо честного 401) — верхний цикл
+        # попробует полный вход через ЭЦП.
+        raise RuntimeError("PORTAL_EMPTY_200")
+    raise RuntimeError(f"GBDFL_REQUEST_FAILED: {last_error}")
+
+
+def parse_people_via_portal_sot():
+    """Блок 4: адрес по ИИН через portal-sot.kz (JSON API ГБД ФЛ).
+    ИИН из колонки D листа «Отмены», адрес → колонка O, регион → колонка P.
+    Автосохранение каждые AUTOSAVE_EVERY строк; при неудаче строка повторяется;
+    при истечении access_token — новый ЭЦП-логин. Возвращает (processed, failed_rows).
+    ПОКА ТОЛЬКО ОМЕГА (company_id=1)."""
+    company_id = (os.environ.get("COMPANY_ID") or "1").strip()
+    if company_id != "1":
+        raise RuntimeError(
+            f"Поиск адреса на portal-sot.kz пока настроен ТОЛЬКО для Омеги "
+            f"(company_id=1), а передан company_id={company_id}. "
+            f"Для остальных компаний добавьте их реквизиты portal-sot.kz."
+        )
+
+    MAX_TOTAL_ATTEMPTS_PER_ROW = 6
+    RETRY_ROW_PAUSE = 1.2
+
+    log4("=== START parse_people_via_portal_sot (portal-sot.kz JSON API, ОМЕГА) ===")
+    log4(f"Файл-источник: {INPUT_XLSX}")
+
+    wb = load_workbook(INPUT_XLSX)
+    try:
+        ws = wb["Отмены"]
+    except KeyError:
+        ws = wb.active
+
+    header_o = ws.cell(row=1, column=15)
+    if not header_o.value or str(header_o.value).strip() == "":
+        header_o.value = "Актуальный адрес с Судебного кабинета"
+    header_p = ws.cell(row=1, column=16)
+    if not header_p.value or str(header_p.value).strip() == "":
+        header_p.value = "Регион с Судебного кабинета"
+
+    log4("🔐 Выполняю вход на portal-sot.kz через ЭЦП...")
+    driver = _portal_init_driver()
+    access_token, refresh_token = _portal_login(driver)
+    session = _portal_make_session(driver, access_token)
+
+    failed_rows = []
+    processed = 0
+    consecutive_fail = 0
+    did_diagnose = False       # диагностику пустых 200 гоняем один раз
+    MAX_CONSECUTIVE_FAIL = 5   # подряд «мертвых» строк → портал недоступен, выходим
+
+    try:
+        for r in range(2, ws.max_row + 1):
+            src_iin = _norm_iin(ws.cell(row=r, column=4).value)
+            if not src_iin or len(src_iin) != 12:
+                continue
+
+            processed += 1
+            log4(f"#{processed} (Excel row {r}) → ИИН: {src_iin}")
+            success = False
+
+            for attempt in range(1, MAX_TOTAL_ATTEMPTS_PER_ROW + 1):
+                try:
+                    data = _portal_fetch_by_iin(session, src_iin, retries=3)
+                    live = data.get("live", "")
+                    log4(f"   ответ: ФИО='{data.get('sur','')} {data.get('name','')} "
+                         f"{data.get('patr','')}', address='{live}'")
+
+                    if live:
+                        ws.cell(row=r, column=15, value=live)
+                        region = extract_region_from_address(live)
+                        ws.cell(row=r, column=16, value=region)
+                        log4(f"   → SAVE: row {r}, address='{live}', region='{region}'")
+                        success = True
+                        break
+
+                    # ИИН не найден в ГБД ФЛ — повторять бессмысленно.
+                    if data.get("status_code") and not data.get("raw"):
+                        break
+
+                    log4(f"   ⚠ адрес не получен, попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW}")
+
+                except RuntimeError as e:
+                    msg = str(e)
+                    if msg == "PORTAL_EMPTY_200":
+                        if not did_diagnose:
+                            did_diagnose = True
+                            try:
+                                _portal_diagnose(driver, session, access_token, src_iin)
+                            except Exception as de:
+                                log4(f"   диагностика упала: {de}")
+                        raise RuntimeError(
+                            "portal-sot.kz на запрос /api/secure/gbdfl/v2/byIin отдаёт пустой 200. "
+                            "Диагностика выше в логе. Нужен свежий HAR рабочего запроса "
+                            "(в браузере: новый иск → добавить участника → поиск по ИИН → Export HAR)."
+                        )
+                    if msg == "PORTAL_TOKEN_EXPIRED":
+                        log4("   🔄 401 — полный вход через ЭЦП")
+                        try:
+                            access_token, refresh_token = _portal_login(driver, force_fresh=True)
+                            session = _portal_make_session(driver, access_token)
+                            log4("   ✅ Свежий access_token получен")
+                        except Exception as relogin_error:
+                            log4(f"   ❌ Перелогин не удался: {relogin_error}")
+                            raise RuntimeError("Не удалось войти на portal-sot.kz заново")
+                    else:
+                        log4(f"   ⚠ RuntimeError: {e} (попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW})")
+
+                except Exception as e:
+                    log4(f"   ⚠ {type(e).__name__}: {e} (попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW})")
+
+                if attempt < MAX_TOTAL_ATTEMPTS_PER_ROW:
+                    time.sleep(RETRY_ROW_PAUSE)
+
+            if success:
+                consecutive_fail = 0
+            else:
+                failed_rows.append(r)
+                consecutive_fail += 1
+                log4(f"   → SAVE (error): row {r}, address='' после {MAX_TOTAL_ATTEMPTS_PER_ROW} попыток")
+                if consecutive_fail >= MAX_CONSECUTIVE_FAIL:
+                    log_err(
+                        f"{consecutive_fail} строк подряд без ответа от portal-sot.kz — "
+                        f"портал недоступен, останавливаю обход (обработано {processed})."
+                    )
+                    break
+
+            if processed % AUTOSAVE_EVERY == 0:
+                _safe_save(wb, OUT_XLSX)
+
+            time.sleep(0.25)
+
+    finally:
+        try:
+            _safe_save(wb, OUT_XLSX)
+        except Exception:
+            pass
+
+    log4(f"=== END parse_people_via_portal_sot: processed={processed}, failed={len(failed_rows)} ===")
+    return processed, failed_rows
+
 # ========= БЛОК 5: логика выбора суда =========
 ADDR_COL_NAME   = "Актуальный адрес с Судебного кабинета"
 REGION_COL_NAME = "Регион с Судебного кабинета"
@@ -1736,6 +2477,23 @@ def simplify_court_name(name: str) -> str:
     # региона стоит ПОСЛЕ "области" (например "суд области Жетісу"), и без
     # обрезки оно оставалось в ключе, ложно совпадая с одноимённым районом.
     s = re.split(r"\bобласт\w*", s, maxsplit=1)[0]
+    # У ОСТАЛЬНЫХ судов (большинство) название региона стоит ПЕРЕД "области"
+    # как прилагательное в родительном падеже — "...Мангистауской области",
+    # "...Атырауской области", "...Костанайской области" и т.п. Оно остаётся
+    # последним словом после обрезки выше и ничего не говорит о КОНКРЕТНОМ
+    # суде внутри региона (это просто отсылка к самому региону). Хуже того,
+    # когда район назван так же, как область (Мангистауский район vs
+    # Мангистауская область, Атырауский район vs Атырауская область и т.д.),
+    # это слово ложно совпадает по смыслу с искомым районом и перетягивает
+    # на себя fuzzy-сравнение — например по адресу с "Мангистауский район"
+    # алгоритм выбирал "Суд №2 города Актау Мангистауской области" вместо
+    # правильного "Мангистауский районный суд Мангистауской области", просто
+    # потому что оба названия судов оканчиваются на "...мангистауской".
+    # Прилагательные региона в этой конструкции всегда согласуются с
+    # "области" (жен. род, род. падеж) и оканчиваются на "-ской" — в отличие
+    # от названий районов, которые здесь всегда оканчиваются на "-ский"
+    # (муж. род, согласуются с "район"/"суд"), поэтому вырезать можно смело.
+    s = re.sub(r"\S*ской\s*$", " ", s)
     remove_words = [
         "районный суд", "районный  суд", "городской суд",
         "район", "района", "районный", "городской", "суд", "соты",
@@ -2606,12 +3364,12 @@ def run(df_main):
     processed, failed_rows = 0, []
 
     try:
-        result = parse_people_via_pure_http()
+        result = parse_people_via_portal_sot()
         if result is not None:
             processed, failed_rows = result
     except Exception as e:
-        log_err(f"Ошибка в HTTP-блоке: {e}")
-        logging.exception("Ошибка в HTTP-блоке (полный traceback ниже, см. sud_script.log)")
+        log_err(f"Ошибка в блоке поиска адресов (portal-sot.kz): {e}")
+        logging.exception("Ошибка в блоке поиска адресов (полный traceback ниже, см. sud_script.log)")
 
     # Блок 5: суды
     fill_courts_column()
