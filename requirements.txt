@@ -33,6 +33,7 @@ webdriver-manager==4.0.2
 requests==2.32.5
 beautifulsoup4==4.13.5
 lxml==6.0.2
+pywinauto==0.6.9
 
 # --- Google Sheets ---
 gspread==6.2.1
