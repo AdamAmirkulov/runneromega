@@ -1727,25 +1727,37 @@ def parse_people_via_pure_http():
 #      собираем адрес регистрации → колонка O, регион → колонка P.
 #   При 401 / стабильном пустом 200 — повторный ЭЦП-логин в том же Chrome.
 #
-# ПОКА ТОЛЬКО ОМЕГА (company_id="1"). Реквизиты — PORTAL_SOT в scripts/config.py
-# (eds_password / portal_password / chrome_profile), фолбэк — значения из ноутбука.
+# По компаниям — PORTAL_SOT_BY_COMPANY в scripts/config.py (eds_password /
+# portal_password / chrome_profile / cert_path), ключ = --company_id этого
+# запуска (уже лежит в os.environ["COMPANY_ID"] к этому моменту). Компания
+# без записи там — явная ошибка, а не тихий фолбэк на чужой сертификат.
+_PORTAL_COMPANY_ID = (os.environ.get("COMPANY_ID") or "1").strip()
 
-def _portal_omega_cfg(key: str, default: str) -> str:
-    try:
-        from config import PORTAL_SOT as _ps
-        v = _ps.get(key)
-        return v if v else default
-    except Exception:
-        return default
+try:
+    from config import PORTAL_SOT_BY_COMPANY as _PORTAL_CFG_ALL
+except Exception:
+    _PORTAL_CFG_ALL = {}
+
+_portal_cfg = _PORTAL_CFG_ALL.get(_PORTAL_COMPANY_ID)
 
 
-PORTAL_EDS_PASSWORD   = _portal_omega_cfg("eds_password", "Qwerty1981")
-PORTAL_LOGIN_PASSWORD = _portal_omega_cfg("portal_password", "n3y&pAM5mD&4zKZ")
-PORTAL_CHROME_PROFILE = _portal_omega_cfg("chrome_profile", r"C:\Users\User\Documents\ChromePortalSot")
+def _portal_cfg_get(key: str, default: str = None):
+    """Не бросает исключение при отсутствии записи для компании — этот блок
+    выполняется на импорте модуля для ЛЮБОГО запуска poiskvsk.py, а строгая
+    проверка (компания реально настроена для входа на portal-sot.kz) сделана
+    только внутри parse_people_via_portal_sot(), где вход фактически нужен."""
+    if _portal_cfg and _portal_cfg.get(key):
+        return _portal_cfg[key]
+    return default
+
+
+PORTAL_EDS_PASSWORD   = _portal_cfg_get("eds_password", "Qwerty1981")
+PORTAL_LOGIN_PASSWORD = _portal_cfg_get("portal_password", "n3y&pAM5mD&4zKZ")
+PORTAL_CHROME_PROFILE = _portal_cfg_get("chrome_profile", r"C:\Users\User\Documents\ChromePortalSot")
 # NCALayer — приложение в трее, слушает ws://127.0.0.1:13579. Портал через него
 # подписывает ЭЦП. Если оно не запущено, клик «Войти» на портале молча ничего не
 # делает и окно NCALayer не появляется — поэтому запускаем его сами.
-NCALAYER_PATH = _portal_omega_cfg(
+NCALAYER_PATH = _portal_cfg_get(
     "ncalayer_path", r"C:\Users\User\AppData\Local\Programs\NCALayer\NCALayer.exe"
 )
 NCALAYER_WS_PORT = 13579
@@ -1827,6 +1839,12 @@ def _portal_ensure_ncalayer(timeout=70):
     """NCALayer должен быть запущен ДО клика «Войти» на портале, иначе окно
     подписи не появится вовсе. Если ws-порт 13579 закрыт — запускаем NCALayer.exe
     и ждём, пока он поднимется (Java/OSGi стартует небыстро)."""
+    try:
+        from config import ensure_ncalayer_cert
+        ensure_ncalayer_cert(_PORTAL_COMPANY_ID)  # переключит recentPath, если сертификат не тот
+    except Exception as e:
+        log_warn(f"ensure_ncalayer_cert: {e}")
+
     if _ncalayer_ws_open():
         log_step("NCALayer уже запущен (порт 13579)")
         return
@@ -2300,13 +2318,14 @@ def parse_people_via_portal_sot():
     ИИН из колонки D листа «Отмены», адрес → колонка O, регион → колонка P.
     Автосохранение каждые AUTOSAVE_EVERY строк; при неудаче строка повторяется;
     при истечении access_token — новый ЭЦП-логин. Возвращает (processed, failed_rows).
-    ПОКА ТОЛЬКО ОМЕГА (company_id=1)."""
-    company_id = (os.environ.get("COMPANY_ID") or "1").strip()
-    if company_id != "1":
+    Реквизиты — PORTAL_SOT_BY_COMPANY[company_id] в scripts/config.py."""
+    company_id = _PORTAL_COMPANY_ID
+    if not _portal_cfg:
         raise RuntimeError(
-            f"Поиск адреса на portal-sot.kz пока настроен ТОЛЬКО для Омеги "
-            f"(company_id=1), а передан company_id={company_id}. "
-            f"Для остальных компаний добавьте их реквизиты portal-sot.kz."
+            f"Для компании {company_id} не настроен вход на portal-sot.kz "
+            f"(нет записи в PORTAL_SOT_BY_COMPANY в scripts/config.py — нужны "
+            f"свой ЭЦП-сертификат на этой машине и отдельный Chrome-профиль с "
+            f"разрешением portal-sot.kz → NCALayer)."
         )
 
     MAX_TOTAL_ATTEMPTS_PER_ROW = 6

@@ -19,10 +19,18 @@ from database import (
     init_db, get_db, User, Company, SessionLocal,
     Schedule, get_all_schedules, get_active_schedules, get_schedule,
     create_schedule, update_schedule, delete_schedule, toggle_schedule,
-    create_job_run, update_job_run_status, get_job_runs,
+    create_job_run, update_job_run_status, get_job_runs, get_job_run_script_keys, count_job_runs,
     get_user_companies, set_user_companies,
     JobRun,
+    Mailing,
+    get_mailings, get_mailing, create_mailing, update_mailing,
+    delete_mailing, toggle_mailing, get_scheduled_mailings,
+    get_mailing_reports, get_mailing_report, create_mailing_report,
+    update_mailing_report, delete_mailing_report,
+    get_chsi_contacts, get_chsi_contact, create_chsi_contact,
+    update_chsi_contact, delete_chsi_contact, bulk_add_chsi_contacts,
 )
+from mailing_common import PLACEHOLDERS
 from auth import (
     create_session, get_current_user, get_admin_user,
     verify_password, SESSIONS, user_can_access_company,
@@ -211,6 +219,30 @@ def scheduler_loop():
                             finally:
                                 db.close()
                         enqueue_scheduled_job(s.script_key, s.params(), company_id=s.company_id, company_name=company_name)
+
+            # ── Рассылки по отчётам со своим расписанием ──
+            for m in get_scheduled_mailings():
+                if m.schedule_hour == now.hour and m.schedule_minute == now.minute:
+                    if now.weekday() not in m.weekday_list():
+                        continue
+                    key = ("mailing", m.id, today_key)
+                    if _scheduler_ran_today.get(key):
+                        continue
+                    _scheduler_ran_today[key] = True
+                    company_name = None
+                    if m.company_id:
+                        db = SessionLocal()
+                        try:
+                            c = db.query(Company).filter(Company.id == m.company_id).first()
+                            company_name = c.name if c else None
+                        finally:
+                            db.close()
+                    enqueue_scheduled_job(
+                        "mailing_send",
+                        {"mailing_id": str(m.id), "mode": "real",
+                         "company_id": ",".join(str(x) for x in m.company_id_list())},
+                        company_id=m.company_id, company_name=company_name,
+                    )
         except Exception as e:
             print("SCHEDULER ERROR:", e)
         import time
@@ -912,6 +944,7 @@ th { background: #28a745; color: white; }
 
 <a href="/admin/user/new" class="btn btn-add">➕ Добавить пользователя</a>
 <a href="/admin/schedule" class="btn-add" style="text-decoration:none;">⏰ Расписание автозапуска</a>
+<a href="/admin/mailings" class="btn-add" style="text-decoration:none; background:#e67e22;">📨 Рассылки по отчётам</a>
 <a href="/monitoring" class="btn-add" style="text-decoration:none; background:#17a2b8;">📊 Мониторинг</a>
 <table>
   <tr><th>Логин</th><th>ФИО</th><th>Компания</th><th>Роль</th><th>Скрипты</th><th>Статус</th><th>Действия</th></tr>
@@ -1150,6 +1183,11 @@ from database import init_db, get_db, User, Company, get_user_scripts, set_user_
 from scripts_registry import SCRIPTS
 
 
+def visible_scripts() -> dict:
+    """SCRIPTS без служебных (hidden) — для списка на главной и чек-листа прав."""
+    return {k: v for k, v in SCRIPTS.items() if not getattr(v, "hidden", False)}
+
+
 def _resolve_active_company(current_user: User, session_id: Optional[str], requested: Optional[str], db: Session):
     """
     Определяет компанию, с которой автоматически запустятся скрипты.
@@ -1216,12 +1254,17 @@ def index(
     active_company_id, active_company = _resolve_active_company(current_user, session_id, company, db)
 
     if current_user.role == "admin":
-        available_scripts = list(SCRIPTS.values())
+        available_scripts = list(visible_scripts().values())
     else:
         allowed_keys = get_user_scripts(current_user.id)
-        available_scripts = [s for s in SCRIPTS.values() if s.key in allowed_keys]
+        available_scripts = [s for s in visible_scripts().values() if s.key in allowed_keys]
 
-    all_jobs = sorted(JOBS.values(), key=lambda x: x["created_ts"], reverse=True)
+    # Автозапуски (по расписанию) сюда не попадают — для них отдельная
+    # страница /monitoring с фильтрами по периоду/скрипту.
+    all_jobs = sorted(
+        (j for j in JOBS.values() if j.get("source") != "scheduler"),
+        key=lambda x: x["created_ts"], reverse=True,
+    )
 
     if allowed_company_ids is None:
         # admin — весь список задач, опционально сужаем по выбранной вкладке
@@ -1645,7 +1688,7 @@ def admin_panel(
     return render(
         ADMIN_HTML,
         users=users,
-        total_scripts=len(SCRIPTS),
+        total_scripts=len(visible_scripts()),
         user_scripts_count=user_scripts_count
     )
 
@@ -1662,7 +1705,7 @@ def add_user_form(
         USER_FORM_HTML,
         user=None,
         companies=companies,
-        scripts=SCRIPTS,
+        scripts=visible_scripts(),
         user_scripts=[],
         user_company_ids=[]
     )
@@ -1728,7 +1771,7 @@ def edit_user_form(
         USER_FORM_HTML,
         user=user,
         companies=companies,
-        scripts=SCRIPTS,
+        scripts=visible_scripts(),
         user_scripts=user_scripts,
         user_company_ids=user_company_ids
     )
@@ -2152,7 +2195,7 @@ def schedule_new_form(current_user: User = Depends(get_admin_user), db: Session 
     if isinstance(current_user, RedirectResponse):
         return current_user
     companies = db.query(Company).all()
-    return render(SCHEDULE_FORM_HTML, schedule=None, scripts=SCRIPTS, companies=companies)
+    return render(SCHEDULE_FORM_HTML, schedule=None, scripts=visible_scripts(), companies=companies)
 
 @app.post("/admin/schedule/new")
 async def schedule_new_submit(
@@ -2179,7 +2222,7 @@ def schedule_edit_form(schedule_id: int, current_user: User = Depends(get_admin_
         return current_user
     s = get_schedule(schedule_id)
     companies = db.query(Company).all()
-    return render(SCHEDULE_FORM_HTML, schedule=s, scripts=SCRIPTS, companies=companies)
+    return render(SCHEDULE_FORM_HTML, schedule=s, scripts=visible_scripts(), companies=companies)
 
 @app.post("/admin/schedule/{schedule_id}/edit")
 async def schedule_edit_submit(
@@ -2212,6 +2255,683 @@ def schedule_delete_route(schedule_id: int, current_user: User = Depends(get_adm
     return RedirectResponse("/admin/schedule", status_code=303)
 
 
+# ═══════════════════════════════════════════════════════════════
+# РАССЫЛКИ ПО ОТЧЁТАМ (ЧСИ)
+# ═══════════════════════════════════════════════════════════════
+
+MAILING_DEFAULT_SUBJECT = (
+    "Отчет по прекращенным производствам / "
+    "Тоқтатылған атқарушылық іс жүргізулер бойынша есеп"
+)
+
+MAILING_DEFAULT_BODY = """<html><body style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6">
+<p>Здравствуйте, {{ФИО_ЧСИ}}!</p>
+<p>Во вложении список займов ({{кол_во_записей}} шт.), по которым прекращено производство
+на основании пункта 7 статьи 47 Закона «Об исполнительном производстве и статусе судебных
+исполнителей», однако денежные средства нам не перечислены.</p>
+<p>Просим перечислить удержанные средства в нашу Компанию для изменения статуса кредита
+на «Погашен».</p>
+<p><b>{{компания}}</b><br>{{дата}}</p>
+</body></html>"""
+
+_MAIL_CSS = """
+body { font-family: Arial; max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+h2 { border-bottom: 2px solid #e67e22; padding-bottom: 10px; }
+table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+th, td { padding: 9px; text-align: left; border: 1px solid #ddd; font-size: 14px; }
+th { background: #e67e22; color: white; }
+.btn { padding: 6px 12px; text-decoration: none; border-radius: 4px; color: white; display: inline-block; margin: 2px; border: none; cursor: pointer; font-size: 13px; }
+.b-run { background: #007bff; } .b-test { background: #6f42c1; } .b-send { background: #dc3545; }
+.b-edit { background: #007bff; } .b-del { background: #6c757d; } .b-add { background: #28a745; padding: 9px 16px; }
+.form-group { margin: 14px 0; }
+label { display: block; margin-bottom: 5px; font-weight: bold; }
+input[type=text], input[type=email], input[type=time], select, textarea {
+  padding: 9px; width: 100%; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; font-size: 14px;
+}
+textarea { font-family: Consolas, monospace; }
+.hint { color: #666; font-size: 12px; margin-top: 4px; }
+.weekdays { display: flex; gap: 12px; flex-wrap: wrap; }
+.weekdays label { font-weight: normal; display: flex; align-items: center; gap: 4px; }
+.tabs a { display: inline-block; padding: 7px 14px; margin: 2px; background: #eee; border-radius: 5px; text-decoration: none; color: #333; }
+.tabs a.active { background: #e67e22; color: white; }
+.warn { background: #fff3cd; border: 1px solid #ffe08a; padding: 12px; border-radius: 6px; color: #7a5b00; }
+"""
+
+MAILINGS_LIST_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><title>Рассылки по отчётам</title>
+<style>""" + _MAIL_CSS + """</style></head><body>
+<a href="/admin">← Назад в админку</a>
+<h2>📨 Рассылки по отчётам</h2>
+<p>
+  <a href="/admin/mailings/new" class="btn b-add">➕ Новая рассылка</a>
+  <a href="/admin/mailings/reports" class="btn b-add" style="background:#17a2b8;">📋 Отчёты (SQL)</a>
+  <a href="/admin/mailings/contacts" class="btn b-add" style="background:#6610f2;">📇 Справочник ЧСИ</a>
+</p>
+<table>
+  <tr><th>Название</th><th>Компания</th><th>Источник</th><th>Колонка-ЧСИ</th><th>Расписание</th><th>Статус</th><th>Действия</th></tr>
+  {% for m in mailings %}
+  <tr>
+    <td>{{ m.name }}</td>
+    <td>{{ mailing_company_names.get(m.id, '—') }}</td>
+    <td>{% if m.sql_text and m.sql_text.strip() %}свой SQL{% elif m.report_id %}{{ report_map.get(m.report_id, 'отчёт') }}{% else %}<span style="color:#dc3545;">не задан</span>{% endif %}</td>
+    <td>{{ m.group_column }}</td>
+    <td>{% if m.schedule_enabled %}{{ '%02d:%02d' % (m.schedule_hour or 0, m.schedule_minute or 0) }}{% else %}—{% endif %}</td>
+    <td>{% if m.is_active %}<span style="color:#28a745;">вкл</span>{% else %}<span style="color:#6c757d;">выкл</span>{% endif %}</td>
+    <td style="white-space:nowrap;">
+      <form method="post" action="/admin/mailings/{{ m.id }}/test" style="display:inline;">
+        <button class="btn b-test" onclick="return confirm('Отправить ТЕСТОВОЕ письмо на {{ m.test_email or 'адрес из рассылки' }}?')">Тест</button>
+      </form>
+      <a href="/admin/mailings/{{ m.id }}/send" class="btn b-send">Отправить</a>
+      <a href="/admin/mailings/{{ m.id }}/edit" class="btn b-edit">Изменить</a>
+      <a href="/admin/mailings/{{ m.id }}/toggle" class="btn b-del">{% if m.is_active %}Выкл{% else %}Вкл{% endif %}</a>
+      <a href="/admin/mailings/{{ m.id }}/delete" class="btn b-del" onclick="return confirm('Удалить рассылку?')">✕</a>
+    </td>
+  </tr>
+  {% endfor %}
+  {% if not mailings %}<tr><td colspan="7" style="color:#666;">Пока нет ни одной рассылки.</td></tr>{% endif %}
+</table>
+</body></html>
+"""
+
+MAILING_FORM_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><title>Рассылка</title>
+<style>""" + _MAIL_CSS + """</style></head><body>
+<a href="/admin/mailings">← Назад к рассылкам</a>
+<h2>{% if mailing %}Изменить рассылку{% else %}Новая рассылка{% endif %}</h2>
+<form method="post">
+  <div class="form-group">
+    <label>Название</label>
+    <input type="text" name="name" required value="{{ mailing.name if mailing else '' }}">
+  </div>
+  <div class="form-group">
+    <label>Компани{{ 'я' if companies|length == 1 else 'и' }} (можно выбрать несколько — рассылка
+      прогонится по очереди, свой SQL/SMTP/справочник ЧСИ для каждой)</label>
+    {% set selected_ids = mailing.company_id_list() if mailing else [] %}
+    {% for c in companies %}
+      <label style="display:inline-block;width:auto;margin-right:16px;font-weight:normal;">
+        <input type="checkbox" name="company_ids" value="{{ c.id }}"
+          {% if c.id in selected_ids %}checked{% endif %} style="width:auto;"> {{ c.name }}
+      </label>
+    {% endfor %}
+  </div>
+  <div class="form-group">
+    <label>Готовый отчёт (SQL)</label>
+    <select name="report_id">
+      <option value="">— не использовать —</option>
+      {% for r in reports %}
+        <option value="{{ r.id }}" {% if mailing and mailing.report_id == r.id %}selected{% endif %}>{{ r.name }}{% if r.company_id %} ({{ company_map.get(r.company_id, '') }}){% endif %}</option>
+      {% endfor %}
+    </select>
+    <div class="hint">Управление отчётами — на странице «Отчёты (SQL)».</div>
+  </div>
+  <div class="form-group">
+    <label>…или свой SQL-запрос</label>
+    <textarea name="sql_text" rows="8" placeholder="SELECT ... WHERE ... l.F209 = {company_filter}">{{ mailing.sql_text if mailing and mailing.sql_text else '' }}</textarea>
+    <div class="hint">Если это поле заполнено — используется оно (отчёт игнорируется). Только SELECT.
+      Подстановка <code>{company_filter}</code> заменяется на имя компании в CRM.</div>
+  </div>
+  <div class="form-group">
+    <label>Колонка результата, по которой группировать (= ЧСИ)</label>
+    <input type="text" name="group_column" required value="{{ mailing.group_column if mailing else '' }}" placeholder="напр. ЧСИ или ФИО ЧСИ">
+  </div>
+  <div class="form-group">
+    <label>Тема письма</label>
+    <input type="text" name="subject" required value="{{ mailing.subject if mailing else default_subject }}">
+  </div>
+  <div class="form-group">
+    <label>Текст письма (HTML)</label>
+    <textarea name="body_html" rows="14" required>{{ mailing.body_html if mailing else default_body }}</textarea>
+    <div class="hint">Доступные подстановки:
+      {% for ph, desc in placeholders.items() %}<code>{{ ph }}</code> — {{ desc }}{% if not loop.last %}; {% endif %}{% endfor %}</div>
+  </div>
+  <div class="form-group">
+    <label><input type="checkbox" name="attach_enabled" value="1" {% if not mailing or mailing.attach_enabled %}checked{% endif %} style="width:auto;"> Прикладывать xlsx со строками этого ЧСИ</label>
+  </div>
+  <div class="form-group">
+    <label>Тестовый email (для кнопки «Тест»)</label>
+    <input type="text" name="test_email" value="{{ mailing.test_email or '' if mailing else '' }}">
+  </div>
+  <div class="form-group">
+    <label>Скрытая копия (BCC), адреса через запятую</label>
+    <input type="text" name="bcc" value="{{ mailing.bcc or '' if mailing else '' }}">
+    <div class="hint">Объединяется с BCC, заданным в config.MAILING_SMTP для компании.</div>
+  </div>
+  <div class="form-group">
+    <label><input type="checkbox" name="is_active" value="1" {% if not mailing or mailing.is_active %}checked{% endif %} style="width:auto;"> Рассылка активна</label>
+  </div>
+
+  <fieldset style="border:1px solid #ddd; border-radius:6px; padding:12px;">
+    <legend>Автозапуск по расписанию</legend>
+    <div class="form-group">
+      <label><input type="checkbox" name="schedule_enabled" value="1" {% if mailing and mailing.schedule_enabled %}checked{% endif %} style="width:auto;"> Включить расписание (режим «реальная отправка»)</label>
+    </div>
+    <div class="form-group">
+      <label>Время</label>
+      <input type="time" name="sched_time" value="{{ '%02d:%02d' % (mailing.schedule_hour or 9, mailing.schedule_minute or 0) if mailing else '09:00' }}">
+    </div>
+    <div class="form-group">
+      <label>Дни недели</label>
+      <div class="weekdays">
+        {% set names = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс'] %}
+        {% set wl = mailing.weekday_list() if mailing else [0,1,2,3,4,5,6] %}
+        {% for i in range(7) %}
+          <label><input type="checkbox" name="weekdays" value="{{ i }}" {% if i in wl %}checked{% endif %}> {{ names[i] }}</label>
+        {% endfor %}
+      </div>
+    </div>
+  </fieldset>
+
+  <p><button type="submit" class="btn b-add" style="font-size:15px;">💾 Сохранить</button></p>
+</form>
+</body></html>
+"""
+
+MAILING_CONFIRM_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><title>Отправка рассылки</title>
+<style>""" + _MAIL_CSS + """</style></head><body>
+<a href="/admin/mailings">← Назад к рассылкам</a>
+<h2>Реальная отправка: {{ mailing.name }}</h2>
+<div class="warn">
+  <p>Письма уйдут <b>каждому ЧСИ</b> на его адрес из справочника. Действие необратимо.</p>
+  <ul>
+    <li>Компани{{ 'я' if contacts_by_company|length == 1 else 'и' }}: <b>{{ company_name }}</b></li>
+    <li>Источник: {% if mailing.sql_text and mailing.sql_text.strip() %}свой SQL{% else %}{{ report_name }}{% endif %}</li>
+    <li>Активных ЧСИ в справочнике: <b>{{ contacts_count }}</b>
+      {% if contacts_by_company|length > 1 %}
+      <ul>{% for cname, n in contacts_by_company.items() %}<li>{{ cname }}: {{ n }}</li>{% endfor %}</ul>
+      {% endif %}
+    </li>
+    <li>Вложение: {{ 'да' if mailing.attach_enabled else 'нет' }}</li>
+    <li>BCC: {{ mailing.bcc or '—' }}</li>
+  </ul>
+</div>
+<form method="post" style="margin-top:16px;">
+  <button type="submit" class="btn b-send" style="font-size:15px;">Да, отправить всем</button>
+  <a href="/admin/mailings" class="btn b-del" style="font-size:15px;">Отмена</a>
+</form>
+</body></html>
+"""
+
+MAILING_REPORTS_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><title>Отчёты (SQL)</title>
+<style>""" + _MAIL_CSS + """</style></head><body>
+<a href="/admin/mailings">← Назад к рассылкам</a>
+<h2>📋 Отчёты (SQL)</h2>
+<p><a href="/admin/mailings/reports/new" class="btn b-add">➕ Новый отчёт</a></p>
+<table>
+  <tr><th>Название</th><th>Компания</th><th>SQL (начало)</th><th>Действия</th></tr>
+  {% for r in reports %}
+  <tr>
+    <td>{{ r.name }}</td>
+    <td>{{ company_map.get(r.company_id, 'общий') }}</td>
+    <td><code>{{ (r.sql_text or '')[:80] }}…</code></td>
+    <td style="white-space:nowrap;">
+      <a href="/admin/mailings/reports/{{ r.id }}/edit" class="btn b-edit">Изменить</a>
+      <a href="/admin/mailings/reports/{{ r.id }}/delete" class="btn b-del" onclick="return confirm('Удалить отчёт?')">✕</a>
+    </td>
+  </tr>
+  {% endfor %}
+  {% if not reports %}<tr><td colspan="4" style="color:#666;">Пока нет отчётов.</td></tr>{% endif %}
+</table>
+</body></html>
+"""
+
+MAILING_REPORT_FORM_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><title>Отчёт (SQL)</title>
+<style>""" + _MAIL_CSS + """</style></head><body>
+<a href="/admin/mailings/reports">← Назад к отчётам</a>
+<h2>{% if report %}Изменить отчёт{% else %}Новый отчёт{% endif %}</h2>
+<form method="post">
+  <div class="form-group">
+    <label>Название</label>
+    <input type="text" name="name" required value="{{ report.name if report else '' }}">
+  </div>
+  <div class="form-group">
+    <label>Компания</label>
+    <select name="company_id">
+      <option value="">— общий (для всех) —</option>
+      {% for c in companies %}
+        <option value="{{ c.id }}" {% if report and report.company_id == c.id %}selected{% endif %}>{{ c.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="form-group">
+    <label>SQL-запрос (только SELECT)</label>
+    <textarea name="sql_text" rows="16" required>{{ report.sql_text if report else '' }}</textarea>
+    <div class="hint">Подстановка <code>{company_filter}</code> в WHERE заменяется на имя компании
+      в CRM (поле l.F209) при запуске рассылки.</div>
+  </div>
+  <p><button type="submit" class="btn b-add" style="font-size:15px;">💾 Сохранить</button></p>
+</form>
+</body></html>
+"""
+
+CHSI_CONTACTS_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><title>Справочник ЧСИ</title>
+<style>""" + _MAIL_CSS + """</style></head><body>
+<a href="/admin/mailings">← Назад к рассылкам</a>
+<h2>📇 Справочник ЧСИ</h2>
+<div class="tabs">
+  {% for c in companies %}
+    <a href="/admin/mailings/contacts?company_id={{ c.id }}" class="{% if c.id == company_id %}active{% endif %}">{{ c.name }}</a>
+  {% endfor %}
+</div>
+
+{% if company_id %}
+<h3 style="margin-top:18px;">Добавить ЧСИ</h3>
+<form method="post" action="/admin/mailings/contacts/add">
+  <input type="hidden" name="company_id" value="{{ company_id }}">
+  <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:end;">
+    <div style="flex:2;"><label>ФИО ЧСИ</label><input type="text" name="fio" required></div>
+    <div style="flex:2;"><label>Email</label><input type="text" name="email" required></div>
+    <div><button type="submit" class="btn b-add">Добавить</button></div>
+  </div>
+</form>
+
+<h3 style="margin-top:18px;">Загрузить из xlsx</h3>
+<form method="post" action="/admin/mailings/contacts/import" enctype="multipart/form-data">
+  <input type="hidden" name="company_id" value="{{ company_id }}">
+  <div style="display:flex; gap:10px; align-items:end;">
+    <div><input type="file" name="file" accept=".xlsx,.xls" required></div>
+    <div><button type="submit" class="btn b-add">Импорт</button></div>
+  </div>
+  <div class="hint">Колонка A — ФИО, колонка B — email. Первая строка (заголовок) пропускается.</div>
+</form>
+{% if imported is not none %}<p style="color:#28a745;">Добавлено записей: {{ imported }}</p>{% endif %}
+
+<h3 style="margin-top:18px;">Контакты ({{ contacts|length }})</h3>
+{% for k in contacts %}
+<form method="post" action="/admin/mailings/contacts/{{ k.id }}/edit"
+      style="display:flex; gap:10px; align-items:center; padding:6px 0; border-bottom:1px solid #eee; flex-wrap:wrap;">
+  <input type="hidden" name="company_id" value="{{ company_id }}">
+  <input type="text" name="fio" value="{{ k.fio }}" style="flex:2; min-width:180px;">
+  <input type="text" name="email" value="{{ k.email }}" style="flex:2; min-width:180px;">
+  <label style="font-weight:normal; white-space:nowrap;">
+    <input type="checkbox" name="is_active" value="1" {% if k.is_active %}checked{% endif %} style="width:auto;"> активен
+  </label>
+  <button type="submit" class="btn b-edit">Сохранить</button>
+  <a href="/admin/mailings/contacts/{{ k.id }}/delete?company_id={{ company_id }}" class="btn b-del" onclick="return confirm('Удалить?')">✕</a>
+</form>
+{% endfor %}
+{% if not contacts %}<p style="color:#666;">Пока нет контактов для этой компании.</p>{% endif %}
+{% else %}
+<p style="margin-top:18px; color:#666;">Выберите компанию.</p>
+{% endif %}
+</body></html>
+"""
+
+
+def _mailing_company_map(db):
+    return {c.id: c.name for c in db.query(Company).all()}
+
+
+def _mailing_form_common(db):
+    companies = db.query(Company).order_by(Company.id).all()
+    return companies, {c.id: c.name for c in companies}
+
+
+@app.get("/admin/mailings", response_class=HTMLResponse)
+def mailings_list(current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    mailings = get_mailings()
+    report_map = {r.id: r.name for r in get_mailing_reports()}
+    cmap = _mailing_company_map(db)
+    mailing_company_names = {
+        m.id: ", ".join(cmap.get(cid, f"#{cid}") for cid in m.company_id_list())
+        for m in mailings
+    }
+    return render(
+        MAILINGS_LIST_HTML,
+        mailings=mailings,
+        company_map=cmap,
+        mailing_company_names=mailing_company_names,
+        report_map=report_map,
+    )
+
+
+@app.get("/admin/mailings/new", response_class=HTMLResponse)
+def mailing_new_form(current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    companies, cmap = _mailing_form_common(db)
+    return render(
+        MAILING_FORM_HTML,
+        mailing=None, companies=companies, company_map=cmap,
+        reports=get_mailing_reports(), placeholders=PLACEHOLDERS,
+        default_subject=MAILING_DEFAULT_SUBJECT, default_body=MAILING_DEFAULT_BODY,
+    )
+
+
+def _mailing_form_values(form):
+    t = (form.get("sched_time") or "09:00").strip()
+    try:
+        sh, sm = [int(x) for x in t.split(":")]
+    except Exception:
+        sh, sm = 9, 0
+    report_id = form.get("report_id")
+    company_ids = [int(x) for x in form.getlist("company_ids") if x.strip().isdigit()]
+    return dict(
+        name=(form.get("name") or "").strip(),
+        company_id=company_ids[0] if company_ids else None,
+        extra_company_ids=",".join(str(x) for x in company_ids[1:]) or None,
+        report_id=int(report_id) if report_id else None,
+        sql_text=(form.get("sql_text") or "").strip() or None,
+        group_column=(form.get("group_column") or "").strip(),
+        subject=(form.get("subject") or "").strip(),
+        body_html=form.get("body_html") or "",
+        attach_enabled=bool(form.get("attach_enabled")),
+        test_email=(form.get("test_email") or "").strip() or None,
+        bcc=(form.get("bcc") or "").strip() or None,
+        is_active=bool(form.get("is_active")),
+        schedule_enabled=bool(form.get("schedule_enabled")),
+        schedule_hour=sh,
+        schedule_minute=sm,
+        schedule_weekdays=",".join(form.getlist("weekdays")) or "0,1,2,3,4,5,6",
+    )
+
+
+@app.post("/admin/mailings/new")
+async def mailing_new_submit(request: Request, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    form = await request.form()
+    vals = _mailing_form_values(form)
+    if not vals["company_id"]:
+        return HTMLResponse("⛔ Не выбрана компания. <a href='javascript:history.back()'>назад</a>", status_code=400)
+    create_mailing(**vals)
+    return RedirectResponse("/admin/mailings", status_code=303)
+
+
+@app.get("/admin/mailings/{mailing_id}/edit", response_class=HTMLResponse)
+def mailing_edit_form(mailing_id: int, current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    companies, cmap = _mailing_form_common(db)
+    return render(
+        MAILING_FORM_HTML,
+        mailing=m, companies=companies, company_map=cmap,
+        reports=get_mailing_reports(), placeholders=PLACEHOLDERS,
+        default_subject=MAILING_DEFAULT_SUBJECT, default_body=MAILING_DEFAULT_BODY,
+    )
+
+
+@app.post("/admin/mailings/{mailing_id}/edit")
+async def mailing_edit_submit(mailing_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    form = await request.form()
+    vals = _mailing_form_values(form)
+    if not vals["company_id"]:
+        return HTMLResponse("⛔ Не выбрана компания. <a href='javascript:history.back()'>назад</a>", status_code=400)
+    update_mailing(mailing_id, **vals)
+    return RedirectResponse("/admin/mailings", status_code=303)
+
+
+@app.get("/admin/mailings/{mailing_id}/delete")
+def mailing_delete(mailing_id: int, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    delete_mailing(mailing_id)
+    return RedirectResponse("/admin/mailings", status_code=303)
+
+
+@app.get("/admin/mailings/{mailing_id}/toggle")
+def mailing_toggle(mailing_id: int, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    toggle_mailing(mailing_id)
+    return RedirectResponse("/admin/mailings", status_code=303)
+
+
+def _enqueue_mailing_job(mailing, mode: str, username: str) -> str:
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = make_job_dir(job_id)
+    ids = mailing.company_id_list()
+    db = SessionLocal()
+    try:
+        names = [c.name for c in db.query(Company).filter(Company.id.in_(ids)).all()]
+        company_name = ", ".join(names) if names else None
+    finally:
+        db.close()
+    params = {"mailing_id": str(mailing.id), "mode": mode, "company_id": ",".join(str(x) for x in ids)}
+    JOBS[job_id] = {
+        "id": job_id, "script_key": "mailing_send", "params": params,
+        "status": "queued", "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "started_at": None, "finished_at": None, "job_dir": str(job_dir),
+        "result_zip": None, "created_ts": datetime.now().timestamp(),
+        "username": username, "company_name": company_name or "—",
+        "company_id": mailing.company_id, "source": "manual",
+        "scheduled_ts": None, "scheduled_display": None,
+    }
+    create_job_run(job_id, "mailing_send", source="manual", username=username,
+                   company_id=mailing.company_id, company_name=company_name)
+    with LOCK:
+        QUEUE.append(job_id)
+    return job_id
+
+
+@app.post("/admin/mailings/{mailing_id}/test")
+def mailing_test(mailing_id: int, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    _enqueue_mailing_job(m, "test", getattr(current_user, "username", "—"))
+    return RedirectResponse("/", status_code=303)
+
+
+@app.get("/admin/mailings/{mailing_id}/send", response_class=HTMLResponse)
+def mailing_send_confirm(mailing_id: int, current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    ids = m.company_id_list()
+    companies = db.query(Company).filter(Company.id.in_(ids)).all()
+    cname_by_id = {c.id: c.name for c in companies}
+    contacts_by_company = {
+        cname_by_id.get(cid, f"#{cid}"): len(get_chsi_contacts(cid, only_active=True))
+        for cid in ids
+    }
+    report_name = "—"
+    if m.report_id:
+        r = get_mailing_report(m.report_id)
+        report_name = r.name if r else "отчёт"
+    return render(
+        MAILING_CONFIRM_HTML,
+        mailing=m, company_name=", ".join(cname_by_id.get(cid, f"#{cid}") for cid in ids),
+        contacts_by_company=contacts_by_company,
+        contacts_count=sum(contacts_by_company.values()), report_name=report_name,
+    )
+
+
+@app.post("/admin/mailings/{mailing_id}/send")
+def mailing_send_run(mailing_id: int, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    _enqueue_mailing_job(m, "real", getattr(current_user, "username", "—"))
+    return RedirectResponse("/", status_code=303)
+
+
+# ── Отчёты (SQL) ─────────────────────────────────────────────
+
+@app.get("/admin/mailings/reports", response_class=HTMLResponse)
+def mailing_reports_list(current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    return render(
+        MAILING_REPORTS_HTML,
+        reports=get_mailing_reports(),
+        company_map=_mailing_company_map(db),
+    )
+
+
+@app.get("/admin/mailings/reports/new", response_class=HTMLResponse)
+def mailing_report_new_form(current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    companies, _ = _mailing_form_common(db)
+    return render(MAILING_REPORT_FORM_HTML, report=None, companies=companies)
+
+
+@app.post("/admin/mailings/reports/new")
+async def mailing_report_new_submit(request: Request, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    form = await request.form()
+    cid = form.get("company_id")
+    create_mailing_report(
+        name=(form.get("name") or "").strip(),
+        sql_text=form.get("sql_text") or "",
+        company_id=int(cid) if cid else None,
+    )
+    return RedirectResponse("/admin/mailings/reports", status_code=303)
+
+
+@app.get("/admin/mailings/reports/{report_id}/edit", response_class=HTMLResponse)
+def mailing_report_edit_form(report_id: int, current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    r = get_mailing_report(report_id)
+    if not r:
+        return HTMLResponse("Отчёт не найден", status_code=404)
+    companies, _ = _mailing_form_common(db)
+    return render(MAILING_REPORT_FORM_HTML, report=r, companies=companies)
+
+
+@app.post("/admin/mailings/reports/{report_id}/edit")
+async def mailing_report_edit_submit(report_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    form = await request.form()
+    cid = form.get("company_id")
+    update_mailing_report(
+        report_id,
+        name=(form.get("name") or "").strip(),
+        sql_text=form.get("sql_text") or "",
+        company_id=int(cid) if cid else None,
+    )
+    return RedirectResponse("/admin/mailings/reports", status_code=303)
+
+
+@app.get("/admin/mailings/reports/{report_id}/delete")
+def mailing_report_delete(report_id: int, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    delete_mailing_report(report_id)
+    return RedirectResponse("/admin/mailings/reports", status_code=303)
+
+
+# ── Справочник ЧСИ ───────────────────────────────────────────
+
+@app.get("/admin/mailings/contacts", response_class=HTMLResponse)
+def chsi_contacts_page(
+    company_id: Optional[int] = None,
+    imported: Optional[int] = None,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    companies = db.query(Company).order_by(Company.id).all()
+    contacts = get_chsi_contacts(company_id) if company_id else []
+    return render(
+        CHSI_CONTACTS_HTML,
+        companies=companies, company_id=company_id,
+        contacts=contacts, imported=imported,
+    )
+
+
+@app.post("/admin/mailings/contacts/add")
+async def chsi_contact_add(request: Request, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    form = await request.form()
+    cid = int(form.get("company_id"))
+    create_chsi_contact(cid, (form.get("fio") or "").strip(), (form.get("email") or "").strip())
+    return RedirectResponse(f"/admin/mailings/contacts?company_id={cid}", status_code=303)
+
+
+@app.post("/admin/mailings/contacts/{contact_id}/edit")
+async def chsi_contact_edit(contact_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    form = await request.form()
+    cid = int(form.get("company_id"))
+    update_chsi_contact(
+        contact_id,
+        fio=(form.get("fio") or "").strip(),
+        email=(form.get("email") or "").strip(),
+        is_active=bool(form.get("is_active")),
+    )
+    return RedirectResponse(f"/admin/mailings/contacts?company_id={cid}", status_code=303)
+
+
+@app.get("/admin/mailings/contacts/{contact_id}/delete")
+def chsi_contact_delete(contact_id: int, company_id: int, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    delete_chsi_contact(contact_id)
+    return RedirectResponse(f"/admin/mailings/contacts?company_id={company_id}", status_code=303)
+
+
+@app.post("/admin/mailings/contacts/import")
+async def chsi_contacts_import(request: Request, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    from openpyxl import load_workbook
+    form = await request.form()
+    cid = int(form.get("company_id"))
+    upload = form.get("file")
+    added = 0
+    if upload is not None and getattr(upload, "filename", ""):
+        dest = UPLOADS_DIR / f"chsi_import_{uuid.uuid4().hex[:8]}.xlsx"
+        dest.write_bytes(await upload.read())
+        try:
+            wb = load_workbook(dest, data_only=True, read_only=True)
+            ws = wb.active
+            rows = []
+            email_col = 1  # по умолчанию колонка B, как в старом узком формате
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if not row:
+                    continue
+                if i == 0:
+                    # ищем колонку "Email" по заголовку — файлы бывают шире двух колонок
+                    # (напр. ФИО/Область/Адрес/Телефон/Email)
+                    header_hit = next(
+                        (j for j, v in enumerate(row) if v and "email" in str(v).strip().lower()),
+                        None,
+                    )
+                    if header_hit is not None:
+                        email_col = header_hit
+                        continue  # это точно строка-заголовок
+                    email0 = row[1] if len(row) > 1 else None
+                    if email0 and "@" in str(email0):
+                        pass  # не заголовок, первая строка — уже данные
+                    else:
+                        continue  # строка-заголовок без явного "Email"
+                fio = row[0] if len(row) > 0 else None
+                email = row[email_col] if len(row) > email_col else None
+                rows.append((str(fio or "").strip(), str(email or "").strip()))
+            wb.close()
+            added = bulk_add_chsi_contacts(cid, rows)
+        finally:
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+    return RedirectResponse(f"/admin/mailings/contacts?company_id={cid}&imported={added}", status_code=303)
+
+
 MONITORING_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Мониторинг</title>
 <style>
@@ -2230,6 +2950,15 @@ th { background: #17a2b8; color: white; }
 .filters a { margin-right: 10px; padding: 6px 12px; background: #e9ecef; border-radius: 4px; text-decoration: none; color: #333; }
 .filters a.active { background: #17a2b8; color: white; }
 .company-badge { display: inline-block; padding: 3px 10px; background: #e7f1ff; color: #0b4f6c; border-radius: 12px; font-size: 12px; font-weight: 500; }
+.script-stats { width: 100%; border-collapse: collapse; margin: 10px 0 25px; }
+.script-stats th, .script-stats td { padding: 6px 10px; border: 1px solid #ddd; text-align: right; font-size: 13px; }
+.script-stats th:first-child, .script-stats td:first-child { text-align: left; }
+.script-stats th { background: #f1f3f5; }
+.script-stats tr.active-row { background: #e7f1ff; }
+.date-form { display: inline-flex; gap: 6px; align-items: center; margin-right: 10px; }
+.date-form input[type=date] { padding: 4px 6px; }
+.date-form button { padding: 6px 12px; background: #17a2b8; color: white; border: none; border-radius: 4px; cursor: pointer; }
+select.script-select { padding: 6px 10px; border-radius: 4px; border: 1px solid #ced4da; }
 </style>
 {% if auto_refresh %}<meta http-equiv="refresh" content="15">{% endif %}
 </head>
@@ -2238,22 +2967,68 @@ th { background: #17a2b8; color: white; }
 <h2>📊 Мониторинг автоматических запусков</h2>
 
 <div class="summary">
-  <div class="card"><div class="num" style="color:#28a745;">{{ success_count }}</div>Успешно (сегодня)</div>
-  <div class="card"><div class="num" style="color:#dc3545;">{{ error_count }}</div>Ошибок (сегодня)</div>
+  <div class="card"><div class="num" style="color:#28a745;">{{ success_count }}</div>Успешно ({{ period_label }})</div>
+  <div class="card"><div class="num" style="color:#dc3545;">{{ error_count }}</div>Ошибок ({{ period_label }})</div>
   <div class="card"><div class="num" style="color:#ffc107;">{{ running_count }}</div>Выполняется</div>
 </div>
 
 <div class="filters">
-  <a href="/monitoring?filter=all&company={{ current_company }}" class="{% if filter=='all' %}active{% endif %}">Все</a>
-  <a href="/monitoring?filter=today&company={{ current_company }}" class="{% if filter=='today' %}active{% endif %}">Сегодня</a>
-  <a href="/monitoring?filter=error&company={{ current_company }}" class="{% if filter=='error' %}active{% endif %}">Только ошибки</a>
+  <a href="{{ mk_url(period='today') }}" class="{% if period=='today' %}active{% endif %}">За день</a>
+  <a href="{{ mk_url(period='week') }}" class="{% if period=='week' %}active{% endif %}">За неделю</a>
+  <a href="{{ mk_url(period='month') }}" class="{% if period=='month' %}active{% endif %}">За месяц</a>
+  <a href="{{ mk_url(period='all') }}" class="{% if period=='all' %}active{% endif %}">Всё время</a>
 </div>
 <div class="filters">
-  <a href="/monitoring?filter={{ filter }}&company=all" class="{% if current_company=='all' %}active{% endif %}">Все компании</a>
+  <form class="date-form" method="get" action="/monitoring">
+    <input type="hidden" name="status" value="{{ status }}">
+    <input type="hidden" name="company" value="{{ current_company }}">
+    <input type="hidden" name="script" value="{{ current_script }}">
+    <input type="hidden" name="period" value="custom">
+    с <input type="date" name="date_from" value="{{ date_from or '' }}">
+    по <input type="date" name="date_to" value="{{ date_to or '' }}">
+    <button type="submit">Показать</button>
+  </form>
+</div>
+<div class="filters">
+  <a href="{{ mk_url(status='all') }}" class="{% if status=='all' %}active{% endif %}">Все статусы</a>
+  <a href="{{ mk_url(status='error') }}" class="{% if status=='error' %}active{% endif %}">Только ошибки</a>
+</div>
+<div class="filters">
+  <a href="{{ mk_url(company='all') }}" class="{% if current_company=='all' %}active{% endif %}">Все компании</a>
   {% for c in companies %}
-    <a href="/monitoring?filter={{ filter }}&company={{ c.id }}" class="{% if current_company==c.id|string %}active{% endif %}">{{ c.name }}</a>
+    <a href="{{ mk_url(company=c.id) }}" class="{% if current_company==c.id|string %}active{% endif %}">{{ c.name }}</a>
   {% endfor %}
 </div>
+<div class="filters">
+  <form method="get" action="/monitoring" style="display:inline;">
+    <input type="hidden" name="status" value="{{ status }}">
+    <input type="hidden" name="company" value="{{ current_company }}">
+    <input type="hidden" name="period" value="{{ period }}">
+    <input type="hidden" name="date_from" value="{{ date_from or '' }}">
+    <input type="hidden" name="date_to" value="{{ date_to or '' }}">
+    <select class="script-select" name="script" onchange="this.form.submit()">
+      <option value="all" {% if current_script=='all' %}selected{% endif %}>Все скрипты</option>
+      {% for sk in script_keys %}
+        <option value="{{ sk }}" {% if current_script==sk %}selected{% endif %}>{{ scripts[sk].title if sk in scripts else sk }}</option>
+      {% endfor %}
+    </select>
+  </form>
+</div>
+
+<h3>По скриптам ({{ period_label }})</h3>
+<table class="script-stats">
+  <tr><th>Скрипт</th><th>Всего</th><th>✅ Успешно</th><th>❌ Ошибок</th><th>⏳ Выполняется</th></tr>
+  {% for sk, st in by_script.items() %}
+  <tr class="{% if current_script==sk %}active-row{% endif %}">
+    <td><a href="{{ mk_url(script=sk) }}">{{ scripts[sk].title if sk in scripts else sk }}</a></td>
+    <td>{{ st.total }}</td>
+    <td style="color:#28a745;">{{ st.success }}</td>
+    <td style="color:#dc3545;">{{ st.error }}</td>
+    <td style="color:#ffc107;">{{ st.running }}</td>
+  </tr>
+  {% endfor %}
+  {% if not by_script %}<tr><td colspan="5" style="text-align:center; color:#666;">Нет запусков за этот период.</td></tr>{% endif %}
+</table>
 
 <table>
   <tr><th>Время</th><th>Скрипт</th><th>Компания</th><th>Статус</th><th>Начало</th><th>Конец</th><th>Ошибка</th><th>Логи</th><th>Действия</th></tr>
@@ -2281,13 +3056,26 @@ th { background: #17a2b8; color: white; }
   </tr>
   {% endfor %}
 </table>
+
+<div class="filters" style="display:flex; align-items:center; justify-content:space-between;">
+  <span style="color:#666; font-size:13px;">Всего запусков: {{ total_runs }} | страница {{ page }} из {{ total_pages }}</span>
+  <span>
+    {% if page > 1 %}<a href="{{ mk_url(page=page-1) }}">← Назад</a>{% endif %}
+    {% if page < total_pages %}<a href="{{ mk_url(page=page+1) }}">Вперёд →</a>{% endif %}
+  </span>
+</div>
 </body></html>
 """
 
 @app.get("/monitoring", response_class=HTMLResponse)
 def monitoring(
-    filter: str = "today",
+    status: str = "all",
+    period: str = "today",
+    date_from: str = None,
+    date_to: str = None,
     company: str = "all",
+    script: str = "all",
+    page: int = 1,
     current_user: User = Depends(get_admin_user),
     db: Session = Depends(get_db),
 ):
@@ -2295,28 +3083,95 @@ def monitoring(
         return current_user
 
     company_id = int(company) if company != "all" else None
+    script_key = script if script != "all" else None
+    page = max(1, page)
+    PAGE_SIZE = 20
 
-    if filter == "error":
-        runs = get_job_runs(source="scheduler", status="error", limit=200, company_id=company_id)
-    elif filter == "today":
-        runs = get_job_runs(source="scheduler", only_today=True, limit=200, company_id=company_id)
-    else:
-        runs = get_job_runs(source="scheduler", limit=200, company_id=company_id)
+    today = datetime.now().date()
+    df = dt_ = None
+    period_label = "всё время"
+    if period == "today":
+        df = today
+        period_label = "сегодня"
+    elif period == "week":
+        df = today - timedelta(days=6)
+        period_label = "за 7 дней"
+    elif period == "month":
+        df = today - timedelta(days=29)
+        period_label = "за 30 дней"
+    elif period == "custom":
+        try:
+            df = datetime.strptime(date_from, "%Y-%m-%d").date() if date_from else None
+        except ValueError:
+            df = None
+        try:
+            dt_ = datetime.strptime(date_to, "%Y-%m-%d").date() if date_to else None
+        except ValueError:
+            dt_ = None
+        if df and dt_:
+            period_label = f"{df.strftime('%d.%m.%Y')} — {dt_.strftime('%d.%m.%Y')}"
+        elif df:
+            period_label = f"с {df.strftime('%d.%m.%Y')}"
+        elif dt_:
+            period_label = f"по {dt_.strftime('%d.%m.%Y')}"
+        else:
+            period_label = "всё время"
+    # period == "all" — df/dt_ остаются None
 
-    today_runs = get_job_runs(source="scheduler", only_today=True, limit=1000, company_id=company_id)
-    success_count = len([j for j in today_runs if j.status == "success"])
-    error_count = len([j for j in today_runs if j.status == "error"])
-    running_count = len([j for j in today_runs if j.status == "running"])
+    status_filter = "error" if status == "error" else None
+
+    total_runs = count_job_runs(source="scheduler", status=status_filter, date_from=df, date_to=dt_,
+                                 script_key=script_key, company_id=company_id)
+    total_pages = max(1, -(-total_runs // PAGE_SIZE))  # ceil
+    page = min(page, total_pages)
+    runs = get_job_runs(source="scheduler", status=status_filter, date_from=df, date_to=dt_,
+                         script_key=script_key, limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE,
+                         company_id=company_id)
+
+    # для сводки/разбивки по скриптам — тот же период+компания, без фильтра статуса/скрипта
+    period_runs = get_job_runs(source="scheduler", date_from=df, date_to=dt_,
+                                limit=5000, company_id=company_id)
+    success_count = len([j for j in period_runs if j.status == "success"])
+    error_count = len([j for j in period_runs if j.status == "error"])
+    running_count = len([j for j in period_runs if j.status == "running"])
+
+    by_script = {}
+    for j in period_runs:
+        st = by_script.setdefault(j.script_key, {"total": 0, "success": 0, "error": 0, "running": 0})
+        st["total"] += 1
+        if j.status in ("success", "error", "running"):
+            st[j.status] += 1
+    by_script = dict(sorted(by_script.items(), key=lambda kv: -kv[1]["total"]))
 
     companies = db.query(Company).all()
+    script_keys = get_job_run_script_keys()
+
+    def mk_url(**overrides):
+        params = {
+            "status": status, "period": period, "date_from": date_from or "",
+            "date_to": date_to or "", "company": company, "script": script, "page": 1,
+        }
+        params.update({k: str(v) for k, v in overrides.items()})
+        return "/monitoring?" + "&".join(f"{k}={v}" for k, v in params.items())
 
     return render(
         MONITORING_HTML,
         runs=runs,
         scripts=SCRIPTS,
-        filter=filter,
+        status=status,
+        period=period,
+        period_label=period_label,
+        date_from=date_from,
+        date_to=date_to,
         companies=companies,
         current_company=company,
+        script_keys=script_keys,
+        current_script=script,
+        by_script=by_script,
+        mk_url=mk_url,
+        page=page,
+        total_pages=total_pages,
+        total_runs=total_runs,
         success_count=success_count,
         error_count=error_count,
         running_count=running_count,

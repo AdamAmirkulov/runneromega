@@ -144,12 +144,7 @@ def log4(msg):
 # БД — EID ПО ИИН ДЛЯ ЭТОЙ КОМПАНИИ
 # =========================
 
-DB_CONFIG = {
-    "server": "DBSRV",
-    "database": "crm",
-    "username": "user",
-    "password": "Log1cF",
-}
+from config import CRM_DB as DB_CONFIG
 
 
 def get_db_connection():
@@ -283,6 +278,9 @@ def _ncalayer_ws_open() -> bool:
 def _portal_ensure_ncalayer(timeout=70):
     """NCALayer должен быть запущен ДО клика «Войти», иначе окно подписи
     не появится вовсе. Если ws-порт 13579 закрыт — запускаем NCALayer.exe."""
+    from config import ensure_ncalayer_cert
+    ensure_ncalayer_cert(_company_id)  # переключит recentPath + убьёт NCALayer, если сертификат не тот
+
     if _ncalayer_ws_open():
         log4("NCALayer уже запущен (порт 13579)")
         return
