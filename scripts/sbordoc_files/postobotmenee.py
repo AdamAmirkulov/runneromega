@@ -438,9 +438,10 @@ def pick_and_download_cancel_doc_api(driver, exec_proc_id, max_checks=4):
 
     return None
 
-def pick_latest_exec_proc(proceedings: list):
+def sort_exec_procs_by_date_desc(proceedings: list) -> list:
+    """Сортирует производства должника от самого свежего к самому старому."""
     if not proceedings:
-        return None
+        return []
 
     def _key(p):
         try:
@@ -448,7 +449,7 @@ def pick_latest_exec_proc(proceedings: list):
         except Exception:
             return datetime(1900, 1, 1)
 
-    return max(proceedings, key=_key)
+    return sorted(proceedings, key=_key, reverse=True)
 
 # ═══════════════════════════════════════════════════════════════
 # ФАЙЛЫ / ПАПКИ КЛИЕНТОВ
@@ -543,9 +544,9 @@ def run(df_main=None):
             for retry in range(2):
                 try:
                     proceedings = api_search_all(driver, iin)
-                    latest = pick_latest_exec_proc(proceedings)
+                    ordered = sort_exec_procs_by_date_desc(proceedings)
 
-                    if not latest:
+                    if not ordered:
                         msg = f"[WARN] Для {iin} не найдено исполнительных производств"
                         log(msg)
                         count_failed += 1
@@ -553,7 +554,18 @@ def run(df_main=None):
                         safe_log(f"[ОТМЕНА ИН] {msg}")
                         break
 
-                    result = pick_and_download_cancel_doc_api(driver, latest["execProcId"], max_checks=4)
+                    # У должника может быть несколько производств — документ об
+                    # отмене ИН может лежать не в самом свежем. Перебираем все,
+                    # от свежего к старому, пока не найдём.
+                    result = None
+                    for i, proc in enumerate(ordered, start=1):
+                        exec_proc_id = proc.get("execProcId")
+                        if not exec_proc_id:
+                            continue
+                        log(f"[{idx+1}] Проверяю производство {i}/{len(ordered)} (execProcId={exec_proc_id})")
+                        result = pick_and_download_cancel_doc_api(driver, exec_proc_id, max_checks=4)
+                        if result:
+                            break
 
                     if not result:
                         msg = f"[WARN] Для {iin} не найден документ об отмене ИН"
