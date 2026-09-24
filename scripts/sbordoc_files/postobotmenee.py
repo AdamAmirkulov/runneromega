@@ -34,8 +34,8 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from pypdf import PdfReader
 
-from config import CREDENTIALS, MAIN_EXCEL, TARGET_BASE
-from utils import safe_log, safe_update_summary
+from config import CREDENTIALS, MAIN_EXCEL, TARGET_BASE, CRM_DB
+from utils import safe_log, safe_update_summary, ensure_row_folder, norm_uid
 
 # ═══════════════════════════════════════════════════════════════
 # НАСТРОЙКИ
@@ -451,6 +451,53 @@ def sort_exec_procs_by_date_desc(proceedings: list) -> list:
 
     return sorted(proceedings, key=_key, reverse=True)
 
+def normalize_ip_number(value) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", "", str(value)).strip().casefold()
+
+
+def load_ip_numbers_by_uid(uids: list) -> dict:
+    """
+    Уникальный номер (EID) -> номер исполнительного производства (loans.F146).
+    Нужен, когда у должника в отчёте несколько займов: по номеру ИП выбираем
+    производство именно этого займа (как в otmeny.py: F146 == execProcNum).
+    """
+    uids = [u for u in uids if u and u.isdigit()]
+    if not uids:
+        return {}
+    import pyodbc
+    conn_str = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={CRM_DB['server']};"
+        f"DATABASE={CRM_DB['database']};"
+        f"UID={CRM_DB['username']};"
+        f"PWD={CRM_DB['password']};"
+        "TrustServerCertificate=yes;"
+        "Encrypt=no;"
+    )
+    query = f"SELECT l.EID, l.F146 FROM loans l WHERE l.EID IN ({', '.join('?' * len(uids))})"
+    conn = pyodbc.connect(conn_str, timeout=30)
+    try:
+        rows = conn.cursor().execute(query, [int(u) for u in uids]).fetchall()
+    finally:
+        conn.close()
+    return {norm_uid(eid): normalize_ip_number(f146) for eid, f146 in rows if f146}
+
+
+def order_procs_for_loan(ordered: list, target_ip: str, sibling_ips: set) -> list:
+    """
+    Производства в порядке проверки для конкретного займа: сначала то, у
+    которого execProcNum совпадает с номером ИП займа; если такого нет —
+    остальные, кроме производств других займов этого же должника.
+    """
+    if not target_ip and not sibling_ips:
+        return ordered
+    exact = [p for p in ordered if normalize_ip_number(p.get("execProcNum")) == target_ip] if target_ip else []
+    if exact:
+        return exact
+    return [p for p in ordered if normalize_ip_number(p.get("execProcNum")) not in sibling_ips]
+
 # ═══════════════════════════════════════════════════════════════
 # ФАЙЛЫ / ПАПКИ КЛИЕНТОВ
 # ═══════════════════════════════════════════════════════════════
@@ -476,8 +523,8 @@ def sanitize_filename_strict(s: str) -> str:
     s = s.rstrip(".").rstrip(" \t\u00A0")
     return s[:180] if len(s) > 180 else s
 
-def save_doc_bytes(content: bytes, ext: str, fio: str, iin: str) -> bool:
-    folder = find_client_folder_by_iin(iin)
+def save_doc_bytes(content: bytes, ext: str, fio: str, iin: str, folder: str = None) -> bool:
+    folder = folder or find_client_folder_by_iin(iin)
     if not folder:
         msg = f"[FATAL] Не найдена папка клиента по ИИН {iin}"
         log(msg)
@@ -525,6 +572,22 @@ def run(df_main=None):
     count_failed = 0
     not_found_list = []
 
+    # Должники с несколькими займами в отчёте: для каждого займа ищем
+    # производство по его номеру ИП (loans.F146), чтобы постановления
+    # не перепутались между папками займов.
+    has_uid = 'UID' in df_main.columns and 'FolderName' in df_main.columns
+    iin_col = df_main['IIN'].astype(str).str.strip().str.zfill(12)
+    multi_iins = set(iin_col[iin_col.duplicated(keep=False)])
+    ip_by_uid = {}
+    if has_uid and multi_iins:
+        multi_uids = [norm_uid(u) for u, i in zip(df_main['UID'], iin_col) if i in multi_iins]
+        try:
+            ip_by_uid = load_ip_numbers_by_uid(multi_uids)
+            log(f"[DB] Номера ИП для займов с общим ИИН: {len(ip_by_uid)}/{len(multi_uids)}")
+        except Exception as e:
+            log(f"[DB] Не удалось получить номера ИП (F146): {e}")
+            safe_log(f"[ОТМЕНА ИН] Не удалось получить номера ИП из БД: {e}")
+
     driver = start_driver_and_login()
 
     try:
@@ -539,12 +602,30 @@ def run(df_main=None):
                 continue
 
             log(f"\n[{idx+1}] === ИИН: {iin} ===")
-            fio_from_folder = get_fio_from_folder(iin)
+            if has_uid:
+                folder = ensure_row_folder(row, TARGET_BASE)
+                fio_from_folder = str(row['FIO']).strip() or "Неизвестный"
+                uid = norm_uid(row['UID'])
+            else:
+                folder = None
+                fio_from_folder = get_fio_from_folder(iin)
+                uid = ""
+            target_ip, sibling_ips = "", set()
+            if iin in multi_iins:
+                target_ip = ip_by_uid.get(uid, "")
+                sibling_ips = {
+                    ip_by_uid.get(norm_uid(u), "")
+                    for u, i in zip(df_main['UID'], iin_col)
+                    if i == iin and norm_uid(u) != uid
+                } - {""}
+                log(f"[{idx+1}] Займ {uid}: ИП={target_ip or '?'}, другие займы: {sorted(sibling_ips)}")
 
             for retry in range(2):
                 try:
                     proceedings = api_search_all(driver, iin)
-                    ordered = sort_exec_procs_by_date_desc(proceedings)
+                    ordered = order_procs_for_loan(
+                        sort_exec_procs_by_date_desc(proceedings), target_ip, sibling_ips
+                    )
 
                     if not ordered:
                         msg = f"[WARN] Для {iin} не найдено исполнительных производств"
@@ -575,7 +656,7 @@ def run(df_main=None):
                         safe_log(f"[ОТМЕНА ИН] Не найден документ об отмене для ФИО: {fio_from_folder}, ИИН: {iin}")
                     else:
                         content, ext = result
-                        ok = save_doc_bytes(content, ext, fio_from_folder, iin)
+                        ok = save_doc_bytes(content, ext, fio_from_folder, iin, folder)
                         if ok:
                             count_success += 1
                             log(f"[OK] Документ сохранён для {fio_from_folder}, {iin}")

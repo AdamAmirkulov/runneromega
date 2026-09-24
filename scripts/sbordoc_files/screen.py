@@ -17,7 +17,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from PIL import Image
 
 from config import MAIN_EXCEL, ROOT, TARGET_BASE
-from utils import ensure_client_folder, safe_log, safe_update_summary
+from utils import ensure_client_folder, ensure_uid_folder, uid_folder_map, safe_log, safe_update_summary
 
 # ═══════════════════════════════════════════════════════════════
 # НАСТРОЙКИ
@@ -155,6 +155,9 @@ def run(df_main):
 
     total = len(df_main)
 
+    # Уникальный номер -> папка займа (у должника может быть несколько займов)
+    folder_map = uid_folder_map(df_main)
+
     # Обрабатываем каждого клиента
     for idx, row in df.iterrows():
         fio = ""
@@ -182,7 +185,9 @@ def run(df_main):
             print(f"[{idx+1}/{len(df)}] {fio} ({iin})")
 
             # Получаем папку клиента
-            target_folder = ensure_client_folder(iin, fio, TARGET_BASE)
+            target_folder = ensure_uid_folder(
+                folder_map, row.get("Уникальный номер"), iin, fio, TARGET_BASE
+            )
 
             # Получаем email
             email = str(row.get("Email", ""))

@@ -11,7 +11,7 @@ from docx import Document
   # pip install docx2pdf
 
 from config import MAIN_EXCEL, ROOT, TARGET_BASE,LOG_SUMMARY
-from utils import ensure_client_folder, safe_log, safe_update_summary
+from utils import ensure_client_folder, safe_log, safe_update_summary, uid_folder_map, norm_uid
 
 # ═══════════════════════════════════════════════════════════════
 # НАСТРОЙКИ
@@ -214,6 +214,9 @@ def run(main_df):
         root_path = Path(TARGET_BASE)
         root_path.mkdir(parents=True, exist_ok=True)
 
+        # Уникальный номер -> папка займа (у должника может быть несколько займов)
+        folder_map = uid_folder_map(main_df)
+
         wb = load_workbook(MAIN_EXCEL, read_only=True, data_only=True)
         ws = wb[SHEET_NAME]
 
@@ -253,8 +256,14 @@ def run(main_df):
                 # 1) Собираем docx по шаблону
                 doc = fill_document(row_dict)
 
-                # Находим/создаём папку должника по ИИН
-                debtor_folder = find_debtor_folder(root_path, iin)
+                # Папка займа — по Уникальному номеру; если его нет в карте —
+                # как раньше, по ИИН
+                folder_name = folder_map.get(norm_uid(row_dict.get("Уникальный номер")))
+                if folder_name:
+                    debtor_folder = root_path / folder_name
+                    debtor_folder.mkdir(parents=True, exist_ok=True)
+                else:
+                    debtor_folder = find_debtor_folder(root_path, iin)
 
                 base_name = f"Досудебная претензия, {fio}, {iin}"
                 docx_path = debtor_folder / (base_name + ".docx")

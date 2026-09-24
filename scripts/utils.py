@@ -3,6 +3,7 @@
 Вспомогательные функции для обработки документов
 """
 import os
+import re
 from config import LOG_LOCK, SUMMARY_LOCK, LOG_SUMMARY, LOG_FILE, FOLDER_LOCK
 
 # ═══════════════════════════════════════════════════════════════
@@ -40,23 +41,26 @@ def normalize(text: str) -> str:
 # РАБОТА С ИМЕНАМИ ФАЙЛОВ И ПАПОК
 # ═══════════════════════════════════════════════════════════════
 
-def safe_folder_name(fio: str, iin: str) -> str:
+def safe_folder_name(fio: str, iin: str, uid: str = "") -> str:
     """
     Создаёт безопасное имя папки для Windows.
-    Формат: 'ФИО, ИИН'
-    
+    Формат: 'ФИО, ИИН, №<Уникальный номер>' (без номера — 'ФИО, ИИН').
+
     Args:
         fio: ФИО клиента
         iin: ИИН клиента (12 цифр)
-    
+        uid: Уникальный номер займа (EID); пусто — без номера
+
     Returns:
         Безопасное имя папки
-    
+
     Example:
         >>> safe_folder_name("Иванов Иван", "123456789012")
         'Иванов Иван, 123456789012'
+        >>> safe_folder_name("Иванов Иван", "123456789012", "118947")
+        'Иванов Иван, 123456789012, №118947'
     """
-    raw = f"{fio}, {iin}"
+    raw = f"{fio}, {iin}, №{uid}" if uid else f"{fio}, {iin}"
     
     # Заменяем запрещённые в Windows символы
     forbidden_chars = [
@@ -120,7 +124,90 @@ def ensure_client_folder(iin: str, fio: str, base_dir: str) -> str:
     # Используем блокировку для безопасного создания папки в многопоточной среде
     with FOLDER_LOCK:
         os.makedirs(target_folder_path, exist_ok=True)
-    
+
+    return target_folder_path
+
+# ═══════════════════════════════════════════════════════════════
+# УНИКАЛЬНЫЙ НОМЕР (EID) → ПАПКА
+# ═══════════════════════════════════════════════════════════════
+# В «Отчёте по отменам» одна строка = один займ. У одного должника может
+# быть несколько займов (или два разных должника с одинаковым ФИО) — с
+# папкой 'ФИО, ИИН' документы разных займов перемешивались. Поэтому папка
+# каждого займа называется 'ФИО, ИИН, №<Уникальный номер>', и все блоки
+# ищут папку строки по Уникальному номеру.
+
+UID_IN_FOLDER_RE = re.compile(r"№\s*(\d+)")
+
+
+def norm_uid(value) -> str:
+    """Уникальный номер как строка без '.0' и пробелов; '' если пусто."""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s.lower() in ("", "nan", "none"):
+        return ""
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
+def uid_from_folder_name(name: str) -> str:
+    """'ФИО, ИИН, №118947' -> '118947'; '' если номера в имени нет."""
+    m = UID_IN_FOLDER_RE.search(name or "")
+    return m.group(1) if m else ""
+
+
+def add_folder_names(df):
+    """
+    Добавляет в df колонку 'FolderName': 'ФИО, ИИН, №<Уникальный номер>'.
+    Ожидает колонки 'FIO', 'IIN' и (необязательно) 'UID'; если номера
+    нет (старый отчёт без колонки) — 'ФИО, ИИН'.
+    """
+    df = df.copy()
+    if 'UID' not in df.columns:
+        df['UID'] = ""
+    df['UID'] = df['UID'].apply(norm_uid)
+
+    df['FolderName'] = [
+        safe_folder_name(str(fio).strip(), str(iin).strip(), uid)
+        for fio, iin, uid in zip(df['FIO'], df['IIN'], df['UID'])
+    ]
+    return df
+
+
+def ensure_row_folder(row, base_dir: str) -> str:
+    """Папка займа для строки df_main (с колонкой 'FolderName', если она есть)."""
+    folder_name = row.get('FolderName') if hasattr(row, 'get') else None
+    if not folder_name:
+        return ensure_client_folder(
+            str(row['IIN']).strip().zfill(12), str(row['FIO']).strip(), base_dir
+        )
+    target_folder_path = os.path.join(base_dir, folder_name)
+    with FOLDER_LOCK:
+        os.makedirs(target_folder_path, exist_ok=True)
+    return target_folder_path
+
+
+def uid_folder_map(df_main) -> dict:
+    """Уникальный номер -> имя папки (для блоков, которые идут по листу
+    «Данные для шаблонов», а не по df_main)."""
+    if df_main is None or 'FolderName' not in getattr(df_main, 'columns', []):
+        return {}
+    return {
+        uid: name
+        for uid, name in zip(df_main['UID'], df_main['FolderName'])
+        if uid
+    }
+
+
+def ensure_uid_folder(folder_map: dict, uid, iin: str, fio: str, base_dir: str) -> str:
+    """Папка займа по Уникальному номеру; если номера нет в карте — 'ФИО, ИИН'."""
+    folder_name = folder_map.get(norm_uid(uid))
+    if not folder_name:
+        return ensure_client_folder(iin, fio, base_dir)
+    target_folder_path = os.path.join(base_dir, folder_name)
+    with FOLDER_LOCK:
+        os.makedirs(target_folder_path, exist_ok=True)
     return target_folder_path
 
 # ═══════════════════════════════════════════════════════════════

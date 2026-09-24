@@ -9,6 +9,7 @@ from utils import (
     normalize,
     filename_contains_iin,
     ensure_client_folder,
+    ensure_row_folder,
     safe_log,
     safe_update_summary
 )
@@ -46,7 +47,7 @@ def run(df_main):
         iin     = str(row['IIN']).strip().zfill(12)
 
         # Папка клиента
-        target_folder = ensure_client_folder(iin, fio, TARGET_BASE)
+        target_folder = ensure_row_folder(row, TARGET_BASE)
 
         copied = False
         found_product_match = False

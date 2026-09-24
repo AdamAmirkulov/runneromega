@@ -5,7 +5,7 @@ import os
 import shutil
 
 from config import ROOT, TARGET_BASE
-from utils import ensure_client_folder, safe_update_summary
+from utils import ensure_row_folder, safe_update_summary
 
 # ═══════════════════════════════════════════════════════════════
 # НАСТРОЙКИ
@@ -112,7 +112,7 @@ def run(df_main):
             print(f"[{idx+1}/{total}]   Пропущено: пустое ФИО или ИИН")
             continue
 
-        folder_path = ensure_client_folder(iin, fio, TARGET_BASE)
+        folder_path = ensure_row_folder(row, TARGET_BASE)
         count_created += 1
 
         if docs_available:

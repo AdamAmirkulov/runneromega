@@ -49,6 +49,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─────────────── Импорт конфигурации и модулей ───────────────
 from config import MAIN_EXCEL, LOG_SUMMARY
+from utils import norm_uid, add_folder_names
 from sbordoc_files import (
     logi,
     sozdaniepapok,
@@ -86,9 +87,17 @@ def main():
     
     try:
         # ✅ ЧИТАЕМ ИЗ ПЕРЕОПРЕДЕЛЁННОГО ПУТИ
-        df = pd.read_excel(MAIN_EXCEL, usecols=[1, 2, 3], header=0)
-        df.columns = ['Product', 'FIO', 'IIN']
-        df['IIN'] = df['IIN'].astype(str).str.zfill(12)
+        df = pd.read_excel(MAIN_EXCEL, usecols=[0, 1, 2, 3], header=0)
+        # Колонка A — «Уникальный номер» (EID займа). В старых отчётах её
+        # может не быть — тогда A уже «Продукт», и работаем как раньше.
+        if str(df.columns[0]).strip().lower().startswith('уникальн'):
+            df.columns = ['UID', 'Product', 'FIO', 'IIN']
+        else:
+            df = df.iloc[:, :3]
+            df.columns = ['Product', 'FIO', 'IIN']
+            df['UID'] = ""
+        df['IIN'] = df['IIN'].astype(str).str.replace(r'\.0$', '', regex=True).str.zfill(12)
+        df['UID'] = df['UID'].apply(norm_uid)
         
         print(f"✅ Загружено записей: {len(df)}")
         print(f"📋 Уникальных продуктов: {df['Product'].nunique()}")
@@ -109,8 +118,20 @@ def main():
     df['IIN'] = df['IIN'].str.strip()
     df['Product'] = df['Product'].astype(str).str.strip()
 
-    # Убираем дубликаты по FIO + IIN
-    df = df.drop_duplicates(subset=['FIO', 'IIN'])
+    # Одна строка = один займ. Дубликаты убираем по Уникальному номеру,
+    # а не по ФИО+ИИН: у должника может быть несколько займов, и на каждый
+    # нужна своя папка (иначе документы займов смешиваются в одной).
+    if (df['UID'] != "").all():
+        df = df.drop_duplicates(subset=['UID'])
+    else:
+        df = df.drop_duplicates(subset=['FIO', 'IIN'])
+    df = add_folder_names(df).reset_index(drop=True)
+
+    multi = df[df['IIN'].duplicated(keep=False)]
+    if not multi.empty:
+        print(f"Должников с несколькими займами — отдельная папка на каждый займ: {len(multi)}")
+        for name in multi['FolderName']:
+            print(f"   {name}")
 
     print(f"Строк после очистки: {len(df)}")
     

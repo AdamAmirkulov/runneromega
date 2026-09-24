@@ -99,3 +99,5 @@ def write_final_summary(log_summary_dict, summary_path=SUMMARY_LOG_PATH):
 
 def run(df_main):
     write_final_summary(LOG_SUMMARY)
+    # sbor.py ждёт (успешно, ошибок) от каждого блока
+    return len(LOG_SUMMARY), 0

@@ -15,7 +15,8 @@ except Exception:
     HAVE_RF = False
 
 from config import MAIN_EXCEL, ROOT, TARGET_BASE
-from utils import safe_log, safe_update_summary
+from utils import safe_log, safe_update_summary, norm_uid, uid_from_folder_name
+import pandas as pd
 
 # ===== ПУТИ =====
 SOURCE_ROOT = rf"{ROOT}\Госпошлины"  # внутри: 2023, 2024, 2025 ...
@@ -198,13 +199,80 @@ def list_client_folders(dest_root: str):
             res.append((p, fio_part))
     return res
 
-def find_best_client_folder(fio: str, candidates: list, threshold: float = 90.0):
-    best_path, best_score = None, -1.0
-    for path, folder_fio in candidates:
-        sc = similarity(fio, folder_fio)
-        if sc > best_score:
-            best_score, best_path = sc, path
-    return (best_path if best_score >= threshold else None), best_score
+def find_best_client_folder(fio: str, candidates: list, threshold: float = 90.0,
+                            amount: float | None = None, amounts_by_uid: dict | None = None,
+                            used: set | None = None):
+    """
+    Папка клиента по ФИО из платёжки. Если лучших совпадений несколько
+    (у должника несколько займов — папки 'ФИО, ИИН, №<Уникальный номер>',
+    либо разные должники с одинаковым ФИО), выбираем по сумме платёжки:
+    ближайшая к «Оплаченная ранее госпошлина» / «Госпошлина 3%» займа.
+    """
+    scored = [(similarity(fio, folder_fio), path) for path, folder_fio in candidates]
+    if not scored:
+        return None, -1.0
+    best_score = max(sc for sc, _ in scored)
+    if best_score < threshold:
+        return None, best_score
+
+    tied = [path for sc, path in scored if sc >= best_score - 0.01]
+    if len(tied) == 1:
+        return tied[0], best_score
+
+    used = used or set()
+    amounts_by_uid = amounts_by_uid or {}
+
+    def _key(path):
+        uid = uid_from_folder_name(os.path.basename(path))
+        amts = amounts_by_uid.get(uid, [])
+        dist = min((abs(a - amount) for a in amts), default=float('inf')) if amount is not None else float('inf')
+        # сначала — ближайшая сумма, при равенстве — папка, куда ещё не клали ГП
+        return (dist, path in used, path)
+
+    return min(tied, key=_key), best_score
+
+
+AMOUNT_RES = [
+    # назначение платежа: 'Калашникова Елена Андреевна Сумма 6 866-67 теңге'
+    re.compile(r'Сумма\s+(\d[\d ]*)-(\d{2})\s*тең'),
+    # 'Сумма прописью:6 866.67 Шесть тысяч ...'
+    re.compile(r'прописью\s*:\s*(\d[\d ]*)\.(\d{2})'),
+]
+
+def extract_amount(page_text: str) -> float | None:
+    t = _clean_text(page_text)
+    for rx in AMOUNT_RES:
+        m = rx.search(t)
+        if m:
+            try:
+                return float(m.group(1).replace(' ', '') + '.' + m.group(2))
+            except ValueError:
+                continue
+    return None
+
+
+def load_amounts_by_uid() -> dict:
+    """Уникальный номер -> [Оплаченная ранее госпошлина, Госпошлина 3%] из листа «Отмены»."""
+    try:
+        df = pd.read_excel(MAIN_EXCEL, sheet_name=0)
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать суммы госпошлин из отчёта: {e}")
+        return {}
+    if 'Уникальный номер' not in df.columns:
+        return {}
+    cols = [c for c in ('Оплаченная ранее госпошлина', 'Госпошлина 3%') if c in df.columns]
+    res = {}
+    for _, r in df.iterrows():
+        uid = norm_uid(r['Уникальный номер'])
+        if not uid:
+            continue
+        vals = []
+        for c in cols:
+            v = pd.to_numeric(r[c], errors='coerce')
+            if pd.notna(v):
+                vals.append(float(v))
+        res[uid] = vals
+    return res
 
 
 # ===== ОСНОВНОЙ СЦЕНАРИЙ =====
@@ -243,6 +311,9 @@ def run(df_main):
     client_dirs = list_client_folders(DEST_ROOT)
     print(f"👥 Найдено клиентских папок: {len(client_dirs)}")
 
+    amounts_by_uid = load_amounts_by_uid()
+    used_folders = set()
+
     pdf_files = [f for f in os.listdir(day_dir)
                  if f.lower().endswith(".pdf") and os.path.isfile(os.path.join(day_dir, f))]
     if not pdf_files:
@@ -269,9 +340,19 @@ def run(df_main):
 
                 fio = extract_fio(page_text)
 
+                best_path, score = None, -1.0
                 if fio:
                     total_gos += 1
-                    file_name = f"Госпошлина, {fio}.pdf"
+                    best_path, score = find_best_client_folder(
+                        fio, client_dirs, threshold=90.0,
+                        amount=extract_amount(page_text),
+                        amounts_by_uid=amounts_by_uid,
+                        used=used_folders,
+                    )
+                    uid = uid_from_folder_name(os.path.basename(best_path)) if best_path else ""
+                    # номер займа и в имени файла — чтобы в 'Готовые' страницы
+                    # займов с общим ФИО не перезаписывали друг друга
+                    file_name = f"Госпошлина, {fio}, №{uid}.pdf" if uid else f"Госпошлина, {fio}.pdf"
                 else:
                     file_name = f"Госпошлина, page-{i+1:03d}.pdf"
 
@@ -286,11 +367,11 @@ def run(df_main):
                 print(f"✅ Стр. {i+1}/{num_pages}: {file_name} — сохранён в 'Готовые'")
 
                 if fio:
-                    best_path, score = find_best_client_folder(fio, client_dirs, threshold=90.0)
                     if best_path:
                         dst_path = os.path.join(best_path, file_name)
                         try:
                             shutil.copy2(page_pdf_path, dst_path)
+                            used_folders.add(best_path)
                             found_gos += 1
                             print(f"   ➤ 📤 Скопирован в клиентскую папку [{score:.0f}%]: {best_path}")
                         except Exception as e:

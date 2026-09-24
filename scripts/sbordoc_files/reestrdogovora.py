@@ -1,7 +1,7 @@
 """
 Блок 7: Реестр договора цессии
 """
-from utils import safe_update_summary
+from utils import safe_update_summary, ensure_row_folder
 from config import MAIN_EXCEL, TARGET_BASE, LOG_SUMMARY,BASE_CESSII
 import os
 import shutil
@@ -63,9 +63,14 @@ def run(main_df):
     print("\n=== БЛОК 4: Реестр договора цессии по продукту ===\n")
 
         
-    df_main = pd.read_excel(MAIN_EXCEL, usecols=[1, 2, 3], header=0)
-    df_main.columns = ['Product', 'FIO', 'IIN']
-    df_main['IIN'] = df_main['IIN'].astype(str).str.zfill(12)
+    # Берём строки, подготовленные в sbor.py (с Уникальным номером и именем
+    # папки займа); Excel перечитываем, только если блок запущен отдельно.
+    if main_df is not None:
+        df_main = main_df
+    else:
+        df_main = pd.read_excel(MAIN_EXCEL, usecols=[1, 2, 3], header=0)
+        df_main.columns = ['Product', 'FIO', 'IIN']
+        df_main['IIN'] = df_main['IIN'].astype(str).str.zfill(12)
 
     print("\n=== БЛОК 4: Реестр договора цессии по продукту ===\n")
 
@@ -84,7 +89,7 @@ def run(main_df):
         iin     = str(row['IIN']).strip().zfill(12)
 
         # Папка клиента
-        target_folder = ensure_client_folder(iin, fio, TARGET_BASE)
+        target_folder = ensure_row_folder(row, TARGET_BASE)
 
         copied = False
         found_product_match = False

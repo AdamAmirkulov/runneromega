@@ -13,7 +13,7 @@ from openpyxl import load_workbook
 from docx import Document
 
 from config import ROOT, TARGET_BASE, MAIN_EXCEL
-from utils import ensure_client_folder, safe_log, safe_update_summary
+from utils import ensure_client_folder, ensure_row_folder, norm_uid, safe_log, safe_update_summary
 
 # ═══════════════════════════════════════════════════════════════
 # НАСТРОЙКИ
@@ -229,7 +229,9 @@ def load_data_from_db(iins: list) -> dict:
     Загружает данные для шаблонов искового заявления напрямую из БД crm
     (вместо листа 'Данные для шаблонов' в «Отчёте по отменам»),
     только по ИИН, переданным из df_main (файла клиентов).
-    Возвращает словарь ИИН (12 цифр) -> строка данных.
+    Возвращает словарь ИИН (12 цифр) -> строка данных и, дополнительно,
+    'EID:<Уникальный номер>' -> строка данных (у должника может быть
+    несколько займов — иск должен собираться по своему займу).
     """
     if not iins:
         return {}
@@ -267,6 +269,9 @@ def load_data_from_db(iins: list) -> dict:
         row.setdefault("УГД", "")
         row.setdefault("БИН УГД", "")
         db_data[iin] = row
+        eid = norm_uid(row.get("Уникальный номер"))
+        if eid:
+            db_data[f"EID:{eid}"] = row
 
     return db_data
 
@@ -467,14 +472,16 @@ def run(df_main):
         safe_log(f"[ИСКОВОЕ] Ошибка загрузки данных из БД: {e}")
         return 0, len(df_main)
 
-    print(f"📊 Загружено данных из БД: {len(excel_data)} строк")
+    # одна и та же строка лежит и под ИИН, и под EID — считаем уникальные
+    db_rows = list({id(r): r for r in excel_data.values()}.values())
+    print(f"📊 Загружено данных из БД: {len(db_rows)} строк")
 
     # Адрес регистрации и Судебный орган — как и раньше, из отчёта
     # (poiskvsk.py), а не из БД
     addr_court_extra = load_address_and_court_from_excel()
     filled_addr_court = 0
-    for iin, row_dict in excel_data.items():
-        extra = addr_court_extra.get(iin)
+    for row_dict in db_rows:
+        extra = addr_court_extra.get(_norm_iin(row_dict.get("ИИН")))
         if not extra:
             continue
         if extra.get("Адрес регистрации"):
@@ -482,7 +489,7 @@ def run(df_main):
         if extra.get("Судебный орган"):
             row_dict["Судебный орган"] = extra["Судебный орган"]
         filled_addr_court += 1
-    print(f"📍 Адрес/суд из отчёта подставлены для: {filled_addr_court}/{len(excel_data)}")
+    print(f"📍 Адрес/суд из отчёта подставлены для: {filled_addr_court}/{len(db_rows)}")
 
     print(f"📋 Клиентов для обработки: {len(df_main)}\n")
 
@@ -495,8 +502,11 @@ def run(df_main):
         
         print(f"[{idx+1}/{total}] {fio} ({iin})")
 
-        # Ищем данные клиента в результатах запроса к БД
-        if iin not in excel_data:
+        # Ищем данные займа в результатах запроса к БД: сначала по
+        # Уникальному номеру (EID), затем — как раньше — по ИИН
+        uid = norm_uid(row.get('UID'))
+        data_key = f"EID:{uid}" if uid and f"EID:{uid}" in excel_data else iin
+        if data_key not in excel_data:
             print(f"   ⚠️  Данные не найдены в БД")
             count_failed += 1
             not_found_list.append(f"{fio}, {iin}")
@@ -504,7 +514,7 @@ def run(df_main):
             continue
 
         try:
-            row_dict = excel_data[iin]
+            row_dict = dict(excel_data[data_key])
             
             # Нормализуем ФИО и ИИН
             for key in row_dict.keys():
@@ -517,7 +527,7 @@ def run(df_main):
             doc = fill_document_isk(row_dict)
 
             # Получаем папку клиента
-            target_folder = ensure_client_folder(iin, fio, TARGET_BASE)
+            target_folder = ensure_row_folder(row, TARGET_BASE)
 
             # Формируем имя файла
             base_name = f"Исковое заявление, {fio}, {iin}"

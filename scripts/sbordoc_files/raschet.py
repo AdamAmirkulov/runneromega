@@ -20,6 +20,8 @@ from config import (
 
 from utils import (
     ensure_client_folder,
+    uid_folder_map,
+    norm_uid,
     safe_log,
     safe_update_summary
 )
@@ -161,6 +163,9 @@ def run(df_main):
         root_path = Path(TARGET_BASE)
         root_path.mkdir(parents=True, exist_ok=True)
 
+        # Уникальный номер -> папка займа (у должника может быть несколько займов)
+        folder_map = uid_folder_map(df_main)
+
         wb = load_workbook(MAIN_EXCEL, read_only=True, data_only=True)
         ws = wb[SHEET_NAME]
         headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
@@ -187,7 +192,14 @@ def run(df_main):
                         row_dict[key] = iin
 
                 doc = fill_document(row_dict)
-                debtor_folder = find_debtor_folder(root_path, iin)
+                # Папка займа — по Уникальному номеру; если его нет в карте —
+                # как раньше, по ИИН
+                folder_name = folder_map.get(norm_uid(row_dict.get("Уникальный номер")))
+                if folder_name:
+                    debtor_folder = root_path / folder_name
+                    debtor_folder.mkdir(parents=True, exist_ok=True)
+                else:
+                    debtor_folder = find_debtor_folder(root_path, iin)
 
                 base = f"Расчёт задолженности, {fio}, {iin}"
                 docx_path = debtor_folder / (base + ".docx")
