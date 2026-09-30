@@ -695,8 +695,8 @@ def stage2b_run_sbor(report_path: Path):
 
 
 def stage3_run_podacha(report_path: Path):
-    log("=== ЭТАП 3: подача иска (scripts/podacha_iska_v2.py) ===")
-    _run_subscript("scripts/podacha_iska_v2.py", ["--excel_path", str(report_path)])
+    log("=== ЭТАП 3: подача иска (scripts/podacha_portal_sot.py) ===")
+    _run_subscript("scripts/podacha_portal_sot.py", ["--excel_path", str(report_path)])
 
 
 # ============================================================

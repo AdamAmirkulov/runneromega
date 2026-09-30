@@ -65,6 +65,10 @@ COMPANY_CREDENTIALS = {
         'rep_iin':           'REP_IIN',
         'org_bin':           'ORG_BIN',
         'org_bank':          'ORG_IBAN',
+        # Адрес истца для portal-sot.kz (scripts/podacha_portal_sot.py).
+        # Для Омеги есть значение по умолчанию в скрипте; остальным — задать.
+        # 'org_legal_address':   'город Алматы, ... офис ...',
+        # 'org_display_address': 'КАЗАХСТАН, АЛМАТЫ, ...',
     },
     # '2': { ... }, '3': { ... }, '4': { ... }  — по образцу выше
 }
@@ -87,6 +91,10 @@ PORTAL_SOT_BY_COMPANY = {
         'eds_password': '...',
         'portal_password': COMPANY_CREDENTIALS['1']['sk_password'],
         'chrome_profile': r'C:\...\ChromePortalSot',
+        'cert_path': r'C:\...\ЭЦП\<Компания>\GOST512_....p12',
+        # необязательно (для scripts/podacha_portal_sot.py):
+        # 'chrome_path':   r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+        # 'ncalayer_path': r'C:\Users\<user>\AppData\Local\Programs\NCALayer\NCALayer.exe',
     },
     # '2': { ... }, '3': { ... }, '4': { ... } — добавить по мере настройки
 }

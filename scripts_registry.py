@@ -145,12 +145,28 @@ SCRIPTS: Dict[str, ScriptDef] = {
 
         "podacha_iska_v2": ScriptDef(
             key="podacha_iska_v2",
-            title="📨 Подача иска в СК(ЧЕРЕЗ API)",
-            description="Подача иска в Судебном Кабинете через канал API",
-            command=["python", "-u", "scripts/podacha_iska_v2.py"],
+            title="📨 Подача иска в СК (portal-sot.kz)",
+            description=(
+                "Готовит иски в portal-sot.kz по «Отчёту по отменам» и последней "
+                "папке партии: создаёт заявление, загружает госпошлину, иск и "
+                "приложения, доводит до этапа подписи. ЭЦП НЕ накладывается — "
+                "подписывает человек. Результат: out/portal_sot_results.xlsx."
+            ),
+            # Раньше: scripts/podacha_iska_v2.py (office.sud.kz, больше не работает).
+            command=["python", "-u", "scripts/podacha_portal_sot.py"],
             allow_scheduled_start=True,
             params=[
                 {"name": "company_id", "label": "Компания", "type": "select"},
+                {
+                    "name": "excel_path",
+                    "label": "Отчёт по отменам (необязательно; пусто = последний на диске компании). "
+                             "Колонки P/Q (регион/суд) должны быть заполнены «Поиском адреса в СК»",
+                    "type": "file",
+                    "accept": ".xlsx",
+                    "save_to": "uploads/podacha_portal_sot_input.xlsx",
+                },
+                {"name": "start_row", "label": "Начальная строка Excel (пусто = 2)", "type": "text"},
+                {"name": "end_row", "label": "Конечная строка Excel (пусто = до конца)", "type": "text"},
             ],
         ),
 
