@@ -83,17 +83,16 @@ COMPANY_DB_FILTER = {
 
 # Вход на portal-sot.kz через ЭЦП — для scripts/sud_fio_zayavlenie.py.
 # Требует физического ЭЦП-сертификата компании на этой машине и отдельного
-# Chrome-профиля с уже нажатым «Разрешить» для portal-sot.kz → NCALayer —
+# Firefox-профиля с уже нажатым «Разрешить» для portal-sot.kz → NCALayer —
 # см. подробный комментарий в реальном scripts/config.py. Компанию без
 # записи здесь скрипт не запустит (явная ошибка вместо чужого сертификата).
 PORTAL_SOT_BY_COMPANY = {
     '1': {
         'eds_password': '...',
         'portal_password': COMPANY_CREDENTIALS['1']['sk_password'],
-        'chrome_profile': r'C:\...\ChromePortalSot',
+        'firefox_profile': r'C:\...\FirefoxPortalSot',
         'cert_path': r'C:\...\ЭЦП\<Компания>\GOST512_....p12',
         # необязательно (для scripts/podacha_portal_sot.py):
-        # 'chrome_path':   r'C:\Program Files\Google\Chrome\Application\chrome.exe',
         # 'ncalayer_path': r'C:\Users\<user>\AppData\Local\Programs\NCALayer\NCALayer.exe',
     },
     # '2': { ... }, '3': { ... }, '4': { ... } — добавить по мере настройки
@@ -144,18 +143,17 @@ IL_DECISION_CONFIG = {
 # PORTAL-SOT.KZ — новый Судебный кабинет (вход через ЭЦП)
 # scripts/poiskvsk.py, блок «Поиск адреса в СК» — ПОКА ТОЛЬКО ОМЕГА
 # (company_id=1). Вход не по компаниям — один аккаунт-представитель.
-# chrome_profile — постоянный профиль Chrome, в котором ОДИН РАЗ вручную
+# firefox_profile — постоянный профиль Firefox, в котором ОДИН РАЗ вручную
 # нажато «Разрешить» для portal-sot.kz → NCALayer (иначе запрос всплывает
 # при каждом входе и автоматика застревает). Отдельный автономный скрипт
 # входа — scripts/login_newsud.py (там же env PORTAL_EDS_PASSWORD /
-# PORTAL_PASSWORD / PORTAL_CHROME_PROFILE, приоритетнее этого словаря).
+# PORTAL_PASSWORD / PORTAL_FIREFOX_PROFILE, приоритетнее этого словаря).
 # ═══════════════════════════════════════════════════════════════
 PORTAL_SOT = {
     'eds_password':    'EDS_FILE_PASSWORD',      # пароль от файла ЭЦП (ключа)
     'portal_password': 'PORTAL_SOT_PASSWORD',    # пароль от portal-sot.kz
-    'chrome_profile':  r'C:\Users\User\Documents\ChromePortalSot',
+    'firefox_profile': r'C:\Users\User\Documents\FirefoxPortalSot',
     # необязательно:
-    # 'chrome_path':    r'C:\Program Files\Google\Chrome\Application\chrome.exe',
     # 'ncalayer_path':  r'C:\Users\User\AppData\Local\Programs\NCALayer\NCALayer.exe',
 }
 

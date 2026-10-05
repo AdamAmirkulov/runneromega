@@ -19,7 +19,7 @@ office.sud.kz + автоподстановка ФИО/адреса участн�
    автоимпорта CRM компании (CREDENTIALS['path_crm']).
 
 ВАЖНО про вход по ЭЦП: он привязан к физическому сертификату на этой
-машине и к отдельному Chrome-профилю с уже выданным разрешением
+машине и к отдельному Firefox-профилю с уже выданным разрешением
 portal-sot.kz → NCALayer — см. PORTAL_SOT_BY_COMPANY в scripts/config.py.
 Пока настроено ТОЛЬКО для company_id=1 (Омега); для остальных компаний
 скрипт останавливается с понятной ошибкой, а не подписывает чужим
@@ -75,14 +75,14 @@ if not _portal_cfg:
     print(
         f"❌ ОШИБКА: для компании ID={_company_id} не настроен вход на portal-sot.kz "
         f"(нет записи в PORTAL_SOT_BY_COMPANY в scripts/config.py). Нужны: свой "
-        f"ЭЦП-сертификат на этой машине и отдельный Chrome-профиль с разрешением "
+        f"ЭЦП-сертификат на этой машине и отдельный Firefox-профиль с разрешением "
         f"portal-sot.kz → NCALayer. Пока поддержана только компания '1' (Омега)."
     )
     sys.exit(1)
 
 PORTAL_EDS_PASSWORD = _portal_cfg['eds_password']
 PORTAL_LOGIN_PASSWORD = _portal_cfg['portal_password']
-PORTAL_CHROME_PROFILE = _portal_cfg['chrome_profile']
+PORTAL_FIREFOX_PROFILE = _portal_cfg['firefox_profile']
 
 PORTAL_SOT_BASE = "https://portal-sot.kz"
 GBDFL_BY_IIN_URL = PORTAL_SOT_BASE + "/api/secure/gbdfl/v2/byIin/"
@@ -102,6 +102,9 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from webdriver_manager.firefox import GeckoDriverManager
 
 from openpyxl import load_workbook
 
@@ -118,6 +121,8 @@ import traceback
 import pandas as pd
 import pyodbc
 import requests
+
+from portal_sot_http import PortalSotHttp, PortalBlocked
 
 
 # =========================
@@ -253,16 +258,29 @@ def extract_region_from_address(address: str) -> str:
 # =========================
 
 def _portal_init_driver():
-    opts = webdriver.ChromeOptions()
-    opts.add_argument("--start-maximized")
-    opts.add_argument("--disable-notifications")
-    opts.add_argument("--disable-popup-blocking")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    # Постоянный профиль этой компании, где уже нажато «Разрешить» для
-    # portal-sot.kz → NCALayer.
-    opts.add_argument(r"--user-data-dir=" + PORTAL_CHROME_PROFILE)
-    driver = webdriver.Chrome(options=opts)
+    # Постоянный профиль этой компании (Firefox), где уже нажато «Разрешить»
+    # для portal-sot.kz → NCALayer. Как в poiskvsk.py.
+    os.makedirs(PORTAL_FIREFOX_PROFILE, exist_ok=True)
+    opts = FirefoxOptions()
+    opts.add_argument("-profile")
+    opts.add_argument(PORTAL_FIREFOX_PROFILE)
+    opts.set_preference("dom.disable_beforeunload", True)
+    try:
+        driver = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opts)
+    except Exception as e:
+        log4(f"Прямой запуск Firefox не удался ({e}); снимаю лок профиля и повторяю")
+        import subprocess
+        subprocess.run(["taskkill", "/F", "/IM", "firefox.exe"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        for lock_name in (".parentlock", "lock"):
+            try:
+                os.remove(os.path.join(PORTAL_FIREFOX_PROFILE, lock_name))
+            except OSError:
+                pass
+        driver = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opts)
     driver.set_page_load_timeout(120)
+    driver.maximize_window()
     return driver
 
 
@@ -499,7 +517,7 @@ def _portal_build_address(result: dict) -> str:
     return ", ".join(parts)
 
 
-def _portal_fetch_by_iin(session, iin, retries=3):
+def _portal_fetch_by_iin(session, iin, retries=2):
     """При 401 бросает RuntimeError('PORTAL_TOKEN_EXPIRED')."""
     iin = _norm_iin(iin)
     if len(iin) != 12:
@@ -509,6 +527,8 @@ def _portal_fetch_by_iin(session, iin, retries=3):
     for attempt in range(1, retries + 1):
         try:
             env = _portal_gbdfl_raw(session, iin)
+        except PortalBlocked:
+            raise
         except Exception as e:
             last_error = e
             log4(f"   ⚠ запрос ГБД ФЛ упал (попытка {attempt}/{retries}): {type(e).__name__}: {e}")
@@ -561,6 +581,29 @@ def _portal_fetch_by_iin(session, iin, retries=3):
 # ЭТАП 1: ФИО/адрес по ИИН -> отчёт
 # =========================
 
+def _portal_browser_login():
+    """Браузер только для входа: ЭЦП → токены/cookies → браузер сразу закрыт.
+    Дальше всё идёт через PortalSotHttp (scripts/portal_sot_http.py)."""
+    driver = _portal_init_driver()
+    try:
+        access, refresh = _portal_login(driver)
+        try:
+            ua = driver.execute_script("return navigator.userAgent")
+        except Exception:
+            ua = ""
+        try:
+            cookies = driver.get_cookies()
+        except Exception:
+            cookies = []
+        return {"access_token": access, "refresh_token": refresh,
+                "cookies": cookies, "user_agent": ua}
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
 def fill_people_from_portal(input_xlsx: str) -> pd.DataFrame:
     log4("=" * 90)
     log4("СУДЕБНЫЙ КАБИНЕТ — ФИО И АДРЕС ПО ИИН")
@@ -577,13 +620,10 @@ def fill_people_from_portal(input_xlsx: str) -> pd.DataFrame:
     for col, title in headers.items():
         ws.cell(row=1, column=col).value = title
 
-    log4("🔐 Вход на portal-sot.kz через ЭЦП...")
-    driver = _portal_init_driver()
-    try:
-        access_token, refresh_token = _portal_login(driver)
-        session = _portal_make_session(driver, access_token)
-
-        processed = ok_count = error_count = 0
+    # Браузер поднимается только если нет живого access/refresh токена,
+    # и закрывается сразу после входа. Дальше — только HTTP.
+    processed = ok_count = error_count = 0
+    with PortalSotHttp(_company_id, _portal_browser_login, log=log4) as portal:
 
         for row in range(2, ws.max_row + 1):
             iin = _norm_iin(ws.cell(row=row, column=2).value)
@@ -600,14 +640,16 @@ def fill_people_from_portal(input_xlsx: str) -> pd.DataFrame:
                 continue
 
             try:
-                data = _portal_fetch_by_iin(session, iin)
+                data = _portal_fetch_by_iin(portal, iin)
+            except PortalBlocked as e:
+                log4(f"⛔ {e} (обработано {processed}, результат сохранён)")
+                break
             except RuntimeError as e:
                 if str(e) == "PORTAL_TOKEN_EXPIRED":
-                    log4("   🔄 access_token истёк, повторный вход через ЭЦП")
-                    access_token, refresh_token = _portal_login(driver, force_fresh=True)
-                    session = _portal_make_session(driver, access_token)
+                    log4("   🔄 401 после обновления токена — обновляю ещё раз")
+                    portal.renew()
                     try:
-                        data = _portal_fetch_by_iin(session, iin)
+                        data = _portal_fetch_by_iin(portal, iin)
                     except Exception as e2:
                         ws.cell(row=row, column=10).value = f"ОШИБКА: {e2}"
                         error_count += 1
@@ -647,8 +689,6 @@ def fill_people_from_portal(input_xlsx: str) -> pd.DataFrame:
                 wb.save(REPORT_XLSX)
                 log4(f"💾 Autosave после {processed} строк")
 
-            time.sleep(0.25)
-
         wb.save(REPORT_XLSX)
 
         log4("")
@@ -657,12 +697,6 @@ def fill_people_from_portal(input_xlsx: str) -> pd.DataFrame:
         log4(f"Обработано: {processed} | Успешно: {ok_count} | Ошибок: {error_count}")
         log4(f"Файл: {REPORT_XLSX}")
         log4("=" * 90)
-
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
 
     return pd.read_excel(REPORT_XLSX, dtype=str)
 

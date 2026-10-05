@@ -84,3 +84,6 @@ scripts/_legacy_har_capture/SUD_API_CAPTURES/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Токены portal-sot.kz (access/refresh/cookies) — секреты
+data/portal_sot_tokens/

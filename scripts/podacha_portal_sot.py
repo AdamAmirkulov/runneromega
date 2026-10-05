@@ -14,8 +14,8 @@
   COMPANY_ROOTS[id]              → папка «Документы для подачи Исков», Excel, партии
   COMPANY_CREDENTIALS[id]        → org_bin, org_bank, rep_iin
                                    (+ необяз. org_legal_address / org_display_address)
-  PORTAL_SOT_BY_COMPANY[id]      → eds_password, portal_password, chrome_profile,
-                                   cert_path (+ необяз. chrome_path, ncalayer_path)
+  PORTAL_SOT_BY_COMPANY[id]      → eds_password, portal_password, firefox_profile,
+                                   cert_path (+ необяз. ncalayer_path)
 
 Логика v24 сохранена: документы строго по 6-значному номеру из колонки A,
 локальный справочник судов (без уголовных, Актау → CODE 194711), retry
@@ -69,6 +69,7 @@ from openpyxl import Workbook, load_workbook
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from portal_sot_login import PortalSotLogin, jwt_claims  # noqa: E402
+from portal_sot_http import PortalBlocked, BLOCK_MESSAGE, is_waf_block, portal_lock  # noqa: E402
 from config import (  # noqa: E402
     COMPANY_ROOTS, CREDENTIALS, MAIN_EXCEL, PORTAL_SOT_BY_COMPANY, ROOT,
 )
@@ -120,10 +121,10 @@ MAX_UPLOAD_FILE_BYTES = 20 * 1024 * 1024
 PORTAL_CFG = PORTAL_SOT_BY_COMPANY.get(COMPANY_ID)
 if not PORTAL_CFG:
     print(f"❌ Для компании {COMPANY_ID} нет записи в PORTAL_SOT_BY_COMPANY (scripts/config.py): "
-          f"нужны ЭЦП-сертификат, пароли и Chrome-профиль с разрешением portal-sot.kz → NCALayer.")
+          f"нужны ЭЦП-сертификат, пароли и Firefox-профиль с разрешением portal-sot.kz → NCALayer.")
     sys.exit(1)
 
-CHROME_USER_DATA_DIR = Path(PORTAL_CFG["chrome_profile"])
+FIREFOX_PROFILE_DIR = Path(PORTAL_CFG["firefox_profile"])
 
 # ============================================================
 # ЛОГИРОВАНИЕ
@@ -302,6 +303,7 @@ def refresh_access():
     if not rt:
         return False
     try:
+        _api_throttle()
         r = requests.post(
             BASE_URL + "/api/public/auth/refresh",
             json={"refreshToken": rt},
@@ -335,15 +337,51 @@ def ensure_token_fresh(margin=90):
     portal_sign_in()
 
 
+API_MIN_GAP_SECONDS = (1.0, 2.0)   # пауза между любыми двумя API-вызовами
+API_BACKOFF_429 = (60, 180, 600)   # ожидания при 429; после последнего — стоп
+_last_api_call_at = 0.0
+
+
+def _api_throttle():
+    global _last_api_call_at
+    wait = _last_api_call_at + random.uniform(*API_MIN_GAP_SECONDS) - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    _last_api_call_at = time.time()
+
+
+def _send(method, url, **kwargs):
+    """Один HTTP-вызов с темпом: WAF-403 → стоп пачки, 429 → ждём и повторяем."""
+    backoff = list(API_BACKOFF_429)
+    while True:
+        _api_throttle()
+        r = session.request(method, url, timeout=120, **kwargs)
+        if is_waf_block(r):
+            raise PortalBlocked(BLOCK_MESSAGE)
+        if r.status_code != 429:
+            return r
+        if not backoff:
+            raise PortalBlocked("portal-sot.kz продолжает отвечать 429 — пачка остановлена")
+        wait = backoff.pop(0)
+        log(f"portal-sot.kz ответил 429 — жду {wait} сек.", "WARNING")
+        time.sleep(wait)
+        # файлы в multipart надо перемотать, иначе повтор уйдёт пустым
+        for f in (kwargs.get("files") or {}).values():
+            try:
+                f[1].seek(0)
+            except Exception:
+                pass
+
+
 def api_request(method, path, **kwargs):
     ensure_token_fresh()
     url = path if path.startswith("http") else BASE_URL + path
-    r = session.request(method, url, timeout=120, **kwargs)
+    r = _send(method, url, **kwargs)
     if r.status_code == 401:
         if not refresh_access():
             log("HTTP 401 — обновляю сессию через браузер")
             portal_sign_in()
-        r = session.request(method, url, timeout=120, **kwargs)
+        r = _send(method, url, **kwargs)
     if not r.ok:
         raise RuntimeError(f"{method} {url} -> HTTP {r.status_code}: {r.text[:1000]}")
     try:
@@ -368,9 +406,25 @@ def check_org():
     return org
 
 
+MAX_FULL_RELOGINS = 2  # частые входы через ЭЦП — главный повод для блокировки
+_full_relogins = 0
+
+
 def force_relogin_portal():
-    """Один контролируемый новый вход: сброс web-сессии → ЭЦП через NCALayer → новый токен."""
-    log("ПОВТОРНЫЙ ВХОД: сбрасываю текущую web-сессию portal-sot и вхожу через ЭЦП...")
+    """Сначала — обновление токена по API (без ЭЦП). Полный вход через ЭЦП —
+    только если refresh не сработал, и не больше MAX_FULL_RELOGINS раз за прогон."""
+    global _full_relogins
+    if refresh_access():
+        check_org()
+        log("ПОВТОРНЫЙ ВХОД не понадобился: токен обновлён через refresh — OK")
+        return
+    if _full_relogins >= MAX_FULL_RELOGINS:
+        raise PortalBlocked(
+            f"уже было {MAX_FULL_RELOGINS} полных входа через ЭЦП за прогон — "
+            f"пачка остановлена, чтобы не вызвать блокировку"
+        )
+    _full_relogins += 1
+    log(f"ПОВТОРНЫЙ ВХОД ({_full_relogins}/{MAX_FULL_RELOGINS}): сбрасываю web-сессию portal-sot и вхожу через ЭЦП...")
     portal_sign_in(force_fresh=True)
     check_org()
     log("ПОВТОРНЫЙ ВХОД: кабинет и API снова авторизованы — OK")
@@ -689,6 +743,8 @@ def person_from_gbdfl(iin):
                 log(f"ГБДФЛ {iin}: попытка {_attempt}/3 — OK")
             return p, address
 
+        except PortalBlocked:
+            raise
         except Exception as _e:
             _last = _e
             _msg = str(_e)
@@ -844,6 +900,8 @@ def upload_file(declaration_id, path, file_type, participant_id=None):
             if _attempt > 1:
                 log(f"ПОВТОР ЗАГРУЗКИ: попытка {_attempt}/3")
             return _one_attempt()
+        except PortalBlocked:
+            raise
         except Exception as _e:
             _last_error = _e
             _msg = str(_e)
@@ -1119,7 +1177,7 @@ def main():
     log(f"СТАРТ portal-sot.kz — подготовка исков БЕЗ ПОДПИСИ | компания {COMPANY_ID}")
     log(f"Корневая папка: {WORK_ROOT}")
     log(f"Excel: {EXCEL_FILE}")
-    log(f"Chrome-профиль: {CHROME_USER_DATA_DIR}")
+    log(f"Firefox-профиль: {FIREFOX_PROFILE_DIR}")
     log(f"Лог: {LOG_FILE}")
     log("=" * 90)
 
@@ -1173,6 +1231,10 @@ def main():
         write_results([], [], [], skipped)
         raise RuntimeError("Нет строк с полным комплектом документов — подавать нечего")
 
+    global _lock
+    _lock = portal_lock(log)
+    _lock.acquire()  # другой скрипт уже на portal-sot.kz → ждём его
+
     portal_login = PortalSotLogin(COMPANY_ID, PORTAL_CFG, log=log, dump_dir=str(OUT_DIR))
     log("🔐 Вход на portal-sot.kz через ЭЦП...")
     driver = portal_login.init_driver()
@@ -1217,6 +1279,12 @@ def main():
                 log(f"СДЕЛКА {n}/{len(rows)} | Excel строка {excel_row} | "
                     f"попытка {row_attempt}/{MAX_ROW_ATTEMPTS} ОШИБКА: {type(e).__name__}: {e}", "ERROR")
                 log_exception("TRACEBACK")
+
+                if isinstance(e, PortalBlocked):
+                    errors.append((excel_row, fio, iin, f"{type(e).__name__}: {e}"))
+                    stop_row = excel_row
+                    log(f"СТОП ВСЕЙ ПАЧКИ на Excel строке {excel_row}: {e}", "ERROR")
+                    break
 
                 if _is_gbdfl_error(e):
                     # person_from_gbdfl уже сделал 3 попытки с паузами — повтор строки
@@ -1291,6 +1359,8 @@ def main():
     return 1 if errors or gbdfl_failed else 0
 
 
+_lock = None
+
 if __name__ == "__main__":
     try:
         code = main()
@@ -1298,4 +1368,7 @@ if __name__ == "__main__":
         log(f"ФАТАЛЬНАЯ ОШИБКА: {type(e).__name__}: {e}", "ERROR")
         log_exception("TRACEBACK")
         code = 1
+    finally:
+        if _lock:
+            _lock.release()
     sys.exit(code)

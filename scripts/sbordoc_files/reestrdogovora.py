@@ -118,7 +118,8 @@ def run(main_df):
                     filename_lower = file.lower()
                     if ('реестр'  in filename_lower and
                         'договора' in filename_lower and
-                        'цессии'   in filename_lower):
+                        'цессии'   in filename_lower and
+                        'обезличенный' in filename_lower):
                         src = os.path.join(root, file)
 
                         # целевое имя в папке клиента:

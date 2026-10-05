@@ -3,11 +3,11 @@
 # ============================================================
 #
 # Автономный скрипт входа (двойной клик / python scripts/login_newsud.py
-# [company_id]). Держит Chrome открытым после входа. Рабочая логика того же
+# [company_id]). Держит Firefox открытым после входа. Рабочая логика того же
 # входа продублирована внутри scripts/poiskvsk.py (блок 4, функции _portal_*),
 # который для поиска адреса ей и пользуется — этот файл на poiskvsk не влияет.
 #
-# Реквизиты (пароль ЭЦП / пароль портала / профиль Chrome) НЕ хранятся
+# Реквизиты (пароль ЭЦП / пароль портала / профиль Firefox) НЕ хранятся
 # здесь в коде — берутся из PORTAL_SOT_BY_COMPANY в scripts/config.py
 # (тот же гитигнорнутый конфиг, что и у остальных скриптов репозитория).
 
@@ -16,7 +16,9 @@ import sys
 import time
 
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.firefox.service import Service
+from webdriver_manager.firefox import GeckoDriverManager
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -52,34 +54,28 @@ EDS_PASSWORD = _cfg["eds_password"]
 # который появляется после подписания ЭЦП
 PORTAL_PASSWORD = _cfg["portal_password"]
 
-# Постоянный профиль Chrome.
+# Постоянный профиль Firefox.
 # В нём уже сохранено разрешение portal-sot.kz на NCALayer.
-CHROME_PROFILE = _cfg["chrome_profile"]
+FIREFOX_PROFILE = _cfg["firefox_profile"]
 
 
 # ============================================================
-# 1. ЗАПУСК CHROME
+# 1. ЗАПУСК FIREFOX
 # ============================================================
 
 def build_driver():
 
     options = Options()
 
-    options.add_argument("--start-maximized")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-popup-blocking")
+    # Постоянный профиль (в нём уже нажато «Разрешить» для portal-sot.kz → NCALayer)
+    os.makedirs(FIREFOX_PROFILE, exist_ok=True)
+    options.add_argument("-profile")
+    options.add_argument(FIREFOX_PROFILE)
 
-    # Не закрывать Chrome после завершения скрипта
-    options.add_experimental_option("detach", True)
-
-    # Постоянный профиль
-    options.add_argument(
-        rf"--user-data-dir={CHROME_PROFILE}"
-    )
-
-    driver = webdriver.Chrome(options=options)
+    driver = webdriver.Firefox(service=Service(GeckoDriverManager().install()), options=options)
 
     driver.set_page_load_timeout(120)
+    driver.maximize_window()
 
     return driver
 
@@ -163,14 +159,14 @@ def login_portal_eds():
     print("=" * 80)
 
     # --------------------------------------------------------
-    # Chrome
+    # Firefox
     # --------------------------------------------------------
 
-    print("\n[1/10] Запускаем Chrome...")
+    print("\n[1/10] Запускаем Firefox...")
 
     driver = build_driver()
 
-    print("       ✅ Chrome запущен")
+    print("       ✅ Firefox запущен")
 
 
     # --------------------------------------------------------
@@ -468,5 +464,5 @@ if __name__ == "__main__":
 
     driver, ACCESS_TOKEN, REFRESH_TOKEN = login_portal_eds()
 
-    # Держим процесс живым, чтобы окно Chrome не закрывалось.
-    input("\nНажмите Enter, чтобы завершить скрипт (Chrome останется открытым)...")
+    # Держим процесс живым, чтобы окно Firefox не закрывалось.
+    input("\nНажмите Enter, чтобы завершить скрипт (Firefox закроется)...")

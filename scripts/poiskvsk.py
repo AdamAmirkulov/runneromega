@@ -16,7 +16,7 @@ r"""
 6) После Selenium-части:
       - по адресам (O) и регионам (P) заполняет колонку Q
         "Судебный орган с Судебного кабинета" по справочнику
-        "Суды по гражданским делам.xlsx" (лист "Возврат") для всех строк.
+        "Справочник судов portal-sot.xlsx" (лист "Все суды") для всех строк.
 
 7) По адресу (O), региону (P) и суду (Q) определяет УГД и БИН УГД
    из справочника "БИН(УГД).xlsx" и записывает в колонки L и M
@@ -128,7 +128,7 @@ FILE_PEOPLE  = INPUT_XLSX
 # Справочники судов и УГД — как и FILE_ENBEKSHI/FILE_SHET ниже, общие для ВСЕХ
 # компаний (не зависят от того, чьё это дело), поэтому путь зафиксирован на
 # одну сетевую папку, а не строится через ROOT компании.
-FILE_COURTS  = rf"\\192.168.1.200\workfolder\Документы для подачи Исков\Шаблоны документов\Суды по гражданским делам.xlsx"
+FILE_COURTS  = rf"\\192.168.1.200\workfolder\Документы для подачи Исков\Шаблоны документов\Справочник судов portal-sot.xlsx"
 FILE_UGD     = rf"\\192.168.1.200\workfolder\Документы для подачи Исков\Шаблоны документов\БИН(УГД) .xlsx"
 # Справочник сёл/округов Енбекшиказахского района общий для всех компаний
 # (разбивка района между двумя судами не зависит от того, чьё это дело),
@@ -1714,21 +1714,21 @@ def parse_people_via_pure_http():
 # Портировано 1:1 из ноутбука poiskvsk_portal_sot_v7_OMEGA_FINAL_ONE_RUN.ipynb.
 # office.sud.kz для поиска адреса умер. Новый портал portal-sot.kz — SPA поверх
 # JSON REST API. Схема:
-#   1. _portal_init_driver() поднимает Chrome на ПОСТОЯННОМ профиле (в нём один
+#   1. _portal_init_driver() поднимает Firefox на ПОСТОЯННОМ профиле (в нём один
 #      раз выдано разрешение portal-sot.kz → NCALayer, иначе оно всплывает каждый раз);
 #   2. _portal_login() — если сессия ещё жива, берём access_token из localStorage;
 #      иначе «Войти» → окно NCALayer (пароль ЭЦП вводит pywinauto) → «Подписать» →
 #      пароль портала → «Войти» → ждём /cabinet → читаем access_token/refresh_token;
 #   3. _portal_make_session() — requests.Session с Authorization: Bearer +
-#      cookie из Chrome + ЗАГОЛОВОК Origin: https://portal-sot.kz (критично:
+#      cookie из Firefox + ЗАГОЛОВОК Origin: https://portal-sot.kz (критично:
 #      на запрос без Origin портал отвечает пустым 200; из вкладки браузера
 #      same-origin запрос Origin не несёт, поэтому качаем через requests);
 #   4. по каждому ИИН из колонки D: GET /api/secure/gbdfl/v2/byIin/<ИИН>,
 #      собираем адрес регистрации → колонка O, регион → колонка P.
-#   При 401 / стабильном пустом 200 — повторный ЭЦП-логин в том же Chrome.
+#   При 401 / стабильном пустом 200 — refresh токена, ЭЦП-логин в Firefox только если refresh не прошёл.
 #
 # По компаниям — PORTAL_SOT_BY_COMPANY в scripts/config.py (eds_password /
-# portal_password / chrome_profile / cert_path), ключ = --company_id этого
+# portal_password / firefox_profile / cert_path), ключ = --company_id этого
 # запуска (уже лежит в os.environ["COMPANY_ID"] к этому моменту). Компания
 # без записи там — явная ошибка, а не тихий фолбэк на чужой сертификат.
 _PORTAL_COMPANY_ID = (os.environ.get("COMPANY_ID") or "1").strip()
@@ -1753,7 +1753,7 @@ def _portal_cfg_get(key: str, default: str = None):
 
 PORTAL_EDS_PASSWORD   = _portal_cfg_get("eds_password", "Qwerty1981")
 PORTAL_LOGIN_PASSWORD = _portal_cfg_get("portal_password", "n3y&pAM5mD&4zKZ")
-PORTAL_CHROME_PROFILE = _portal_cfg_get("chrome_profile", r"C:\Users\User\Documents\ChromePortalSot")
+PORTAL_FIREFOX_PROFILE = _portal_cfg_get("firefox_profile", r"C:\Users\User\Documents\FirefoxPortalSot")
 # NCALayer — приложение в трее, слушает ws://127.0.0.1:13579. Портал через него
 # подписывает ЭЦП. Если оно не запущено, клик «Войти» на портале молча ничего не
 # делает и окно NCALayer не появляется — поэтому запускаем его сами.
@@ -1764,65 +1764,48 @@ NCALAYER_WS_PORT = 13579
 
 GBDFL_BY_IIN_TMPL = PORTAL_SOT_BASE + "/api/secure/gbdfl/v2/byIin/{iin}"
 
+from portal_sot_http import PortalSotHttp, PortalBlocked
 
-def _portal_attach_debug_chrome(port: int = 9333):
-    """Запасной путь: если webdriver.Chrome(options) падает в окружении
-    job-раннера (DevToolsActivePort / Chrome crashed), поднимаем chrome.exe
-    отдельным процессом с remote-debugging и подключаемся по debuggerAddress —
-    как в podacha_iska_v2.py."""
-    import socket
+
+def _portal_release_stale_firefox_profile():
+    """Если прошлый запуск (job-раннер) не закрыл Firefox, профиль остаётся
+    залоченным (.parentlock) и новый Firefox на нём не стартует."""
     import subprocess
-
-    def _port_open() -> bool:
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "firefox.exe"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    time.sleep(1)
+    for lock_name in (".parentlock", "lock"):
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1):
-                return True
-        except OSError:
-            return False
-
-    if not _port_open():
-        chrome_exe = _portal_omega_cfg(
-            "chrome_path", r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-        )
-        os.makedirs(PORTAL_CHROME_PROFILE, exist_ok=True)
-        subprocess.Popen(
-            [
-                chrome_exe,
-                f"--remote-debugging-port={port}",
-                f"--user-data-dir={PORTAL_CHROME_PROFILE}",
-                "--start-maximized",
-                "--disable-notifications",
-                "--disable-popup-blocking",
-                PORTAL_SOT_BASE,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        deadline = time.time() + 30
-        while time.time() < deadline and not _port_open():
-            time.sleep(0.5)
-        if not _port_open():
-            raise RuntimeError(f"Chrome не открыл порт remote-debugging {port}")
-
-    o = webdriver.ChromeOptions()
-    o.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-    return webdriver.Chrome(options=o)
+            lock_path = os.path.join(PORTAL_FIREFOX_PROFILE, lock_name)
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except Exception:
+            pass
 
 
 def _portal_init_driver():
-    opts = webdriver.ChromeOptions()
-    opts.add_argument("--start-maximized")
-    opts.add_argument("--disable-notifications")
-    opts.add_argument("--disable-popup-blocking")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    # Постоянный профиль, где уже нажато «Разрешить» для portal-sot.kz → NCALayer.
-    opts.add_argument(r"--user-data-dir=" + PORTAL_CHROME_PROFILE)
+    from selenium.webdriver.firefox.options import Options as FirefoxOptions
+    from selenium.webdriver.firefox.service import Service as FirefoxService
+    from webdriver_manager.firefox import GeckoDriverManager
+
+    # Постоянный профиль (не копия!) — запускаем прямо на нём через -profile,
+    # чтобы разрешение portal-sot.kz → NCALayer сохранялось между запусками.
+    os.makedirs(PORTAL_FIREFOX_PROFILE, exist_ok=True)
+    opts = FirefoxOptions()
+    opts.add_argument("-profile")
+    opts.add_argument(PORTAL_FIREFOX_PROFILE)
+    opts.set_preference("dom.disable_beforeunload", True)
     try:
-        drv = webdriver.Chrome(options=opts)
+        drv = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opts)
     except Exception as e:
-        log_warn(f"Прямой запуск Chrome не удался ({e}); пробую через remote-debugging")
-        drv = _portal_attach_debug_chrome()
+        log_warn(f"Прямой запуск Firefox не удался ({e}); снимаю лок профиля и повторяю")
+        _portal_release_stale_firefox_profile()
+        drv = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opts)
     drv.set_page_load_timeout(120)
+    drv.maximize_window()
     return drv
 
 
@@ -2056,6 +2039,29 @@ def _portal_make_session(driver, access_token):
     return s
 
 
+def _portal_browser_login():
+    """Браузер только для входа: ЭЦП → токены/cookies → браузер сразу закрыт.
+    Дальше всё идёт через PortalSotHttp (scripts/portal_sot_http.py)."""
+    driver = _portal_init_driver()
+    try:
+        access, refresh = _portal_login(driver)
+        try:
+            ua = driver.execute_script("return navigator.userAgent")
+        except Exception:
+            ua = ""
+        try:
+            cookies = driver.get_cookies()
+        except Exception:
+            cookies = []
+        return {"access_token": access, "refresh_token": refresh,
+                "cookies": cookies, "user_agent": ua}
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
 def _portal_gbdfl_raw(session, iin):
     """GET /api/secure/gbdfl/v2/byIin/<iin> через requests-сессию.
     Возвращает dict {status, statusText, respURL, headers, bodyLen, body}."""
@@ -2234,7 +2240,7 @@ def _portal_build_address(result: dict) -> str:
     return ", ".join(parts)
 
 
-def _portal_fetch_by_iin(session, iin, retries=3):
+def _portal_fetch_by_iin(session, iin, retries=2):
     """Аналог fillPersonData() на portal-sot.kz — GET /api/secure/gbdfl/v2/byIin/{iin}.
     При 401 бросает RuntimeError('PORTAL_TOKEN_EXPIRED'); при стабильном пустом
     200 — RuntimeError('PORTAL_EMPTY_200') — верхний цикл делает повторный
@@ -2248,6 +2254,8 @@ def _portal_fetch_by_iin(session, iin, retries=3):
     for attempt in range(1, retries + 1):
         try:
             env = _portal_gbdfl_raw(session, iin)
+        except PortalBlocked:
+            raise
         except Exception as e:
             last_error = e
             empty_200_only = False
@@ -2324,12 +2332,11 @@ def parse_people_via_portal_sot():
         raise RuntimeError(
             f"Для компании {company_id} не настроен вход на portal-sot.kz "
             f"(нет записи в PORTAL_SOT_BY_COMPANY в scripts/config.py — нужны "
-            f"свой ЭЦП-сертификат на этой машине и отдельный Chrome-профиль с "
+            f"свой ЭЦП-сертификат на этой машине и отдельный Firefox-профиль с "
             f"разрешением portal-sot.kz → NCALayer)."
         )
 
-    MAX_TOTAL_ATTEMPTS_PER_ROW = 6
-    RETRY_ROW_PAUSE = 1.2
+    MAX_TOTAL_ATTEMPTS_PER_ROW = 2   # темп/повторы при 429/5xx — внутри PortalSotHttp
 
     log4("=== START parse_people_via_portal_sot (portal-sot.kz JSON API, ОМЕГА) ===")
     log4(f"Файл-источник: {INPUT_XLSX}")
@@ -2347,18 +2354,17 @@ def parse_people_via_portal_sot():
     if not header_p.value or str(header_p.value).strip() == "":
         header_p.value = "Регион с Судебного кабинета"
 
-    log4("🔐 Выполняю вход на portal-sot.kz через ЭЦП...")
-    driver = _portal_init_driver()
-    access_token, refresh_token = _portal_login(driver)
-    session = _portal_make_session(driver, access_token)
-
     failed_rows = []
     processed = 0
     consecutive_fail = 0
-    did_diagnose = False       # диагностику пустых 200 гоняем один раз
+    renewed_on_empty = False   # пустой 200 = токен не принят; обновляем один раз
     MAX_CONSECUTIVE_FAIL = 5   # подряд «мертвых» строк → портал недоступен, выходим
 
+    # Браузер поднимается только если нет живого access/refresh токена,
+    # и закрывается сразу после входа. Дальше — только HTTP.
+    portal = PortalSotHttp(company_id, _portal_browser_login, log=log4)
     try:
+        portal.__enter__()
         for r in range(2, ws.max_row + 1):
             src_iin = _norm_iin(ws.cell(row=r, column=4).value)
             if not src_iin or len(src_iin) != 12:
@@ -2370,7 +2376,7 @@ def parse_people_via_portal_sot():
 
             for attempt in range(1, MAX_TOTAL_ATTEMPTS_PER_ROW + 1):
                 try:
-                    data = _portal_fetch_by_iin(session, src_iin, retries=3)
+                    data = _portal_fetch_by_iin(portal, src_iin)
                     live = data.get("live", "")
                     log4(f"   ответ: ФИО='{data.get('sur','')} {data.get('name','')} "
                          f"{data.get('patr','')}', address='{live}'")
@@ -2389,37 +2395,28 @@ def parse_people_via_portal_sot():
 
                     log4(f"   ⚠ адрес не получен, попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW}")
 
+                except PortalBlocked:
+                    raise
                 except RuntimeError as e:
                     msg = str(e)
                     if msg == "PORTAL_EMPTY_200":
-                        if not did_diagnose:
-                            did_diagnose = True
-                            try:
-                                _portal_diagnose(driver, session, access_token, src_iin)
-                            except Exception as de:
-                                log4(f"   диагностика упала: {de}")
-                        raise RuntimeError(
-                            "portal-sot.kz на запрос /api/secure/gbdfl/v2/byIin отдаёт пустой 200. "
-                            "Диагностика выше в логе. Нужен свежий HAR рабочего запроса "
-                            "(в браузере: новый иск → добавить участника → поиск по ИИН → Export HAR)."
-                        )
-                    if msg == "PORTAL_TOKEN_EXPIRED":
-                        log4("   🔄 401 — полный вход через ЭЦП")
-                        try:
-                            access_token, refresh_token = _portal_login(driver, force_fresh=True)
-                            session = _portal_make_session(driver, access_token)
-                            log4("   ✅ Свежий access_token получен")
-                        except Exception as relogin_error:
-                            log4(f"   ❌ Перелогин не удался: {relogin_error}")
-                            raise RuntimeError("Не удалось войти на portal-sot.kz заново")
+                        if renewed_on_empty:
+                            raise RuntimeError(
+                                "portal-sot.kz на запрос /api/secure/gbdfl/v2/byIin отдаёт пустой 200 "
+                                "даже после обновления токена. Нужен свежий HAR рабочего запроса "
+                                "(в браузере: новый иск → добавить участника → поиск по ИИН → Export HAR)."
+                            )
+                        renewed_on_empty = True
+                        log4("   🔄 пустой 200 — обновляю токен")
+                        portal.renew()
+                    elif msg == "PORTAL_TOKEN_EXPIRED":
+                        log4("   🔄 401 после обновления токена — обновляю ещё раз")
+                        portal.renew()
                     else:
                         log4(f"   ⚠ RuntimeError: {e} (попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW})")
 
                 except Exception as e:
                     log4(f"   ⚠ {type(e).__name__}: {e} (попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW})")
-
-                if attempt < MAX_TOTAL_ATTEMPTS_PER_ROW:
-                    time.sleep(RETRY_ROW_PAUSE)
 
             if success:
                 consecutive_fail = 0
@@ -2437,9 +2434,11 @@ def parse_people_via_portal_sot():
             if processed % AUTOSAVE_EVERY == 0:
                 _safe_save(wb, OUT_XLSX)
 
-            time.sleep(0.25)
+    except PortalBlocked as e:
+        log_err(f"⛔ {e} (обработано {processed}, результат сохранён)")
 
     finally:
+        portal.__exit__(None, None, None)
         try:
             _safe_save(wb, OUT_XLSX)
         except Exception:
@@ -2542,6 +2541,10 @@ def extract_locality_from_address(address: str):
     if pd.isna(address):
         return None
     parts = [p.strip() for p in str(address).split(",") if p.strip()]
+    # Адрес может начинаться со страны ("КАЗАХСТАН, <область>, <район>, ...") —
+    # тогда 2-й элемент был бы областью, а не районом/городом.
+    if parts and normalize_kz_text(parts[0]) == "казахстан":
+        parts = parts[1:]
     if len(parts) >= 2:
         return parts[1]
     return parts[0] if parts else None
@@ -2635,7 +2638,7 @@ def _pick_court_by_settlement(addr_norm: str, file_path: str, default_court: str
 def _pick_enbekshi_court(addr_norm: str) -> str:
     return _pick_court_by_settlement(
         addr_norm, FILE_ENBEKSHI,
-        default_court="Енбекшиказахский районный суд",
+        default_court="Енбекшиказахский районный суд Алматинской области (Общая юрисдикция)",
         district_label="Енбекшиказахский район",
     )
 
@@ -2643,18 +2646,92 @@ def _pick_enbekshi_court(addr_norm: str) -> str:
 def _pick_shet_court(addr_norm: str) -> str:
     return _pick_court_by_settlement(
         addr_norm, FILE_SHET,
-        default_court="Шетский районный суд Карагандинской области",
+        default_court="Шетский районный суд Карагандинской области (Общая юрисдикция)",
         district_label="Шетский район",
     )
 
 
+# ── Исключения подсудности / УГД (от юристов, по разбору примеров) ──────────
+# Некоторые районы/города относятся к суду и УГД ДРУГОГО района/города, а
+# справочники этого не знают. Правило срабатывает, если в нормализованном
+# адресе (normalize_kz_text → UPPER: казахские буквы заменены — Ұ→У, Ң→Н,
+# Ө→О, І→И …) есть и `region`, и хотя бы один из `any` (целым словом).
+# Суд — точное название из «Справочник судов portal-sot.xlsx».
+# Правило приоритетнее и выбора суда (блок 5), и выбора УГД (блок 6).
+COURT_UGD_EXCEPTIONS = [
+    {   # Уланский район → Межрайонный суд по гражданским делам г. Усть-Каменогорска
+        "region": "ВОСТОЧНО-КАЗАХСТАНСКАЯ ОБЛАСТЬ",
+        "any": ["УЛАНСКИЙ РАЙОН"],
+        "court": "Межрайонный суд по гражданским делам города Усть-Каменогорска",
+        "ugd": "УГД по г.Усть-Каменогорск", "bin": "991040001526",
+    },
+    {   # Алтынсаринский район → Костанайский межрайонный суд
+        "region": "КОСТАНАЙСКАЯ ОБЛАСТЬ",
+        "any": ["АЛТЫНСАРИНСКИЙ РАЙОН"],
+        "court": "Костанайский межрайонный суд Костанайской области (Общая юрисдикция)",
+        "ugd": "УГД по Костанайскому району", "bin": "960440000409",
+    },
+    {   # Семей → Межрайонный суд по гражданским делам г. Семей (не Абайский районный)
+        "region": "ОБЛАСТЬ АБАЙ",
+        "any": ["ОБЛАСТЬ АБАЙ, СЕМЕЙ"],   # город сразу после области
+        "court": "Межрайонный суд по гражданским делам  города Семея",
+        "ugd": "УГД по городу Семей", "bin": "990940001202",
+    },
+    {   # Качирский район (он же район Тереңкөл) → Суд района Тереңкөл
+        "region": "ПАВЛОДАРСКАЯ ОБЛАСТЬ",
+        "any": ["КАЧИРСКИЙ РАЙОН", "РАЙОН ТЕРЕНКОЛ", "ТЕРЕНКОЛЬСКИЙ РАЙОН"],
+        "court": "Суд района Тереңкөл Павлодарской области (Общая юрисдикция)",
+        "ugd": "УГД по Качирскому району", "bin": "980940001240",
+    },
+    {   # Майский район → Межрайонный суд г. Аксу
+        "region": "ПАВЛОДАРСКАЯ ОБЛАСТЬ",
+        "any": ["МАЙСКИЙ РАЙОН"],
+        "court": "Межрайонный суд города Аксу Павлодарской области (Общая юрисдикция)",
+        "ugd": "УГД по г.Аксу", "bin": "980940001141",
+    },
+    {   # г. Алатау: суд верный, но УГД — по г. Алатау (не Қонаев);
+        # в справочнике БИН(УГД).xlsx этого УГД нет.
+        "region": "АЛМАТИНСКАЯ ОБЛАСТЬ",
+        "any": ["АЛМАТИНСКАЯ ОБЛАСТЬ, АЛАТАУ"],   # город, а не село «Алатау»
+        "court": "Суд города Алатау Алматинской области (Общая юрисдикция)",
+        "ugd": "УГД по городу Алатау", "bin": "240640001721",
+    },
+    {   # г. Сатпаев: УГД по г. Сатпаев с БИН 900540000015 — так указали юристы
+        # (в БИН(УГД).xlsx этот БИН записан за г. Жезказган — справочник расходится).
+        "region": "ОБЛАСТЬ УЛЫТАУ",
+        "any": ["ОБЛАСТЬ УЛЫТАУ, САТПАЕВ"],
+        "court": "Сатпаевский городской суд области Ұлытау",
+        "ugd": "УГД по городу Сатпаев", "bin": "900540000015",
+    },
+]
+
+
+def find_court_ugd_exception(address_value, region_value=None):
+    """Правило из COURT_UGD_EXCEPTIONS для адреса или None."""
+    text = " ".join(str(v) for v in (region_value, address_value)
+                    if v is not None and not pd.isna(v))
+    if not text:
+        return None
+    addr = normalize_kz_text(text).upper()
+    for rule in COURT_UGD_EXCEPTIONS:
+        if rule["region"] not in addr:
+            continue
+        if any(re.search(r"(?<![\w-])" + re.escape(k) + r"(?![\w-])", addr) for k in rule["any"]):
+            return rule
+    return None
+
+
 def pick_court(region_value, address_value, courts_by_region):
+    rule = find_court_ugd_exception(address_value, region_value)
+    if rule:
+        return rule["court"]
+
     addr_norm = ""
     if not pd.isna(address_value):
         addr_norm = normalize_kz_text(address_value).upper()
 
         if "КОСТАНАЙСКАЯ ОБЛАСТЬ, КОСТАНАЙСКИЙ РАЙОН" in addr_norm and "ТОБЫЛ" in addr_norm:
-            return "Костанайский межрайонный суд Костанайской области"
+            return "Костанайский межрайонный суд Костанайской области (Общая юрисдикция)"
         if "КОСТАНАЙСКАЯ ОБЛАСТЬ, КОСТАНАЙ," in addr_norm:
             return "Костанайский городской суд Костанайской области (Гражданские дела)"
         if "АТЫРАУСКАЯ ОБЛАСТЬ" in addr_norm and "АТЫРАУ," in addr_norm:
@@ -2688,21 +2765,21 @@ def pick_court(region_value, address_value, courts_by_region):
             if "ТАРАЗ," in addr_norm:
                 return "Таразский городской суд Жамбылской области (Гражданские дела)"
             if "КОРДАЙСКИЙ РАЙОН" in addr_norm:
-                return "Кордайский районный суд Жамбылской области"
+                return "Кордайский районный суд Жамбылской области (Общая юрисдикция)"
             if "МЕРКЕНСКИЙ РАЙОН" in addr_norm:
-                return "Меркенский районный суд Жамбылской области"
+                return "Меркенский районный суд Жамбылской области (Общая юрисдикция)"
             if "ЖУАЛИНСКИЙ РАЙОН" in addr_norm:
-                return "Жуалинский районный суд Жамбылской области"
+                return "Жуалынский районный суд Жамбылской области (Общая юрисдикция)"
             if "БАЙЗАКСКИЙ РАЙОН" in addr_norm:
-                return "Байзакский районный суд Жамбылской области"
+                return "Байзакский районный суд Жамбылской области (Общая юрисдикция)"
             if "ШУСКИЙ РАЙОН" in addr_norm:
-                return "Шуский районный суд Жамбылской области"
+                return "Шуский районный суд Жамбылской области (Общая юрисдикция)"
         if "МАНГИСТАУСКАЯ ОБЛАСТЬ" in addr_norm and "АКТАУ," in addr_norm:
-            return "Актауский городской суд Мангистауской области (Гражданские дела)"
+            return "Суд №2 города Актау Мангистауской области (Гражданские дела)"
         if "ВОСТОЧНО-КАЗАХСТАНСКАЯ ОБЛАСТЬ" in addr_norm and "УСТЬ-КАМЕНОГОРСК," in addr_norm:
             return "Межрайонный суд по гражданским делам города Усть-Каменогорска"
-        if "ОБЛАСТЬ ЖЕТІСУ" in addr_norm and "ТАЛДЫКОРГАН," in addr_norm:
-            return "Талдыкорганский городской суд области Жетісу (Гражданские дела)"
+        if "ОБЛАСТЬ ЖЕТИСУ" in addr_norm and "ТАЛДЫКОРГАН," in addr_norm:
+            return "Талдыкорганский городской суд области  Жетісу"
         if "АЛМАТИНСКАЯ ОБЛАСТЬ" in addr_norm and "ЕНБЕКШИКАЗАХ" in addr_norm:
             return _pick_enbekshi_court(addr_norm)
 
@@ -2740,6 +2817,66 @@ def pick_court(region_value, address_value, courts_by_region):
     return best_court
 
 
+# В «Справочник судов portal-sot.xlsx» — ВСЕ суды страны. Для иска о взыскании
+# к физлицу нужны только районные/городские суды по гражданским делам или общей
+# юрисдикции; остальное (уголовные, административные, апелляция, следственные,
+# экономические, по делам несовершеннолетних, военные) отсекаем.
+_COURT_TYPES_ALLOWED = {"Гражданские", "Общая юрисдикция", "Гражданские и уголовные", "Прочее / не указано"}
+_COURT_TYPE_ORDER = {"Гражданские": 0, "Общая юрисдикция": 1, "Гражданские и уголовные": 2, "Прочее / не указано": 3}
+_COURT_NAME_EXCLUDE = re.compile(
+    r"апелляц|следствен|экономическ|несовершеннолетн|военн|верховн|кассацион|"
+    r"административн|по уголовным|^суд области\b",
+    re.IGNORECASE,
+)
+_COURT_EXCLUDED_REGION_IDS = {18, 23, 99}   # как EXCLUDED_REGION_IDS в podacha_portal_sot.py
+
+
+def load_courts_directory() -> pd.DataFrame:
+    """Лист «Все суды» → DataFrame с колонками «Области»/«Суды» (как было у старого
+    «Суды по гражданским делам.xlsx»), только подходящие для иска суды.
+    Порядок внутри региона: сначала «Гражданские», потом «Общая юрисдикция»…
+    — первый суд региона берётся, когда населённый пункт из адреса не определён."""
+    df = pd.read_excel(FILE_COURTS, sheet_name="Все суды")
+    df = df.dropna(subset=["Регион", "Наименование суда"]).copy()
+    df["Наименование суда"] = df["Наименование суда"].astype(str).str.strip()
+    df = df[~df["ID региона"].isin(_COURT_EXCLUDED_REGION_IDS)]
+    df = df[df["Тип суда"].isin(_COURT_TYPES_ALLOWED)]
+    df = df[~df["Наименование суда"].str.contains(_COURT_NAME_EXCLUDE)]
+    df["_order"] = df["Тип суда"].map(_COURT_TYPE_ORDER)
+    df = df.sort_values(["Регион", "_order", "Наименование суда"], kind="stable")
+    return df.rename(columns={"Регион": "Области", "Наименование суда": "Суды"})[["Области", "Суды"]]
+
+
+def _court_match_key(name) -> str:
+    """Ключ для сравнения названий суда: без скобок, регистра, лишних пробелов,
+    казахских букв и вариантов «№ 2»/«№2»."""
+    s = normalize_kz_text(str(name or "")).split("(", 1)[0]
+    s = re.sub(r"№\s*", "№", s)
+    s = re.sub(r"[\"'«»]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def canonical_court_name(court_name, region_value, df_courts: pd.DataFrame):
+    """Приводит выбранный суд к ТОЧНОМУ названию из справочника (его потом ищет
+    подача иска на portal-sot.kz). Не нашли однозначно — оставляем как есть."""
+    if not court_name or pd.isna(court_name) or str(court_name).startswith("Необходимо вручную"):
+        return court_name
+    key = _court_match_key(court_name)
+    pool = df_courts
+    if region_value is not None and not pd.isna(region_value):
+        reg = df_courts[df_courts["Области"].apply(norm_region) == norm_region(region_value)]
+        if not reg.empty:
+            pool = reg
+    keys = pool["Суды"].apply(_court_match_key)
+    exact = pool[keys == key]
+    if len(exact) >= 1:
+        return exact["Суды"].iloc[0]
+    partial = pool[keys.apply(lambda k: bool(key) and (key in k or k in key))]
+    if len(partial) == 1:
+        return partial["Суды"].iloc[0]
+    return court_name
+
+
 def fill_courts_column():
     print("Читаю файл отчёта:", FILE_PEOPLE)
     df_people = pd.read_excel(FILE_PEOPLE, sheet_name="Отмены")
@@ -2750,9 +2887,8 @@ def fill_courts_column():
             raise ValueError(f"В файле нет столбца '{col}'")
 
     print("Читаю файл судов:", FILE_COURTS)
-    df_courts = pd.read_excel(FILE_COURTS, sheet_name="Возврат")
-    df_courts["Области"] = df_courts["Области"].ffill()
-    df_courts = df_courts.dropna(subset=["Суды"]).copy()
+    df_courts = load_courts_directory()
+    print(f"  подходящих для иска судов в справочнике: {len(df_courts)}")
     df_courts["region_key"] = df_courts["Области"].apply(norm_region)
     df_courts["court_key"]  = df_courts["Суды"].apply(simplify_court_name)
 
@@ -2763,7 +2899,10 @@ def fill_courts_column():
 
     print("Определяю суды для каждой строки...")
     courts_series = df_people.apply(
-        lambda row: pick_court(row[REGION_COL_NAME], row[ADDR_COL_NAME], courts_by_region),
+        lambda row: canonical_court_name(
+            pick_court(row[REGION_COL_NAME], row[ADDR_COL_NAME], courts_by_region),
+            row[REGION_COL_NAME], df_courts,
+        ),
         axis=1,
     ).reset_index(drop=True)
 
@@ -3060,6 +3199,10 @@ def _pick_ugd(address_value, region_value, court_value, mapping: list) -> tuple:
          самой области, исключаются из сравнения, чтобы не давать
          ложное совпадение "область == одноимённый район".
     """
+    rule = find_court_ugd_exception(address_value, region_value)
+    if rule:
+        return rule["ugd"], rule["bin"]
+
     region = _ugd_detect_region(region_value, address_value)
 
     # Если во всём определённом регионе всего один УГД — берём его сразу,

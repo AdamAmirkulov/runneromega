@@ -27,6 +27,9 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from webdriver_manager.firefox import GeckoDriverManager
 
 BASE_URL = "https://portal-sot.kz"
 NCALAYER_WS_PORT = 13579
@@ -62,58 +65,52 @@ class PortalSotLogin:
         self.cfg = cfg
         self.log = log
         self.dump_dir = dump_dir or os.getcwd()
-        self.profile = cfg["chrome_profile"]
-        self.chrome_path = cfg.get("chrome_path") or r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        self.profile = cfg.get("firefox_profile")
+        if not self.profile:
+            raise RuntimeError(
+                f"Для компании {company_id} не задан firefox_profile в PORTAL_SOT_BY_COMPANY (scripts/config.py)"
+            )
         self.ncalayer_path = cfg.get("ncalayer_path") or os.path.expandvars(
             r"%LOCALAPPDATA%\Programs\NCALayer\NCALayer.exe"
         )
-        # Порт отладки уникален на компанию (запасной путь запуска Chrome).
-        cid = self.company_id
-        self.debug_port = 9400 + (int(cid) if cid.isdigit() else 0)
 
-    # ---------- Chrome ----------
+    # ---------- Firefox ----------
 
-    def _attach_debug_chrome(self):
-        """Запасной путь: если webdriver.Chrome(options) падает (профиль уже
-        открыт / DevToolsActivePort), поднимаем chrome.exe с remote-debugging
-        и подключаемся по debuggerAddress."""
-        port = self.debug_port
-        if not _port_open(port):
-            os.makedirs(self.profile, exist_ok=True)
-            subprocess.Popen(
-                [self.chrome_path, f"--remote-debugging-port={port}",
-                 f"--user-data-dir={self.profile}", "--start-maximized",
-                 "--disable-notifications", "--disable-popup-blocking", BASE_URL],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            deadline = time.time() + 30
-            while time.time() < deadline and not _port_open(port):
-                time.sleep(0.5)
-            if not _port_open(port):
-                raise RuntimeError(
-                    f"Chrome не открыл порт remote-debugging {port}. Если Chrome с профилем "
-                    f"{self.profile} открыт вручную — закройте его и перезапустите."
-                )
-        o = webdriver.ChromeOptions()
-        o.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-        return webdriver.Chrome(options=o)
+    def _release_stale_profile(self):
+        """Как в poiskvsk.py: если прошлый запуск не закрыл Firefox, профиль
+        остаётся залоченным (.parentlock) и новый Firefox на нём не стартует."""
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "firefox.exe"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        time.sleep(1)
+        for lock_name in (".parentlock", "lock"):
+            try:
+                lock_path = os.path.join(self.profile, lock_name)
+                if os.path.exists(lock_path):
+                    os.remove(lock_path)
+            except Exception:
+                pass
 
     def init_driver(self):
-        opts = webdriver.ChromeOptions()
-        opts.add_argument("--start-maximized")
-        opts.add_argument("--disable-notifications")
-        opts.add_argument("--disable-popup-blocking")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        # Постоянный профиль компании, где уже нажато «Разрешить» для portal-sot.kz → NCALayer.
-        opts.add_argument("--user-data-dir=" + self.profile)
+        # Постоянный профиль компании (не копия!), где уже нажато «Разрешить»
+        # для portal-sot.kz → NCALayer и принят self-signed сертификат NCALayer.
+        os.makedirs(self.profile, exist_ok=True)
+        opts = FirefoxOptions()
+        opts.add_argument("-profile")
+        opts.add_argument(self.profile)
+        opts.set_preference("dom.disable_beforeunload", True)
         try:
-            drv = webdriver.Chrome(options=opts)
+            drv = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opts)
         except Exception as e:
-            self.log(f"Прямой запуск Chrome не удался ({str(e).splitlines()[0]}); пробую через remote-debugging")
-            drv = self._attach_debug_chrome()
+            self.log(f"Прямой запуск Firefox не удался ({str(e).splitlines()[0]}); снимаю лок профиля и повторяю")
+            self._release_stale_profile()
+            drv = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opts)
         caps = drv.capabilities or {}
         self.log(f"Браузер: {caps.get('browserName')} {caps.get('browserVersion')}, профиль: {self.profile}")
         drv.set_page_load_timeout(120)
+        drv.maximize_window()
         return drv
 
     # ---------- NCALayer ----------
@@ -269,7 +266,7 @@ class PortalSotLogin:
         if nca is None:
             raise RuntimeError(
                 "Окно подписи NCALayer так и не появилось после клика «Войти». Убедитесь, что NCALayer "
-                "запущен и в Chrome-профиле компании для portal-sot.kz нажато «Разрешить»."
+                "запущен и в Firefox-профиле компании для portal-sot.kz нажато «Разрешить»."
             )
         nca.set_focus()
 
