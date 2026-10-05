@@ -7,7 +7,10 @@ portal-sot.kz: браузер ТОЛЬКО для входа, дальше — �
      data/portal_sot_tokens/<company_id>.json.
   2. access_token живёт ~15 минут, refresh_token ~24 часа. Когда access истёк —
      POST /api/public/auth/refresh (без браузера, без ЭЦП). Браузер + ЭЦП
-     поднимаются только если refresh тоже истёк/отклонён — т.е. ~раз в сутки.
+     поднимаются, если refresh истёк/отклонён ИЛИ если токен после refresh всё
+     равно получает 401: когда сессия на портале умерла, /auth/refresh отвечает
+     200 и выдаёт новый access_token, но API его не принимает (сам сайт в этой
+     ситуации тоже уходит на вход по ЭЦП — см. data/portal_debug).
   3. Браузер открывается функцией browser_login() из скрипта и СРАЗУ закрывается
      после получения токенов.
   4. Все запросы идут через get(): случайная пауза между запросами, длинная
@@ -36,6 +39,7 @@ LONG_PAUSE_EVERY = 50               # каждые N запросов ...
 LONG_PAUSE_SECONDS = (30.0, 60.0)   # ... передышка
 BACKOFF_429_5XX = (60, 180, 600)    # ожидания при 429/5xx; после последнего — стоп
 MAX_REQUESTS_PER_RUN = 3000         # предохранитель на один запуск
+MAX_BROWSER_LOGINS_PER_RUN = 3      # входов по ЭЦП за запуск; больше — портал явно не пускает
 
 
 class PortalBlocked(RuntimeError):
@@ -123,6 +127,7 @@ class PortalSotHttp:
         self.session = None
         self._last_request_at = 0.0
         self._count = 0
+        self._browser_logins = 0
         self._lock = _ProcessLock(LOCK_PATH, log)
 
     # ---------- жизненный цикл ----------
@@ -213,8 +218,14 @@ class PortalSotHttp:
         self.log("🔄 portal-sot.kz: access_token обновлён через refresh (без браузера)")
         return True
 
-    def _login_via_browser(self):
-        self.log("🔐 portal-sot.kz: refresh_token нет/истёк — вход через браузер + ЭЦП (браузер закроется сразу после входа)")
+    def _login_via_browser(self, reason="refresh_token нет/истёк"):
+        if self._browser_logins >= MAX_BROWSER_LOGINS_PER_RUN:
+            raise PortalBlocked(
+                f"portal-sot.kz не принимает токен даже после {self._browser_logins} входов по ЭЦП "
+                f"за этот запуск — прогон остановлен. Проверьте вход на портал вручную."
+            )
+        self._browser_logins += 1
+        self.log(f"🔐 portal-sot.kz: {reason} — вход через браузер + ЭЦП (браузер закроется сразу после входа)")
         got = self.browser_login()
         if not got or not got.get("access_token"):
             raise RuntimeError("Вход на portal-sot.kz через браузер не вернул access_token")
@@ -227,9 +238,12 @@ class PortalSotHttp:
         }
         self._save_tokens()
 
-    def renew(self):
-        """Токен не принят (401 / пустой 200): сначала refresh, потом браузер."""
-        if not self._refresh():
+    def renew(self, full=False):
+        """Токен не принят (401 / пустой 200): сначала refresh, потом браузер.
+        full=True — сразу вход по ЭЦП (refresh уже пробовали, и он не помог)."""
+        if full:
+            self._login_via_browser("токен после refresh всё равно не принят (401)")
+        elif not self._refresh():
             self._login_via_browser()
         self._build_session()
 
@@ -255,16 +269,25 @@ class PortalSotHttp:
         kwargs.setdefault("timeout", (10, 60))
         if _jwt_exp(self.tokens.get("access_token", "")) < time.time() + 30:
             self.renew()
-        renewed = False
+        renew_stage = 0   # 0 — ещё не обновляли, 1 — был refresh, 2 — был вход по ЭЦП
         backoff = list(BACKOFF_429_5XX)
         while True:
             self._throttle()
             r = self.session.get(url, **kwargs)
 
-            if r.status_code == 401 and not renewed:
-                renewed = True
-                self.renew()
-                continue
+            if r.status_code == 401:
+                if renew_stage == 0:
+                    renew_stage = 1
+                    self.renew()
+                    continue
+                if renew_stage == 1:
+                    renew_stage = 2
+                    self.renew(full=True)
+                    continue
+                raise PortalBlocked(
+                    "portal-sot.kz отвечает 401 даже сразу после свежего входа по ЭЦП — "
+                    "прогон остановлен. Проверьте вход на портал вручную."
+                )
 
             if is_waf_block(r):
                 raise PortalBlocked(BLOCK_MESSAGE)

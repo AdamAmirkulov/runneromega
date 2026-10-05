@@ -646,10 +646,13 @@ def fill_people_from_portal(input_xlsx: str) -> pd.DataFrame:
                 break
             except RuntimeError as e:
                 if str(e) == "PORTAL_TOKEN_EXPIRED":
-                    log4("   🔄 401 после обновления токена — обновляю ещё раз")
-                    portal.renew()
+                    log4("   🔄 401 после обновления токена — вход заново по ЭЦП")
                     try:
+                        portal.renew(full=True)
                         data = _portal_fetch_by_iin(portal, iin)
+                    except PortalBlocked as e2:
+                        log4(f"⛔ {e2} (обработано {processed}, результат сохранён)")
+                        break
                     except Exception as e2:
                         ws.cell(row=row, column=10).value = f"ОШИБКА: {e2}"
                         error_count += 1

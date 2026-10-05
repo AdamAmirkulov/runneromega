@@ -2341,7 +2341,18 @@ def parse_people_via_portal_sot():
     log4("=== START parse_people_via_portal_sot (portal-sot.kz JSON API, ОМЕГА) ===")
     log4(f"Файл-источник: {INPUT_XLSX}")
 
-    wb = load_workbook(INPUT_XLSX)
+    # Файл читаем только ПОСЛЕ того, как заняли portal-sot.kz: иначе второй
+    # параллельный запуск загрузит книгу, пока первый ещё пишет адреса, а потом
+    # сохранит свою (старую) копию поверх — и найденные адреса пропадут.
+    # Браузер поднимается только если нет живого access/refresh токена,
+    # и закрывается сразу после входа. Дальше — только HTTP.
+    portal = PortalSotHttp(company_id, _portal_browser_login, log=log4)
+    portal.__enter__()
+    try:
+        wb = load_workbook(INPUT_XLSX)
+    except Exception:
+        portal.__exit__(None, None, None)
+        raise
     try:
         ws = wb["Отмены"]
     except KeyError:
@@ -2360,11 +2371,7 @@ def parse_people_via_portal_sot():
     renewed_on_empty = False   # пустой 200 = токен не принят; обновляем один раз
     MAX_CONSECUTIVE_FAIL = 5   # подряд «мертвых» строк → портал недоступен, выходим
 
-    # Браузер поднимается только если нет живого access/refresh токена,
-    # и закрывается сразу после входа. Дальше — только HTTP.
-    portal = PortalSotHttp(company_id, _portal_browser_login, log=log4)
     try:
-        portal.__enter__()
         for r in range(2, ws.max_row + 1):
             src_iin = _norm_iin(ws.cell(row=r, column=4).value)
             if not src_iin or len(src_iin) != 12:
@@ -2407,11 +2414,11 @@ def parse_people_via_portal_sot():
                                 "(в браузере: новый иск → добавить участника → поиск по ИИН → Export HAR)."
                             )
                         renewed_on_empty = True
-                        log4("   🔄 пустой 200 — обновляю токен")
-                        portal.renew()
+                        log4("   🔄 пустой 200 — вход заново по ЭЦП")
+                        portal.renew(full=True)
                     elif msg == "PORTAL_TOKEN_EXPIRED":
-                        log4("   🔄 401 после обновления токена — обновляю ещё раз")
-                        portal.renew()
+                        log4("   🔄 401 после обновления токена — вход заново по ЭЦП")
+                        portal.renew(full=True)
                     else:
                         log4(f"   ⚠ RuntimeError: {e} (попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW})")
 
