@@ -144,6 +144,7 @@ UPLOAD_RETRY_COUNT = 3
 UPLOAD_RETRY_BASE_DELAY = 4
 
 # Колонки Excel.
+COL_UID = "A"  # Уникальный номер — есть в имени папки займа ('ФИО, ИИН, №<номер>')
 COL_FIO = "C"
 COL_IIN = "D"
 COL_SUM = "J"
@@ -1761,6 +1762,7 @@ def load_case_row(row: int) -> dict[str, str]:
 
         result = {
             "ROW": str(row),
+            "UID": re.sub(r"\.0$", "", cell_text(ws, COL_UID, row).strip()),
             "FIO": cell_text(ws, COL_FIO, row),
             "IIN": normalize_iin(cell_text(ws, COL_IIN, row)),
             "CLAIM_SUM": claim_sum,
@@ -1828,12 +1830,25 @@ def selected_batch_folder() -> Path:
     return batch
 
 
-def find_case_folder(iin: str, fio: str) -> Path:
+def find_case_folder(iin: str, fio: str, uid: str = "") -> Path:
     batch = selected_batch_folder()
     normalized_fio = re.sub(r"\s+", " ", fio).strip().casefold()
 
     iin_matches: list[Path] = []
     fio_matches: list[Path] = []
+
+    # Папки займов называются 'ФИО, ИИН, №<Уникальный номер>' — сначала
+    # ищем строго по номеру (у должника может быть несколько займов);
+    # старые партии без номера — как раньше, по ИИН/ФИО.
+    if uid:
+        uid_matches = [
+            path.resolve() for path in batch.iterdir()
+            if path.is_dir()
+            and re.search(rf"№\s*{re.escape(uid)}(?!\d)", path.name)
+        ]
+        if len(uid_matches) == 1:
+            log.info("ТОЧНАЯ папка займа по Уникальному номеру %s: %s", uid, uid_matches[0])
+            return uid_matches[0]
 
     for path in batch.iterdir():
         if not path.is_dir():
@@ -5316,7 +5331,7 @@ def validate_http_only_notebook() -> None:
 def run_row(row: int, captures: list[CapturedRequest], position: int = 0, total: int = 0) -> None:
     context = load_case_row(row)
     progress(f"[{position}/{total}] {context['FIO']} ({context['IIN']})")
-    folder = find_case_folder(context["IIN"], context["FIO"])
+    folder = find_case_folder(context["IIN"], context["FIO"], context.get("UID", ""))
     case_files = classify_case_files(folder)
     validate_case_files(folder, case_files, context)
 

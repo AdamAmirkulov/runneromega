@@ -2,13 +2,22 @@
 """
 Подача исков в portal-sot.kz — подготовка БЕЗ ПОДПИСИ, по компаниям.
 
-Порт ноутбука PORTAL_SOT_FINAL_DRAFTS_NO_SIGN_LOCAL_COURTS_v24_BUTTON_RETRY_SAME_DRAFT
-в раннер вместо scripts/podacha_iska_v2.py (office.sud.kz больше не работает).
+Порт ноутбука Portal_Sud_Podacha_Iska (PORTAL-SOT v54) в раннер вместо
+scripts/podacha_iska_v2.py (office.sud.kz больше не работает).
 
 Что делает по каждой строке листа «Отмены»:
   create (истец-ЮЛ, ответчик из ГБДФЛ, представитель) → загрузка госпошлины,
-  иска и приложений → blank → повторное заполнение 2 полей на экране blank →
-  «Следующий шаг» до step=sign. ЭЦП НЕ накладывается — подписывает человек.
+  иска и приложений → экран blank: текст иска в оба поля настоящим Ctrl+V →
+  «Следующий шаг» до step=sign → «Мои дела» → «Ожидается отправка» → тот же
+  черновик → текст в оба поля ещё раз → следующая сделка.
+  ЭЦП НЕ накладывается — подписывает человек.
+
+Сделки ведутся в реестре «Шаблоны документов/portal-sot обработанные сделки.xlsx»
+(ключ — номер из колонки A): готовая сделка при повторном запуске пропускается,
+недоделанная продолжается в том же declarationId — второй черновик не создаётся.
+
+Нужны Word (текст иска берётся как Ctrl+A → Ctrl+C) и разблокированный рабочий
+стол: окно браузера выводится на передний план, буфер обмена занят скриптом.
 
 Всё, что в ноутбуке было захардкожено под Омегу, берётся по --company_id:
   COMPANY_ROOTS[id]              → папка «Документы для подачи Исков», Excel, партии
@@ -20,7 +29,7 @@
 Логика v24 сохранена: документы строго по 6-значному номеру из колонки A,
 локальный справочник судов (без уголовных, Актау → CODE 194711), retry
 загрузки файла, retry ГБДФЛ + перелогин, до 3 полных попыток строки, остановка
-всей пачки при неудаче (NO-SKIP), пауза 20–40 сек между сделками.
+всей пачки при неудаче (NO-SKIP), пауза 30–60 сек между сделками.
 """
 
 # ========= АРГУМЕНТЫ =========
@@ -63,9 +72,20 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import ctypes
+from ctypes import wintypes
+
+import pythoncom
 import requests
-from docx import Document
+import win32clipboard
+import win32com.client
+import win32con
+import win32gui
+import win32process
 from openpyxl import Workbook, load_workbook
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from portal_sot_login import PortalSotLogin, jwt_claims  # noqa: E402
@@ -83,6 +103,7 @@ BASE_URL = "https://portal-sot.kz"
 WORK_ROOT = Path(ROOT) / "Документы для подачи Исков"
 EXCEL_SHEET = "Отмены"
 COURTS_REL = Path("Документы для подачи Исков") / "Шаблоны документов" / "Справочник судов portal-sot.xlsx"
+REGISTRY_FILE = WORK_ROOT / "Шаблоны документов" / "portal-sot обработанные сделки.xlsx"
 
 
 def _int_arg(v, default):
@@ -185,14 +206,57 @@ def normalize_iin(v):
 
 
 def read_docx_text(path: Path) -> str:
-    doc = Document(path)
-    parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    for table in doc.tables:
-        for row in table.rows:
-            t = " ".join(c.text.strip() for c in row.cells if c.text.strip())
-            if t:
-                parts.append(t)
-    return "\n".join(parts)
+    """Текст иска ровно таким, каким его даёт ручное Ctrl+A → Ctrl+C в Word.
+
+    python-docx отдавал другой текст (на одном иске 6561 символ против 6618 из
+    Word), поэтому документ открывается в Word (невидимо, ReadOnly, без
+    сохранения), основной текст копируется в буфер обмена и забирается оттуда.
+    Если Word/буфер недоступны — ошибка, без отката на python-docx.
+    """
+    word = None
+    doc = None
+    pythoncom.CoInitialize()
+    try:
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        doc = word.Documents.Open(
+            str(Path(path).resolve()),
+            ReadOnly=True, AddToRecentFiles=False, ConfirmConversions=False,
+        )
+        doc.StoryRanges(1).Copy()  # wdMainTextStory — то, что выделяет Ctrl+A в теле документа
+
+        text = None
+        last_error = None
+        for _ in range(30):
+            try:
+                win32clipboard.OpenClipboard()
+                try:
+                    if win32clipboard.IsClipboardFormatAvailable(win32con.CF_UNICODETEXT):
+                        text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+                        break
+                finally:
+                    win32clipboard.CloseClipboard()
+            except Exception as e:
+                last_error = e
+            time.sleep(0.1)
+        if text is None:
+            raise RuntimeError(f"Word скопировал документ, но текст не получен из буфера обмена: {last_error}")
+
+        # textarea в браузере использует LF; остальное (пустые строки, табы) не трогаем.
+        return str(text).replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+    finally:
+        try:
+            if doc is not None:
+                doc.Close(False)
+        except Exception:
+            pass
+        try:
+            if word is not None:
+                word.Quit()
+        except Exception:
+            pass
+        pythoncom.CoUninitialize()
 
 
 def api_data(payload):
@@ -205,6 +269,108 @@ def api_data(payload):
     if "organization" in payload:
         return payload["organization"]
     return payload
+
+
+# ============================================================
+# РЕЕСТР ПОДГОТОВЛЕННЫХ СДЕЛОК
+# Ключ — уникальный номер сделки (Excel, колонка A). По нему повторный запуск
+# не создаёт второй черновик, а пропускает сделку или продолжает тот же.
+# ============================================================
+
+REGISTRY_HEADERS = [
+    "UNIQUE_NO", "EXCEL_ROW", "IIN", "FIO",
+    "DECLARATION_ID", "DOCUMENT_NUMBER",
+    "STATUS", "TEXT_VERIFIED", "UPDATED_AT",
+]
+REGISTRY_READY_STATUSES = {"READY_TO_SIGN", "SIGNED", "SENT"}
+REG_STAGE_FILES_DONE = "FILES_DONE"
+REG_STAGE_FIRST_SIGN = "FIRST_SIGN_TRUSTED_PASTE_OK"
+REG_STAGE_DONE = "MY_CASES_TRUSTED_PASTE_SAVED"
+# READY_TO_SIGN, но проход 2 («Мои дела») ещё не сделан — доделываем только его.
+REGISTRY_SECOND_PASS_PENDING = {
+    REG_STAGE_FIRST_SIGN, "PASS1_DONE_MY_CASES_PASS2_PENDING", "SERVER_OK_PASS2_PENDING",
+}
+
+
+def _norm_unique_no(value):
+    s = str(value or "").strip()
+    return s[:-2] if s.endswith(".0") else s
+
+
+def _registry_load():
+    REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not REGISTRY_FILE.exists():
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Сделки"
+        ws.append(REGISTRY_HEADERS)
+        ws.freeze_panes = "A2"
+        for col, width in zip("ABCDEFGHI", (16, 12, 18, 42, 18, 24, 20, 30, 22)):
+            ws.column_dimensions[col].width = width
+        wb.save(REGISTRY_FILE)
+    wb = load_workbook(REGISTRY_FILE)
+    ws = wb["Сделки"] if "Сделки" in wb.sheetnames else wb.active
+    return wb, ws
+
+
+def registry_check_writable():
+    """До первого /create: реестр должен открываться на запись (не открыт в Excel)."""
+    wb, _ws = _registry_load()
+    wb.close()
+    with open(REGISTRY_FILE, "r+b"):
+        pass
+
+
+def registry_get(unique_no):
+    key = _norm_unique_no(unique_no)
+    wb, ws = _registry_load()
+    try:
+        for r in range(2, ws.max_row + 1):
+            if _norm_unique_no(ws.cell(r, 1).value) == key:
+                return {
+                    "UNIQUE_NO": key,
+                    "EXCEL_ROW": ws.cell(r, 2).value,
+                    "IIN": ws.cell(r, 3).value,
+                    "FIO": ws.cell(r, 4).value,
+                    "DECLARATION_ID": ws.cell(r, 5).value,
+                    "DOCUMENT_NUMBER": ws.cell(r, 6).value,
+                    "STATUS": str(ws.cell(r, 7).value or "").strip(),
+                    "TEXT_VERIFIED": str(ws.cell(r, 8).value or "").strip(),
+                    "UPDATED_AT": ws.cell(r, 9).value,
+                }
+        return None
+    finally:
+        wb.close()
+
+
+def _registry_declaration_id(rec):
+    s = _norm_unique_no((rec or {}).get("DECLARATION_ID"))
+    return int(s) if s.isdigit() else None
+
+
+def registry_upsert(unique_no, excel_row, iin, fio, declaration_id,
+                    document_number="", status="READY_TO_SIGN", text_verified=""):
+    key = _norm_unique_no(unique_no)
+    wb, ws = _registry_load()
+    try:
+        target = next((r for r in range(2, ws.max_row + 1)
+                       if _norm_unique_no(ws.cell(r, 1).value) == key), ws.max_row + 1)
+        values = [
+            key, excel_row, str(iin or ""), str(fio or ""),
+            declaration_id, str(document_number or ""),
+            status, str(text_verified or ""),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+        for c, value in enumerate(values, 1):
+            ws.cell(target, c).value = value
+        # Сначала временный файл, затем replace — чтобы не оставить битый реестр.
+        tmp = REGISTRY_FILE.with_name(REGISTRY_FILE.stem + ".__tmp__.xlsx")
+        wb.save(tmp)
+    finally:
+        wb.close()
+    tmp.replace(REGISTRY_FILE)
+    log(f"РЕЕСТР: №{key} | declarationId={declaration_id} | "
+        f"номер документа={document_number or '-'} | {status} | {text_verified or '-'}")
 
 
 # ============================================================
@@ -932,26 +1098,6 @@ def get_declaration(declaration_id):
     ))
 
 
-def make_blank(declaration_id, claim_text, claim_sum, duty_sum):
-    decl = get_declaration(declaration_id)
-    plaintiffs = [p for p in decl.get("participants", []) if str(p.get("type")) == "61090001"]
-    if len(plaintiffs) != 1:
-        raise RuntimeError(f"Не найден участник-истец: {decl.get('participants')}")
-    pl = dict(plaintiffs[0])
-    pl["totalSum"] = str(claim_sum)
-    pl["dutyAmount"] = str(duty_sum)
-    pl["payingType"] = "check"
-
-    payload = {
-        "requirement": claim_text,
-        "circumstances": claim_text,
-        "declarationId": declaration_id,
-        "summary": "",
-        "participants": [pl],
-    }
-    return api_data(api_request("POST", "/api/secure/declaration/REQUEST_TYPE2/blank", json=payload))
-
-
 def open_blank_page(declaration_id):
     url = (f"{BASE_URL}/cabinet/declarations/REQUEST_TYPE2"
            f"?step=blank&caseType={CASE_TYPE}&instanceType={INSTANCE_TYPE}"
@@ -960,36 +1106,191 @@ def open_blank_page(declaration_id):
     return url
 
 
-def fill_blank_and_go_next(declaration_id, claim_text):
-    """Заполняет 2 поля, прокручивает к «Следующий шаг», кликает и доходит до step=sign. НЕ подписывает."""
-    from selenium.common.exceptions import TimeoutException
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
+# ============================================================
+# 7. ЭКРАН BLANK: «НАСТОЯЩАЯ» ВСТАВКА CTRL+V (v54)
+# ============================================================
+# Портал сохраняет текст двух полей только после доверенного (trusted) ввода:
+# значение, выставленное через JS, и прямой POST /blank из Python он теряет.
+# Поэтому текст кладём в буфер Windows и жмём Ctrl+A / Ctrl+V через SendInput
+# в окне браузера — как человек. Окно браузера при этом должно быть на экране,
+# а буфером обмена на этой машине во время пачки пользоваться нельзя.
 
-    open_blank_page(declaration_id)
-    wait = WebDriverWait(driver, 60)
+BLANK_FIELDS = ("circumstances", "requirement")
+BROWSER_WINDOW_CLASSES = ("MozillaWindowClass", "Chrome_WidgetWin_1")
 
-    def visible_textareas(d):
-        return [x for x in d.find_elements(By.TAG_NAME, "textarea") if x.is_displayed() and x.is_enabled()]
+_INPUT_KEYBOARD = 1
+_KEYEVENTF_KEYUP = 0x0002
+_VK_CONTROL, _VK_A, _VK_V = 0x11, 0x41, 0x56
+_ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 
-    tas = wait.until(lambda d: visible_textareas(d) if len(visible_textareas(d)) >= 2 else False)
-    log(f"Экран blank: найдено textarea = {len(tas)}")
 
-    for i, el in enumerate(tas[:2], 1):
-        driver.execute_script("""
-            const el=arguments[0], value=arguments[1];
-            const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;
-            setter.call(el,value);
-            el.dispatchEvent(new Event('input',{bubbles:true}));
-            el.dispatchEvent(new Event('change',{bubbles:true}));
-            el.dispatchEvent(new Event('blur',{bubbles:true}));
-        """, el, claim_text)
-        log(f"OK: textarea {i}/2 заполнено ({len(claim_text)} символов)")
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", _ULONG_PTR)]
 
-    vals = [x.get_attribute("value") or "" for x in tas[:2]]
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", _ULONG_PTR)]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUT_UNION)]
+
+
+def _send_ctrl_combo(vk, label):
+    user32 = ctypes.windll.user32
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)
+    user32.SendInput.restype = wintypes.UINT
+
+    def key(code, up=False):
+        x = _INPUT()
+        x.type = _INPUT_KEYBOARD
+        x.ki.wVk = code
+        x.ki.dwFlags = _KEYEVENTF_KEYUP if up else 0
+        return x
+
+    seq = (_INPUT * 4)(key(_VK_CONTROL), key(vk), key(vk, True), key(_VK_CONTROL, True))
+    n = user32.SendInput(4, seq, ctypes.sizeof(_INPUT))
+    if n != 4:
+        raise RuntimeError(f"{label}: SendInput {n}/4")
+
+
+def _set_clipboard_text(value):
+    last = None
+    for _ in range(20):
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardText(value, win32con.CF_UNICODETEXT)
+            finally:
+                win32clipboard.CloseClipboard()
+            return
+        except Exception as e:
+            last = e
+            time.sleep(0.1)
+    raise RuntimeError(f"Не удалось записать текст в буфер обмена Windows: {last}")
+
+
+def _browser_hwnd(label):
+    """Окно браузера, которым управляет driver: по PID процесса, иначе по заголовку."""
+    wins = []
+
+    def enum_cb(hwnd, _):
+        try:
+            if win32gui.IsWindowVisible(hwnd) and win32gui.GetClassName(hwnd) in BROWSER_WINDOW_CLASSES:
+                title = win32gui.GetWindowText(hwnd)
+                if title:
+                    wins.append((hwnd, title, win32process.GetWindowThreadProcessId(hwnd)[1]))
+        except Exception:
+            pass
+
+    win32gui.EnumWindows(enum_cb, None)
+    if not wins:
+        raise RuntimeError(f"{label}: окно браузера не найдено")
+    pid = (driver.capabilities or {}).get("moz:processID")
+    title = driver.title or ""
+    return (next((h for h, _t, p in wins if pid and p == pid), None)
+            or next((h for h, t, _p in wins if title and title in t), None)
+            or wins[0][0])
+
+
+def _activate_browser_window(label):
+    user32 = ctypes.windll.user32
+    target = _browser_hwnd(label)
+    cur = ctypes.windll.kernel32.GetCurrentThreadId()
+    fg_tid = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+    target_tid = user32.GetWindowThreadProcessId(target, None)
+    a = b = False
+    try:
+        if fg_tid and fg_tid != cur:
+            a = bool(user32.AttachThreadInput(cur, fg_tid, True))
+        if target_tid and target_tid != cur:
+            b = bool(user32.AttachThreadInput(cur, target_tid, True))
+        win32gui.ShowWindow(target, win32con.SW_RESTORE)
+        user32.BringWindowToTop(target)
+        user32.SetForegroundWindow(target)
+        user32.SetActiveWindow(target)
+        user32.SetFocus(target)
+    finally:
+        if b:
+            user32.AttachThreadInput(cur, target_tid, False)
+        if a:
+            user32.AttachThreadInput(cur, fg_tid, False)
+    time.sleep(0.45)
+    if user32.GetForegroundWindow() != target:
+        raise RuntimeError(f"{label}: окно браузера не стало активным (сеанс рабочего стола заблокирован/свёрнут?)")
+
+
+def _blank_field(name, timeout=60):
+    def finder(d):
+        els = d.find_elements(By.CSS_SELECTOR, f'textarea[name="{name}"]')
+        return els[0] if els and els[0].is_displayed() and els[0].is_enabled() else False
+    return WebDriverWait(driver, timeout).until(finder)
+
+
+def _blank_field_state(name):
+    return driver.execute_script("""
+      const el=document.querySelector(`textarea[name="${arguments[0]}"]`);
+      const k=Object.keys(el).find(k=>k.startsWith('__reactProps'));
+      const p=k?el[k]:null;
+      const tr=el._valueTracker&&el._valueTracker.getValue?el._valueTracker.getValue():null;
+      return {valueLen:el.value.length,
+              trackerLen:tr==null?null:String(tr).length,
+              reactLen:p&&typeof p.value==='string'?p.value.length:null};
+    """, name)
+
+
+def trusted_paste(name, value, label):
+    """Ctrl+A, Ctrl+V в textarea[name] и проверка, что текст дошёл до DOM и до состояния React."""
+    _set_clipboard_text(value)
+    _activate_browser_window(label)
+
+    el = _blank_field(name)
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+    time.sleep(0.3)
+    el.click()
+    time.sleep(0.25)
+    if not driver.execute_script("return document.activeElement===arguments[0];", el):
+        raise RuntimeError(f"{label}: поле {name} не получило фокус")
+
+    _send_ctrl_combo(_VK_A, label)
+    time.sleep(0.15)
+    _send_ctrl_combo(_VK_V, label)
+
+    expected = len(value)
+    state = {}
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        time.sleep(0.4)
+        state = _blank_field_state(name)
+        if state["valueLen"] == state["reactLen"] == state["trackerLen"] == expected:
+            break
+    log(f"{label}: ВСТАВКА {name} | DOM={state['valueLen']} | React={state['reactLen']} | tracker={state['trackerLen']}")
+    if not (state["valueLen"] == state["reactLen"] == state["trackerLen"] == expected):
+        raise RuntimeError(f"{label}: {name} — вставилось не то: ожидалось {expected} символов, получено {state}")
+
+
+def paste_both_fields(claim_text, label):
+    for name in BLANK_FIELDS:
+        trusted_paste(name, claim_text, label)
+    vals = [_blank_field(name).get_attribute("value") or "" for name in BLANK_FIELDS]
     if any(v != claim_text for v in vals):
-        raise RuntimeError("Контроль textarea не пройден: текст записался не полностью")
+        raise RuntimeError(f"{label}: после вставки текст в полях не совпал с текстом иска")
 
+
+def click_next_to_sign(declaration_id, label):
+    """«Следующий шаг» → ждём step=sign. НЕ подписывает."""
     def find_next_button(d):
         for b in d.find_elements(
             By.XPATH,
@@ -1007,7 +1308,6 @@ def fill_blank_and_go_next(declaration_id, claim_text):
         driver.execute_script(
             "arguments[0].scrollIntoView({behavior:'auto', block:'center', inline:'nearest'});", b
         )
-        log("Кнопка «Следующий шаг» найдена. Прокрутка к кнопке выполнена.")
         time.sleep(1.2)
         b = WebDriverWait(driver, 10).until(find_next_button)
         try:
@@ -1026,39 +1326,162 @@ def fill_blank_and_go_next(declaration_id, claim_text):
         if "step=sign" in driver.current_url:
             break
         if click_attempt > 1 and not find_next_button(driver):
-            log("Кнопки «Следующий шаг» нет, но и step=sign нет — жду ещё...")
+            log(f"{label}: кнопки «Следующий шаг» нет, но и step=sign нет — жду ещё...")
         else:
-            log(f"«Следующий шаг»: попытка {click_attempt}/{MAX_NEXT_CLICKS} в этом же declarationId={declaration_id}")
+            log(f"{label}: «Следующий шаг», попытка {click_attempt}/{MAX_NEXT_CLICKS} | declarationId={declaration_id}")
             scroll_and_click_next()
         try:
             WebDriverWait(driver, NEXT_WAIT_SEC).until(lambda d: "step=sign" in d.current_url)
             break
         except TimeoutException:
-            log(f"Переход на step=sign не подтверждён за {NEXT_WAIT_SEC} сек.")
+            log(f"{label}: переход на step=sign не подтверждён за {NEXT_WAIT_SEC} сек.")
 
     if "step=sign" not in driver.current_url:
         portal_login.dump_page(driver, f"no_sign_{declaration_id}")
-        raise DraftStuckError(
-            f"NEXT_BUTTON_RETRY_EXHAUSTED: declarationId={declaration_id} остался на шаге blank — "
-            f"откройте черновик в кабинете и нажмите «Следующий шаг» вручную (новый черновик НЕ создаётся)"
+        raise RuntimeError(
+            f"NEXT_BUTTON_RETRY_EXHAUSTED: declarationId={declaration_id} остался на шаге blank"
         )
+    log(f"{label}: step=sign подтверждён")
 
-    log(f"OK: заявление доведено до этапа подписи: {driver.current_url}")
-    log("СТОП: ЭЦП не накладывается, «Подписать» не нажимается.")
-    return driver.current_url
+
+def wait_sign_page_loaded():
+    """С экрана подписи нельзя уходить сразу: ждём, пока бланк реально отрисуется."""
+    WebDriverWait(driver, 60).until(
+        lambda d: "step=sign" in d.current_url
+        and d.execute_script("return document.readyState") == "complete"
+    )
+    WebDriverWait(driver, 90).until(lambda d: d.execute_script("""
+        const visible = el => {
+          if(!el) return false;
+          const s=getComputedStyle(el), r=el.getBoundingClientRect();
+          return s.display!=='none' && s.visibility!=='hidden' && r.width>0 && r.height>0;
+        };
+        const loaders=[...document.querySelectorAll(
+          '.ant-spin-spinning,.ant-spin,.spinner,.loader,[class*="loading"],[class*="spinner"]'
+        )].filter(visible);
+        const body=(document.body?.innerText||'').trim();
+        const contentReady = body.length > 150 ||
+          !!document.querySelector('iframe,embed,object,canvas,[class*="pdf"],[class*="document"],[class*="blank"]');
+        return loaders.length===0 && contentReady;
+    """))
+    time.sleep(2.0)
+
+
+def open_draft_from_my_cases(declaration_id):
+    """«Мои дела» → «Ожидается отправка» → этот же черновик на шаге blank."""
+    driver.get(BASE_URL)
+    WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
+    my = WebDriverWait(driver, 30).until(lambda d: next(
+        (x for x in d.find_elements(
+            By.XPATH, "//*[self::a or self::button][contains(normalize-space(.),'Мои дела')]")
+         if x.is_displayed()), None))
+    driver.execute_script("arguments[0].click();", my)
+    WebDriverWait(driver, 40).until(lambda d: "Мои дела" in (d.execute_script(
+        "return document.body ? document.body.innerText : ''") or ""))
+    time.sleep(1)
+
+    wait_tab = WebDriverWait(driver, 30).until(lambda d: next(
+        (x for x in d.find_elements(
+            By.XPATH,
+            "//*[self::a or self::button or @role='tab'][contains(normalize-space(.),'Ожидается отправка')]")
+         if x.is_displayed()), None))
+    driver.execute_script("arguments[0].click();", wait_tab)
+    time.sleep(1.5)
+    log("Открыт раздел «Мои дела» → «Ожидается отправка»")
+
+    # Ровно тот URL, который портал открывает по клику на черновик в списке
+    # (id в кавычках) — искать строку в таблице по номеру документа не нужно.
+    driver.get(
+        f"{BASE_URL}/cabinet/declarations/REQUEST_TYPE2"
+        f"?step=blank&caseType={CASE_TYPE}&instanceType={INSTANCE_TYPE}"
+        f"&id=%22{declaration_id}%22"
+    )
+    WebDriverWait(driver, 60).until(
+        lambda d: str(declaration_id) in d.current_url
+        and all(d.find_elements(By.CSS_SELECTOR, f'textarea[name="{n}"]') for n in BLANK_FIELDS)
+    )
+    WebDriverWait(driver, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
+    time.sleep(1.5)
+    log(f"Черновик открыт из «Мои дела» | declarationId={declaration_id}")
 
 
 # ============================================================
-# 7. ОДНА СДЕЛКА: СОЗДАТЬ ИСК ДО ЭКРАНА ПОДПИСАНИЯ
+# 8. ОДНА СДЕЛКА: СОЗДАТЬ ИСК ДО ЭКРАНА ПОДПИСАНИЯ
 # ============================================================
+
+_uploaded_files = {}  # declarationId -> имена файлов, загруженных в ЭТОМ запуске
+
+
+def _names_in_declaration(obj, names):
+    """Какие из имён файлов уже встречаются в JSON заявления (структура вложений не фиксирована)."""
+    found = set()
+
+    def walk(x):
+        if isinstance(x, dict):
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+        elif isinstance(x, str) and x in names:
+            found.add(x)
+    walk(obj)
+    return found
+
+
+def upload_case_files(declaration_id, plaintiff_id, files, already=frozenset()):
+    done = _uploaded_files.setdefault(declaration_id, set())
+    extras = files["extras"]
+    plan = [(files["duty"], "OFFLINE_PAYMENT_CHECK", plaintiff_id, "госпошлина (OFFLINE_PAYMENT_CHECK)"),
+            (files["claim"], "MAIN_DECLARATION_FILE", None, "иск")]
+    plan += [(p, "ADDITIONAL_FILE", None, f"приложение {i}/{len(extras)}") for i, p in enumerate(extras, 1)]
+    for p, file_type, participant_id, label in plan:
+        if p.name in done or p.name in already:
+            log(f"УЖЕ ЗАГРУЖЕН, пропускаю: {label}: {p.name}")
+            continue
+        size_bytes = p.stat().st_size if p.exists() else -1
+        log(f"ЗАГРУЗКА {label}: {p.name} | {size_bytes} байт ({size_bytes / 1024:.1f} КБ)")
+        try:
+            upload_file(declaration_id, p, file_type, participant_id)
+        except Exception as e:
+            log(f"ОШИБКА НА ФАЙЛЕ {label}: {p.name} | путь: {p} | "
+                f"размер: {size_bytes} байт | {type(e).__name__}: {e}", "ERROR")
+            raise
+        done.add(p.name)
+        log(f"OK: {label}: {p.name}")
+
+
+def _plaintiff_id(decl):
+    plaintiffs = [p for p in decl.get("participants", []) if str(p.get("type")) == "61090001"]
+    if len(plaintiffs) != 1:
+        raise RuntimeError("Не удалось определить participantId истца")
+    return plaintiffs[0]["id"]
+
 
 def run_one(row):
     ctx = load_case_row(row)
+    unique_no = ctx["UNIQUE_NO"]
+
+    rec = registry_get(unique_no) or {}
+    status = rec.get("STATUS", "").upper()
+    stage = rec.get("TEXT_VERIFIED", "")
+    declaration_id = _registry_declaration_id(rec)
+    document_number = str(rec.get("DOCUMENT_NUMBER") or "")
+    is_ready = status in REGISTRY_READY_STATUSES
+    second_pass_only = bool(is_ready and declaration_id and stage in REGISTRY_SECOND_PASS_PENDING)
+
+    if is_ready and not second_pass_only:
+        log(f"ПРОПУСК №{unique_no}: уже {status} | declarationId={declaration_id or '-'} | "
+            f"номер документа={document_number or '-'}")
+        return {"declaration_id": declaration_id, "document_number": document_number,
+                "unique_no": unique_no, "skipped": True}
+
     folder = find_case_folder(ctx["UNIQUE_NO"], ctx["FIO"], ctx["IIN"])
     files = classify_case_files(folder)
 
     log("=" * 80)
     log(f"СТРОКА EXCEL: {row}")
+    log(f"УНИКАЛЬНЫЙ № СДЕЛКИ: {unique_no}")
     log(f"ФИО: {ctx['FIO']}")
     log(f"ИИН: {ctx['IIN']}")
     log(f"Суд: {ctx['COURT']}")
@@ -1069,64 +1492,99 @@ def run_one(row):
     log(f"Файл госпошлины: {files['duty'].name}")
     log(f"Приложений: {len(files['extras'])}")
 
-    # 1. Создание
-    decl = create_declaration(ctx)
-    declaration_id = decl["id"]
-    log(f"Создан declarationId = {declaration_id}")
-
-    # 2. ID истца нужен для OFFLINE_PAYMENT_CHECK
-    plaintiffs = [p for p in decl.get("participants", []) if str(p.get("type")) == "61090001"]
-    if len(plaintiffs) != 1:
-        raise RuntimeError("Не удалось определить participantId истца")
-    plaintiff_id = plaintiffs[0]["id"]
-
-    # 3. Госпошлина как подтверждение оплаты
-    upload_file(declaration_id, files["duty"], "OFFLINE_PAYMENT_CHECK", plaintiff_id)
-    log("OK: госпошлина (OFFLINE_PAYMENT_CHECK)")
-
-    # 4. Основной файл иска
-    upload_file(declaration_id, files["claim"], "MAIN_DECLARATION_FILE")
-    log("OK: иск")
-
-    # 5. Все остальные приложения
-    for i, p in enumerate(files["extras"], 1):
-        size_bytes = p.stat().st_size if p.exists() else -1
-        log(f"ЗАГРУЗКА приложения {i}/{len(files['extras'])}: {p.name} | "
-            f"{size_bytes} байт ({size_bytes / 1024:.1f} КБ)")
-        try:
-            upload_file(declaration_id, p, "ADDITIONAL_FILE")
-        except Exception as e:
-            log(f"ОШИБКА НА ФАЙЛЕ {i}/{len(files['extras'])}: {p.name} | путь: {p} | "
-                f"размер: {size_bytes} байт | {type(e).__name__}: {e}", "ERROR")
-            raise
-        log(f"OK: приложение {i}/{len(files['extras'])}: {p.name}")
-
-    # 6. Текст иска -> blank
+    # Текст иска — до /create: если Word не отдал текст, черновик не плодим.
     claim_text = read_docx_text(files["claim"])
-    blank = make_blank(declaration_id, claim_text, ctx["CLAIM_SUM"], ctx["DUTY_SUM"])
-    if not isinstance(blank, dict) or not blank.get("xmlForSign"):
-        raise RuntimeError(f"Портал не вернул xmlForSign: {blank}")
-    log("OK: blank сформирован, xmlForSign получен")
+    if not claim_text.strip():
+        raise ValueError(f"Текст DOCX иска пустой: {files['claim'].name}")
+    log(f"Текст иска (как Ctrl+A → Ctrl+C в Word): {len(claim_text)} символов | "
+        f"строк={claim_text.count(chr(10)) + 1}")
 
-    # 7. Рабочий ручной сценарий портала: blank → заполнить ОБА поля → «Следующий шаг».
-    log("Повторное заполнение двух обязательных полей на этапе blank...")
-    fill_blank_and_go_next(declaration_id, claim_text)
+    def reg(new_status, new_stage):
+        registry_upsert(unique_no, row, ctx["IIN"], ctx["FIO"], declaration_id,
+                        document_number, new_status, new_stage)
 
-    # 8. НЕ ПОДПИСЫВАЕМ И НЕ ОТПРАВЛЯЕМ.
+    resumed = bool(declaration_id)
+    if not second_pass_only:
+        if resumed:
+            log(f"ПРОДОЛЖАЮ существующий черновик №{unique_no}: declarationId={declaration_id} "
+                f"({status or '-'} / {stage or '-'}). Новый /create НЕ делаю.")
+            if stage != REG_STAGE_FILES_DONE:
+                decl = get_declaration(declaration_id)
+                names = {p.name for p in [files["duty"], files["claim"], *files["extras"]]}
+                already = _names_in_declaration(decl, names)
+                if not already and declaration_id not in _uploaded_files:
+                    raise DraftStuckError(
+                        f"declarationId={declaration_id} (№{unique_no}) создан раньше, но неизвестно, какие "
+                        f"файлы в него загружены. Проверьте черновик в кабинете: либо удалите его и строку "
+                        f"№{unique_no} из реестра «{REGISTRY_FILE.name}», либо догрузите файлы вручную."
+                    )
+                upload_case_files(declaration_id, _plaintiff_id(decl), files, already)
+                reg("CREATED_IN_PROGRESS", REG_STAGE_FILES_DONE)
+        else:
+            # 1. Создание
+            decl = create_declaration(ctx)
+            declaration_id = decl["id"]
+            log(f"Создан declarationId = {declaration_id}")
+            # ID фиксируем СРАЗУ: если дальше что-то упадёт, повтор этой сделки
+            # продолжит этот declarationId и не создаст второй черновик.
+            try:
+                reg("CREATED_IN_PROGRESS", "FILES_PENDING")
+            except Exception as e:
+                raise DraftStuckError(
+                    f"declarationId={declaration_id} (№{unique_no}) создан, но не записан в реестр "
+                    f"«{REGISTRY_FILE}» ({type(e).__name__}: {e}) — повтор создал бы дубль"
+                ) from e
+            # 2. Госпошлина (к истцу), иск, приложения
+            upload_case_files(declaration_id, _plaintiff_id(decl), files)
+            reg("CREATED_IN_PROGRESS", REG_STAGE_FILES_DONE)
+
+        # 3. Проход 1: blank → текст в оба поля → «Следующий шаг» → step=sign.
+        log(f"ПРОХОД 1: открываю step=blank | declarationId={declaration_id}")
+        open_blank_page(declaration_id)
+        current = [_blank_field(name).get_attribute("value") or "" for name in BLANK_FIELDS]
+        if resumed and all(current):
+            log(f"ПРОХОД 1: текст уже в черновике ({len(current[0])} / {len(current[1])} символов)")
+        else:
+            paste_both_fields(claim_text, "ПРОХОД 1")
+        click_next_to_sign(declaration_id, "ПРОХОД 1")
+        wait_sign_page_loaded()
+        log("ПРОХОД 1: бланк подписи полностью загружен")
+
+        try:
+            document_number = str((get_declaration(declaration_id) or {}).get("requestUID") or "").strip()
+        except PortalBlocked:
+            raise
+        except Exception as e:
+            log(f"Номер документа (requestUID) не получен: {type(e).__name__}: {e}", "WARNING")
+        log(f"Номер документа: {document_number or '-'}")
+        reg("READY_TO_SIGN", REG_STAGE_FIRST_SIGN)
+    else:
+        log(f"ПРОДОЛЖАЮ №{unique_no}: declarationId={declaration_id} уже на подписи, "
+            f"остался только проход 2 («Мои дела»).")
+
+    # 4. Проход 2: «Мои дела» → «Ожидается отправка» → тот же черновик → текст ещё раз.
+    #    После этой вставки портал текст сохраняет сам; второй «Следующий шаг» не нужен.
+    open_draft_from_my_cases(declaration_id)
+    paste_both_fields(claim_text, "ПРОХОД 2")
+    reg("READY_TO_SIGN", REG_STAGE_DONE)
+
+    # 5. НЕ ПОДПИСЫВАЕМ И НЕ ОТПРАВЛЯЕМ.
     log("=" * 80)
-    log(f"ГОТОВО ДО ПОДПИСАНИЯ. declarationId={declaration_id}")
-    log("ЭЦП НЕ НАКЛАДЫВАЛАСЬ. Заявление оставлено на этапе подписи для ручной проверки.")
-    return declaration_id
+    log(f"ГОТОВО ДО ПОДПИСАНИЯ. №{unique_no} | declarationId={declaration_id}")
+    log("ЭЦП НЕ НАКЛАДЫВАЛАСЬ. Заявление оставлено в «Ожидается отправка» для ручной проверки и подписи.")
+    return {"declaration_id": declaration_id, "document_number": document_number,
+            "unique_no": unique_no, "skipped": False}
 
 
 class DraftStuckError(RuntimeError):
-    """Черновик уже создан и заполнен, но не перешёл на step=sign. Повтор
-    строки создал бы ДУБЛЬ заявления — поэтому пачку останавливаем."""
+    """Черновик уже создан, но продолжить его автоматически нельзя (не записан
+    в реестр / неизвестно, какие файлы загружены). Повтор строки создал бы
+    ДУБЛЬ или неполное заявление — поэтому пачку останавливаем."""
 
 
 def _is_data_error(e):
     """Повтор строки не поможет (или навредит): ошибка исходных данных
-    (папка/файлы/номер/суд) либо уже созданный черновик застрял на blank."""
+    (папка/файлы/номер/суд) либо черновик, который нужно разобрать вручную."""
     return isinstance(e, (FileNotFoundError, ValueError, DraftStuckError))
 
 
@@ -1149,8 +1607,10 @@ def write_results(success, errors, rows_left, skipped=(), gbdfl_failed=()):
     ws = wb.active
     ws.title = "Результат"
     ws.append(["Excel строка", "ИИН", "ФИО", "Статус", "declarationId / ошибка"])
-    for excel_row, fio, iin, did in success:
-        ws.append([excel_row, iin, fio, "ГОТОВО ДО ПОДПИСИ", did])
+    for excel_row, fio, iin, uid, did, doc_no, was_ready in success:
+        ws.append([excel_row, iin, fio,
+                   "УЖЕ БЫЛА ПОДГОТОВЛЕНА (реестр)" if was_ready else "ГОТОВО ДО ПОДПИСИ",
+                   f"№{uid}: declarationId={did}" + (f", номер документа {doc_no}" if doc_no else "")])
     for excel_row, fio, iin, err in errors:
         ws.append([excel_row, iin, fio, "ОШИБКА", err])
     for excel_row, fio, iin, uid, missing in skipped:
@@ -1177,6 +1637,7 @@ def main():
     log(f"СТАРТ portal-sot.kz — подготовка исков БЕЗ ПОДПИСИ | компания {COMPANY_ID}")
     log(f"Корневая папка: {WORK_ROOT}")
     log(f"Excel: {EXCEL_FILE}")
+    log(f"Реестр подготовленных сделок: {REGISTRY_FILE}")
     log(f"Firefox-профиль: {FIREFOX_PROFILE_DIR}")
     log(f"Лог: {LOG_FILE}")
     log("=" * 90)
@@ -1185,6 +1646,10 @@ def main():
         raise FileNotFoundError(f"Нет Excel-файла: {EXCEL_FILE}")
     CASES_BATCH_DIR = discover_batch_dir()
     log(f"Папка документов (партия): {CASES_BATCH_DIR}")
+    try:
+        registry_check_writable()
+    except OSError as e:
+        raise RuntimeError(f"Реестр недоступен на запись (открыт в Excel?): {REGISTRY_FILE} — {e}") from e
 
     courts_file = find_courts_file()
     LOCAL_COURTS = load_local_courts(courts_file)
@@ -1246,7 +1711,8 @@ def main():
 
     log("=" * 80)
     log(f"ПОДГОТОВКА БЕЗ ПОДПИСИ. Строк к обработке: {len(rows)}. Начинаем с Excel №{rows[0]}")
-    log("Пауза 20–40 секунд между сделками. При неудаче строки после 3 попыток — стоп пачки.")
+    log("Сделки из реестра со статусом READY_TO_SIGN повторно не создаются.")
+    log("Пауза 30–60 секунд между сделками. При неудаче строки после 3 попыток — стоп пачки.")
     log("=" * 80)
 
     success, errors = [], []
@@ -1263,14 +1729,21 @@ def main():
         fio, iin = row_ctx["FIO"], row_ctx["IIN"]
         row_success = False
         row_gbdfl_skip = False
+        was_ready = False
 
         for row_attempt in range(1, MAX_ROW_ATTEMPTS + 1):
             try:
                 if row_attempt > 1:
                     log(f"ПОВТОР ТЕКУЩЕЙ СДЕЛКИ: Excel строка {excel_row}, попытка {row_attempt}/{MAX_ROW_ATTEMPTS}")
-                declaration_id = run_one(excel_row)
-                success.append((excel_row, fio, iin, declaration_id))
-                log(f"СДЕЛКА {n}/{len(rows)} ПОДГОТОВЛЕНА БЕЗ ПОДПИСИ | declarationId={declaration_id}")
+                result = run_one(excel_row)
+                declaration_id = result["declaration_id"]
+                was_ready = result["skipped"]
+                success.append((excel_row, fio, iin, result["unique_no"], declaration_id,
+                                result["document_number"], was_ready))
+                log(f"СДЕЛКА {n}/{len(rows)} "
+                    f"{'УЖЕ БЫЛА ПОДГОТОВЛЕНА — НОВЫЙ ИСК НЕ СОЗДАВАЛСЯ' if was_ready else 'ПОДГОТОВЛЕНА БЕЗ ПОДПИСИ'}"
+                    f" | №{result['unique_no']} | declarationId={declaration_id}"
+                    f" | номер документа={result['document_number'] or '-'}")
                 row_success = True
                 gbdfl_streak = 0
                 break
@@ -1306,7 +1779,7 @@ def main():
                     errors.append((excel_row, fio, iin, f"{type(e).__name__}: {e}"))
                     stop_row = excel_row
                     log(f"СТОП ВСЕЙ ПАЧКИ на Excel строке {excel_row}: повтор не поможет "
-                        f"({'черновик застрял на blank' if isinstance(e, DraftStuckError) else 'ошибка исходных данных'}).",
+                        f"({'черновик нужно разобрать вручную' if isinstance(e, DraftStuckError) else 'ошибка исходных данных'}).",
                         "ERROR")
                     break
 
@@ -1330,8 +1803,8 @@ def main():
         if not row_success and not row_gbdfl_skip:
             break
 
-        if n < len(rows):
-            pause_sec = random.randint(20, 40)
+        if n < len(rows) and not was_ready:
+            pause_sec = random.randint(30, 60)
             log(f"Пауза {pause_sec} секунд перед следующей сделкой...")
             time.sleep(pause_sec)
 
@@ -1344,8 +1817,9 @@ def main():
     log(f"ОШИБОК: {len(errors)}")
     if stop_row is not None:
         log(f"STOP: для продолжения запустите с «Начальная строка» = {stop_row}", "ERROR")
-    for excel_row, fio, iin, did in success:
-        log(f"OK | Excel {excel_row} | {iin} | {fio} | declarationId={did}")
+    for excel_row, fio, iin, uid, did, doc_no, was_ready in success:
+        log(f"{'УЖЕ ГОТОВА' if was_ready else 'OK'} | Excel {excel_row} | №{uid} | {iin} | {fio} | "
+            f"declarationId={did} | номер документа={doc_no or '-'}")
     for excel_row, fio, iin, err in errors:
         log(f"ERROR | Excel {excel_row} | {iin} | {fio} | {err}", "ERROR")
     log_skipped(skipped)

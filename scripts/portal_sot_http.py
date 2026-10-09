@@ -264,16 +264,25 @@ class PortalSotHttp:
     # ---------- запросы ----------
     def get(self, url, **kwargs):
         """GET с темпом, авто-обновлением токена и отступом. Совместим с requests.Session.get."""
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        """POST с теми же правилами, что и get()."""
+        return self.request("POST", url, **kwargs)
+
+    def request(self, method, url, backoff=BACKOFF_429_5XX, **kwargs):
+        """backoff — ожидания при 429/5xx. Свой короткий список нужен там, где
+        5xx — обычный ответ на конкретный объект, а не признак перегрузки."""
         if url.startswith("/"):
             url = PORTAL_SOT_BASE + url
         kwargs.setdefault("timeout", (10, 60))
         if _jwt_exp(self.tokens.get("access_token", "")) < time.time() + 30:
             self.renew()
         renew_stage = 0   # 0 — ещё не обновляли, 1 — был refresh, 2 — был вход по ЭЦП
-        backoff = list(BACKOFF_429_5XX)
+        backoff = list(backoff)
         while True:
             self._throttle()
-            r = self.session.get(url, **kwargs)
+            r = self.session.request(method, url, **kwargs)
 
             if r.status_code == 401:
                 if renew_stage == 0:

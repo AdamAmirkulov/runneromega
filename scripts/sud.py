@@ -1,19 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Выгрузка из Судебного кабинета (office.sud.kz) через HTTP/AJAX.
+Выгрузка из Судебного кабинета — оба портала в один processimport.xlsx.
 
-Портировано из ноутбука Vigruzka_SK_po_Talony_HTTP_API_v2_FINAL.ipynb.
-Бизнес-логика (SQL-отбор сделок, JSF/RichFaces HTTP-запросы, парсинг
-карточки дела) сохранена без изменений — добавлена только интеграция
-с --company_id/config.py, как и в остальных скриптах проекта.
+1) НОВЫЙ портал portal-sot.kz (JSON API). Портировано из ноутбука
+   PORTAL_SOT_Vygruzka_Statusov.ipynb (ONECLICK v9): все отправленные талоны
+   кабинета -> сопоставление с CRM по номеру талона -> отсев «Погашен» /
+   «Обратный выкуп» -> карточка getCase по каждому талону. Вход по ЭЦП и
+   темп запросов — общие scripts/portal_sot_login.py + portal_sot_http.py.
+2) СТАРЫЙ портал office.sud.kz (JSF/RichFaces, HTTP/AJAX). Портировано из
+   Vigruzka_SK_po_Talony_HTTP_API_v2_FINAL.ipynb, логика без изменений.
+   Сюда идут только талоны из SQL_QUERY, которых НЕТ на новом портале.
 
-Schema:
-    SQL Server (свои талоны для выбранной компании) -> один вход Selenium
-    в Судебный кабинет -> cookies -> requests.Session -> JSF/RichFaces
-    AJAX-запросы по каждому талону -> Excel.
-
-Selenium используется только один раз для входа. Все талоны обрабатываются
-прямыми HTTP-запросами.
+Порталы независимы: если один недоступен, в файл попадают данные второго.
+Selenium нужен только для входа; все талоны обрабатываются HTTP-запросами.
 """
 
 import os
@@ -63,6 +62,11 @@ if project_root not in sys.path:
 
 from config import CREDENTIALS, DB_COMPANY_FILTER, _company_id
 
+try:
+    from config import PORTAL_SOT_BY_COMPANY
+except ImportError:
+    PORTAL_SOT_BY_COMPANY = {}
+
 print(f"🏢 Запуск выгрузки с Судебного кабинета для компании ID={_company_id}")
 
 # =========================
@@ -93,6 +97,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+
+from portal_sot_http import PortalSotHttp, PortalBlocked
+from portal_sot_login import login_chain
 
 
 # ============================================================
@@ -135,6 +142,17 @@ LOCAL_OUT_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_OUTPUT_XLSX = LOCAL_OUT_DIR / OUTPUT_FILENAME
 
 NETWORK_OUTPUT_XLSX = Path(CREDENTIALS['path_crm']) / OUTPUT_FILENAME
+
+# portal-sot.kz
+SOT_PAGE_SIZE = 50
+SOT_MAX_PAGES = 2000                 # предохранитель от бесконечной пагинации
+SOT_TIMEOUT = (10, 90)
+# getCase отвечает 5xx и на «плохой» талон — долгие общие ожидания
+# PortalSotHttp (до 10 минут) здесь не нужны.
+SOT_BACKOFF = (10, 30, 60)
+SOT_EXCLUDED_CREDIT_STATUSES = {"Погашен", "Обратный выкуп"}
+# Технический отчёт: талоны не из CRM / исключённые / ошибки API
+SOT_REPORT_XLSX = LOCAL_OUT_DIR / "portal_sot_report.xlsx"
 
 
 # ============================================================
@@ -199,7 +217,7 @@ ORDER BY SortDate ASC;
 """
 
 
-def load_tickets_from_db():
+def read_sql_from_db(query):
     conn_str = (
         "DRIVER={ODBC Driver 18 for SQL Server};"
         f"SERVER={DB_SERVER};"
@@ -209,18 +227,25 @@ def load_tickets_from_db():
         "TrustServerCertificate=yes;"
         "Encrypt=no;"
     )
-
-    print("Подключение к БД...")
     conn = pyodbc.connect(conn_str, timeout=30)
     try:
-        df_source = pd.read_sql(SQL_QUERY, conn)
+        return pd.read_sql(query, conn)
     finally:
         conn.close()
 
-    def norm(v):
-        if v is None:
-            return ""
-        return re.sub(r"\D+", "", str(v).replace("\xa0", " ").strip())
+
+def norm_ticket(v):
+    """191166A00216174 -> 19116600216174: ключ сопоставления талона с CRM."""
+    if v is None:
+        return ""
+    return re.sub(r"\D+", "", str(v).replace("\xa0", " ").strip())
+
+
+def load_tickets_from_db():
+    print("Подключение к БД...")
+    df_source = read_sql_from_db(SQL_QUERY)
+
+    norm = norm_ticket
 
     df_source["Номер талона в СК"] = df_source["Номер талона в СК"].apply(norm)
     df_source = df_source.drop_duplicates(
@@ -241,7 +266,295 @@ def load_tickets_from_db():
 
 
 # ============================================================
-# ОДНОКРАТНАЯ АВТОРИЗАЦИЯ
+# НОВЫЙ ПОРТАЛ portal-sot.kz
+# ============================================================
+# В отличие от SQL_QUERY выше, здесь берутся ВСЕ сделки компании с талоном
+# (без отбора «В работе»/АИС ОИП) + статус кредита: список дел приходит с
+# портала, CRM нужна только чтобы привязать талон к сделке и отсеять
+# «Погашен»/«Обратный выкуп». В ноутбуке было l.F209 LIKE N'%Омега%' —
+# заменено на фильтр компании из config.py, как в SQL_QUERY.
+
+SQL_QUERY_PORTAL_SOT = f"""
+WITH Base AS (
+    SELECT
+        l.EID AS [Уникальный номер],
+        s.Caption AS [Статус кредита],
+        pPick.F356 AS [Номер талона в СК],
+        l.F158 AS SortDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY l.EID, pPick.F356
+            ORDER BY l.F158 ASC, l.ID ASC
+        ) AS rn
+    FROM dbo.loans l WITH (NOLOCK)
+    JOIN dbo.states s WITH (NOLOCK)                 ON s.ID = l.State
+    JOIN dbo.clients c WITH (NOLOCK)                ON c.ID = l.CID
+    JOIN dbo.Dictionary dF246 WITH (NOLOCK)         ON dF246.ID = l.F246
+    LEFT JOIN dbo.Constants constF236 WITH (NOLOCK) ON constF236.ID = l.F236
+    LEFT JOIN dbo.Constants constF235 WITH (NOLOCK) ON constF235.ID = l.F235
+    LEFT JOIN dbo.Constants constF238 WITH (NOLOCK) ON constF238.ID = c.F238
+    OUTER APPLY (
+        SELECT TOP (1)
+            NULLIF(
+                REPLACE(
+                    REPLACE(LTRIM(RTRIM(p.F356)), NCHAR(160), N''),
+                    N' ', N''
+                ),
+                N''
+            ) AS F356
+        FROM dbo.ProcessCreatedInLoans pl WITH (NOLOCK)
+        JOIN dbo.Process p WITH (NOLOCK) ON p.ID = pl.ProcessID
+        WHERE pl.LoanID = l.ID
+          AND NULLIF(
+                REPLACE(
+                    REPLACE(LTRIM(RTRIM(p.F356)), NCHAR(160), N''),
+                    N' ', N''
+                ),
+                N''
+              ) IS NOT NULL
+        ORDER BY p.ID DESC
+    ) pPick
+    WHERE
+        l.F209 = N'{DB_COMPANY_FILTER}'
+        AND pPick.F356 IS NOT NULL
+)
+SELECT
+    [Уникальный номер],
+    [Статус кредита],
+    [Номер талона в СК]
+FROM Base
+WHERE rn = 1
+ORDER BY SortDate ASC;
+"""
+
+
+def sot_json(portal, method, path, **kwargs):
+    """Запрос к API portal-sot.kz -> JSON. Пустой 200 портал отдаёт, когда
+    токен не принят, — один раз входим заново по ЭЦП и повторяем."""
+    kwargs.setdefault("timeout", SOT_TIMEOUT)
+    for attempt in (1, 2):
+        r = portal.request(method, path, backoff=SOT_BACKOFF, **kwargs)
+        body = (r.text or "").strip()
+        if r.status_code == 200 and not body:
+            if attempt == 1:
+                portal.renew(full=True)
+                continue
+            raise RuntimeError("пустой ответ 200 даже после нового входа по ЭЦП")
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}: {body[:200]!r}")
+        try:
+            return r.json()
+        except Exception:
+            raise RuntimeError(f"не JSON: {body[:200]!r}")
+
+
+def load_all_portal_cases(portal):
+    """Все отправленные талоны кабинета: {цифровой талон: запись портала}."""
+    rows = []
+    for page in range(1, SOT_MAX_PAGES + 1):
+        j = sot_json(
+            portal, "POST",
+            f"/api/secure/myCases/cases?page={page}&pageSize={SOT_PAGE_SIZE}",
+            json={"status": "SENDED"},
+        )
+        data = j.get("data", j)
+        content = data.get("content") or []
+        rows.extend(content)
+        total = data.get("totalElements")
+        print(f"portal-sot: страница {page}, получено {len(content)}, всего собрано {len(rows)}"
+              + (f" / {total}" if total is not None else ""), flush=True)
+        if not content:
+            break
+        if total is not None and len(rows) >= int(total):
+            break
+
+    out = {}
+    for x in rows:
+        t = norm_ticket(x.get("requestUID"))   # requestUID — наш талон
+        if t:
+            out[t] = x
+    print(f"✓ Уникальных отправленных талонов на portal-sot: {len(out)}")
+    return out
+
+
+def sot_dmy(ms):
+    return datetime.fromtimestamp(ms / 1000).strftime("%d.%m.%Y") if ms else ""
+
+
+def sot_clean_text(s):
+    s = html.unescape(str(s or "")).replace("\xa0", " ")
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+
+def sot_find_judge(text):
+    m = re.search(r"Судья\s*[–—-]\s*([^\n\r]+)", text or "", re.I)
+    return m.group(1).strip() if m else ""
+
+
+def parse_portal_case(ticket, j):
+    """Карточка getCase -> те же поля, что даёт parse_case_html для старого портала."""
+    data = j.get("data", j)
+    case = data.get("caseData") or {}
+    court = case.get("court") or {}
+    notes = sorted(data.get("notifications") or [], key=lambda x: x.get("lastUpdateDate") or 0)
+    participants = data.get("participants") or []
+
+    r = {
+        "ticket_number": ticket,
+        "number_case": case.get("number") or "",
+        "judicial_authority": court.get("valueRu") or "",
+        "case_category": "",
+        "amount_of_claim": "",
+        "amount_of_state_duties": "",
+        "date_of_departure": sot_dmy(case.get("requestDate")),
+        "date_of_rejection": "",
+        "cause_of_rejection": "",
+        "date_of_registration": "",
+        "name_judge": "",
+        "date_of_return": "",
+        "date_of_agreement": "",
+        "date_of_simplification": "",
+        "date_of_first_instance": "",
+        "date_court_order": "",
+        "date_of_leaving_without_consideration": "",
+        "date_refusal_of_summary_proceedings": "",
+        "plaintiff_representative": "",
+        "_events": len(notes),
+    }
+
+    reps = []
+    for p in participants:
+        side = (p.get("sideRu") or "").lower()
+        if "представител" in side:
+            fio = p.get("payerName") or p.get("fio") or p.get("name") or ""
+            if fio:
+                reps.append(str(fio))
+    r["plaintiff_representative"] = "; ".join(dict.fromkeys(reps))
+
+    for n in notes:
+        txt = sot_clean_text(n.get("content"))
+        low = txt.lower()
+        dt = sot_dmy(n.get("lastUpdateDate"))
+        code = (n.get("code") or "").upper()
+        jg = sot_find_judge(txt)
+        if jg:
+            r["name_judge"] = jg
+        if "документ отправлен" in low:
+            r["date_of_departure"] = dt
+        if code == "INCORRESPONDENCE_EXECUTION" or "зарегистрирован" in low:
+            r["date_of_registration"] = dt
+        if "возврат" in low and ("исков" in low or "заявлен" in low):
+            r["date_of_return"] = dt
+        if "оставлен" in low and "без рассмотрен" in low:
+            r["date_of_leaving_without_consideration"] = dt
+        if "утвержден" in low and ("соглашен" in low or "медиац" in low):
+            r["date_of_agreement"] = dt
+        if "упрощ" in low and ("рассмотр" in low or "производств" in low):
+            r["date_of_simplification"] = dt
+        if ("решение" in low and "первой инстанц" in low) or "вынесено решение" in low:
+            r["date_of_first_instance"] = dt
+        if "судебн" in low and "приказ" in low:
+            r["date_court_order"] = dt
+        if "отмен" in low and "упрощ" in low:
+            r["date_refusal_of_summary_proceedings"] = dt
+        if ("отклон" in low or "отказ" in low) and "заявлен" in low:
+            r["date_of_rejection"] = dt
+            r["cause_of_rejection"] = txt
+
+    return r
+
+
+def run_portal_sot():
+    """Возвращает (строки для итогового файла, множество цифровых талонов,
+    которые есть на portal-sot.kz). Талоны из множества на старом портале
+    уже не ищутся."""
+    cfg = PORTAL_SOT_BY_COMPANY.get(_company_id)
+    if not cfg:
+        print(f"⚠ Для компании {_company_id} нет записи в PORTAL_SOT_BY_COMPANY (scripts/config.py) — "
+              f"portal-sot.kz пропущен, выгрузка только со старого портала.")
+        return [], set()
+
+    print("\n=== НОВЫЙ ПОРТАЛ portal-sot.kz ===")
+    parsed, errors, not_in_crm, excluded = [], [], [], []
+
+    def login():
+        return login_chain(_company_id, cfg, log=print, dump_dir=str(LOCAL_OUT_DIR))
+
+    with PortalSotHttp(_company_id, login, log=print) as portal:
+        portal_cases = load_all_portal_cases(portal)
+
+        crm = read_sql_from_db(SQL_QUERY_PORTAL_SOT)
+        crm["Номер талона в СК"] = crm["Номер талона в СК"].apply(norm_ticket)
+        crm_by_ticket = {x["Номер талона в СК"]: x for _, x in crm.iterrows()}
+
+        # portal_ticket — исходный requestUID с буквой (нужен API getCase),
+        # t — цифровой ключ только для сопоставления с CRM.
+        work = []
+        for t, meta in portal_cases.items():
+            portal_ticket = str(meta.get("requestUID") or "").strip()
+            row = crm_by_ticket.get(t)
+            if row is None:
+                not_in_crm.append({"Талон": portal_ticket, "Причина": "Не найден в CRM",
+                                   "Номер дела": meta.get("number", "")})
+                continue
+            status = str(row["Статус кредита"] or "").strip()
+            if status in SOT_EXCLUDED_CREDIT_STATUSES:
+                excluded.append({"Талон": portal_ticket, "Уникальный номер": row["Уникальный номер"],
+                                 "Статус кредита": status})
+                continue
+            work.append((portal_ticket, row))
+
+        print("\nСОПОСТАВЛЕНИЕ С CRM")
+        print("Всего талонов portal-sot:", len(portal_cases))
+        print("Не найдено в CRM:", len(not_in_crm))
+        print("Исключено Погашен/Обратный выкуп:", len(excluded))
+        print("Осталось для получения динамики:", len(work))
+        print()
+
+        for i, (portal_ticket, row) in enumerate(work, 1):
+            print(f"[{i}/{len(work)}] {portal_ticket}", end="", flush=True)
+            try:
+                j = sot_json(portal, "GET", f"/api/secure/myCases/cases/getCase/{portal_ticket}")
+                x = parse_portal_case(portal_ticket, j)
+                x["Уникальный номер"] = row["Уникальный номер"]
+                parsed.append(x)
+                print(f" -> OK, дело {x['number_case']} / событий {x['_events']}")
+            except PortalBlocked as e:
+                print(f" -> СТОП: {e}")
+                errors.append({"Талон": portal_ticket, "Уникальный номер": row["Уникальный номер"],
+                               "Ошибка": f"прогон остановлен: {e}"})
+                print(f"⚠ Не обработано талонов portal-sot: {len(work) - i + 1} из {len(work)}")
+                break
+            except Exception as e:
+                errors.append({"Талон": portal_ticket, "Уникальный номер": row["Уникальный номер"],
+                               "Ошибка": str(e)})
+                print(f" -> ОШИБКА: {e}")
+
+    report_rows = (
+        [{"Тип": "Не найден в CRM", **x} for x in not_in_crm]
+        + [{"Тип": "Исключён", **x} for x in excluded]
+        + [{"Тип": "Ошибка API", **x} for x in errors]
+    )
+    try:
+        pd.DataFrame(report_rows).to_excel(SOT_REPORT_XLSX, index=False, engine="openpyxl")
+        print(f"✓ Тех. отчёт portal-sot: {SOT_REPORT_XLSX}")
+    except Exception as e:
+        print(f"✗ Тех. отчёт portal-sot не сохранён: {e}")
+
+    print(f"portal-sot итог: успешно {len(parsed)}, ошибок {len(errors)}, "
+          f"не в CRM {len(not_in_crm)}, исключено {len(excluded)}")
+    return parsed, set(portal_cases)
+
+
+def build_portal_sot_dataframe(parsed):
+    df = pd.DataFrame(parsed).rename(columns=RENAME_COLS)
+    df["Тип процесса"] = "1. Упрощённое производство"
+    df["Статус процесса"] = "Рассмотрение дела"
+    return df.reindex(columns=FINAL_COLS)
+
+
+# ============================================================
+# СТАРЫЙ ПОРТАЛ office.sud.kz — ОДНОКРАТНАЯ АВТОРИЗАЦИЯ
 # ============================================================
 
 def build_login_driver():
@@ -1101,6 +1414,28 @@ FINAL_COLS = [
     "Статус процесса",
 ]
 
+RENAME_COLS = {
+    "ticket_number": "Номер талона в СК",
+    "number_case": "Номер судебного дела",
+    "date_court_order": "Вынесен судебный приказ",
+    "date_refusal_of_summary_proceedings": "Определение об отмене решения в порядке упрощенного производства",
+    "amount_of_claim": "Сумма иска",
+    "amount_of_state_duties": "Сумма государственной пошлины",
+    "date_of_departure": "Дата отправки искового заявления",
+    "date_of_rejection": "Отклонено",
+    "cause_of_rejection": "Причина отклонения заявления",
+    "date_of_registration": "Зарегистрировано",
+    "name_judge": "Судья",
+    "date_of_return": "Вынесено определение о возврате искового заявления",
+    "date_of_agreement": "Вынесено определение об утверждении соглашения об урегулировании спора",
+    "date_of_simplification": "Вынесено определение о рассмотрении дела в порядке упрощенного производства",
+    "date_of_first_instance": "Вынесено решение первой инстанции",
+    "plaintiff_representative": "Представитель истца",
+    "judicial_authority": "Судебный орган",
+    "date_of_leaving_without_consideration": "Вынесено определение об оставлении заявления без рассмотрения",
+    "case_category": "Категория дела",
+}
+
 
 def build_final_dataframe(df_source, parsed_by_ticket):
     list_dicts_cases = []
@@ -1154,27 +1489,7 @@ def build_final_dataframe(df_source, parsed_by_ticket):
         if col in df.columns:
             df[col] = df[col].apply(get_latest_date)
 
-    df = df.rename(columns={
-        "ticket_number": "Номер талона в СК",
-        "number_case": "Номер судебного дела",
-        "date_court_order": "Вынесен судебный приказ",
-        "date_refusal_of_summary_proceedings": "Определение об отмене решения в порядке упрощенного производства",
-        "amount_of_claim": "Сумма иска",
-        "amount_of_state_duties": "Сумма государственной пошлины",
-        "date_of_departure": "Дата отправки искового заявления",
-        "date_of_rejection": "Отклонено",
-        "cause_of_rejection": "Причина отклонения заявления",
-        "date_of_registration": "Зарегистрировано",
-        "name_judge": "Судья",
-        "date_of_return": "Вынесено определение о возврате искового заявления",
-        "date_of_agreement": "Вынесено определение об утверждении соглашения об урегулировании спора",
-        "date_of_simplification": "Вынесено определение о рассмотрении дела в порядке упрощенного производства",
-        "date_of_first_instance": "Вынесено решение первой инстанции",
-        "plaintiff_representative": "Представитель истца",
-        "judicial_authority": "Судебный орган",
-        "date_of_leaving_without_consideration": "Вынесено определение об оставлении заявления без рассмотрения",
-        "case_category": "Категория дела",
-    })
+    df = df.rename(columns=RENAME_COLS)
 
     for col in [
         "Дата подачи заявления на выписку ИЛ",
@@ -1217,15 +1532,57 @@ def build_final_dataframe(df_source, parsed_by_ticket):
 def main():
     df_source, tickets_uniq = load_tickets_from_db()
 
-    if not tickets_uniq:
-        print("Нет талонов для обработки — завершаю без запуска браузера.")
-        df_empty = pd.DataFrame(columns=FINAL_COLS)
-        df_empty.to_excel(LOCAL_OUTPUT_XLSX, index=False, engine="openpyxl")
-        print(f"✓ Пустой итоговый файл сохранён: {LOCAL_OUTPUT_XLSX}")
+    # --- новый портал ---
+    sot_failed = False
+    try:
+        sot_parsed, sot_tickets = run_portal_sot()
+    except Exception as e:
+        sot_failed = True
+        sot_parsed, sot_tickets = [], set()
+        print(f"⚠ portal-sot.kz недоступен ({type(e).__name__}: {e}) — "
+              f"продолжаю только со старым порталом.")
+    df_sot = build_portal_sot_dataframe(sot_parsed)
+
+    # --- старый портал: только талоны, которых нет на новом ---
+    df_source = df_source[~df_source["Номер талона в СК"].isin(sot_tickets)].reset_index(drop=True)
+    total_tickets = len(tickets_uniq)
+    tickets_uniq = [t for t in tickets_uniq if t not in sot_tickets]
+
+    print("\n=== СТАРЫЙ ПОРТАЛ office.sud.kz ===")
+    print(f"Талонов из БД для старого портала: {len(tickets_uniq)} "
+          f"(ещё {total_tickets - len(tickets_uniq)} уже есть на portal-sot.kz)")
+
+    df_old = pd.DataFrame(columns=FINAL_COLS)
+    if tickets_uniq:
+        try:
+            session = login_and_make_session()
+        except Exception as e:
+            if sot_failed or df_sot.empty:
+                raise
+            print(f"⚠ Старый портал недоступен ({e}) — в файл попадут только данные portal-sot.kz.")
+        else:
+            df_old = fetch_old_portal(session, df_source, tickets_uniq)
+
+    df = pd.concat([df_sot, df_old.reindex(columns=FINAL_COLS)], ignore_index=True)
+
+    df.to_excel(LOCAL_OUTPUT_XLSX, index=False, engine="openpyxl")
+    print(f"\n✓ Итоговый Excel сохранён: {LOCAL_OUTPUT_XLSX}")
+    print(f"Строк: {len(df)} (portal-sot.kz: {len(df_sot)}, office.sud.kz: {len(df_old)}), "
+          f"колонок: {len(df.columns)}")
+
+    if df.empty:
+        print("Данных нет — файл в папку автоимпорта CRM не копируется.")
         return
 
-    session = login_and_make_session()
+    try:
+        NETWORK_OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(LOCAL_OUTPUT_XLSX, NETWORK_OUTPUT_XLSX)
+        print(f"✓ Скопировано в папку автоимпорта CRM: {NETWORK_OUTPUT_XLSX}")
+    except Exception as e:
+        print(f"✗ Не удалось скопировать в папку автоимпорта {NETWORK_OUTPUT_XLSX}: {e}")
 
+
+def fetch_old_portal(session, df_source, tickets_uniq):
     parsed_by_ticket = {}
 
     print("\nНачинаем HTTP/AJAX выгрузку...\n")
@@ -1254,18 +1611,7 @@ def main():
         if PAUSE_BETWEEN_TICKETS:
             time.sleep(PAUSE_BETWEEN_TICKETS)
 
-    df = build_final_dataframe(df_source, parsed_by_ticket)
-
-    df.to_excel(LOCAL_OUTPUT_XLSX, index=False, engine="openpyxl")
-    print(f"✓ Итоговый Excel сохранён: {LOCAL_OUTPUT_XLSX}")
-    print(f"Строк: {len(df)}, колонок: {len(df.columns)}")
-
-    try:
-        NETWORK_OUTPUT_XLSX.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(LOCAL_OUTPUT_XLSX, NETWORK_OUTPUT_XLSX)
-        print(f"✓ Скопировано в папку автоимпорта CRM: {NETWORK_OUTPUT_XLSX}")
-    except Exception as e:
-        print(f"✗ Не удалось скопировать в папку автоимпорта {NETWORK_OUTPUT_XLSX}: {e}")
+    return build_final_dataframe(df_source, parsed_by_ticket)
 
 
 if __name__ == "__main__":

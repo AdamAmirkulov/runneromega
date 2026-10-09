@@ -7,12 +7,11 @@
    не оформлена (условия и запрос — от заказчика).
 2) Заполняет по этим данным data/Шаблоны/Шаблон_реестр.xlsx.
 3) Для каждого ИИН ищет актуальный адрес в Судебном кабинете
-   (HTTP-версия блока поиска участника — перенесена из
-   scripts/poiskvsk.py: Selenium используется только для логина,
-   сам поиск по сотням ИИН идёт через requests).
+   (portal-sot.kz, ГБД ФЛ — как в scripts/poiskvsk.py: браузер только
+   для входа по ЭЦП, сам поиск по сотням ИИН идёт через HTTP).
 4) Отправляет Excel-реестр в WhatsApp-группу через Wamm Chat, перед
-   файлом коротким сообщением тегает два номера из
-   config.REESTR_GP_WA_TAGS (текстовая сводка не отправляется).
+   файлом — короткое сообщение WAMM_REESTR_TEXT (текстовая сводка
+   не отправляется).
 5) Дополнительно формирует AddressesImport.xlsx (импорт адресов в
    Дельту) по образцу AddressesImportExample.xlsx и кладёт его в папку
    автоимпорта Дельты — CREDENTIALS['path_crm'] из config.py
@@ -36,7 +35,8 @@ args = parse_args()
 if not args.company_id or not args.company_id.strip():
     print("❌ ОШИБКА: не передан --company_id — компания не определена, запуск остановлен.")
     sys.exit(1)
-os.environ['COMPANY_ID'] = args.company_id.strip()
+COMPANY_ID = args.company_id.strip()
+os.environ['COMPANY_ID'] = COMPANY_ID
 
 import re
 import time
@@ -44,34 +44,20 @@ import base64
 import shutil
 import logging
 import unicodedata
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass
 from difflib import SequenceMatcher
-from urllib.parse import urljoin
 
 import requests
 import pyodbc
 import pandas as pd
-from bs4 import BeautifulSoup
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
-
-from config import CREDENTIALS, DB_COMPANY_FILTER
-
-try:
-    from config import REESTR_GP_WA_TAGS
-except ImportError:
-    REESTR_GP_WA_TAGS = []
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import CREDENTIALS, DB_COMPANY_FILTER, PORTAL_SOT_BY_COMPANY
+from portal_sot_http import PortalSotHttp, PortalBlocked
+from portal_sot_login import login_chain
 
 # ============================================================
 # НАСТРОЙКИ
@@ -92,16 +78,14 @@ DB_CONFIG = {
     "password": "Log1cF",
 }
 
-# Судебный кабинет — логин/пароль по company_id, как и в остальных
-# скриптах, работающих с office.sud.kz.
-USER_AUTH = CREDENTIALS['sk_login']
-USER_PASSWORD = CREDENTIALS['sk_password']
-
 WAMM_TOKEN = 'dZ0ec89YqunW7GOB'
 WAMM_GROUP_ID = '120363160875851590'
 WAMM_MSG_URL = f"https://wamm.chat/api2/msg_to/{WAMM_TOKEN}/"
 WAMM_FILE_URL = f"https://wamm.chat/api2/file_from_base64/{WAMM_TOKEN}/"
 WAMM_MAX_MSG_CHARS = 3500
+# К Excel-реестру подпись не прикладывается (Wamm Chat не поддерживает
+# caption у файлов) — текст уходит отдельным сообщением перед файлом.
+WAMM_REESTR_TEXT = "Аружан, проверьте пожалуйста. Жанна оплатите после одобрения Аружан"
 
 logging.basicConfig(
     filename="sud_script.log",
@@ -267,574 +251,114 @@ def fill_template(df: pd.DataFrame):
 
 
 # ============================================================
-# СУДЕБНЫЙ КАБИНЕТ — HTTP-поиск адреса по ИИН
-# (перенесено из scripts/poiskvsk.py: Selenium только для логина,
-#  сам поиск по ИИН идёт через requests — как в podacha_iska_v2.py)
+# СУДЕБНЫЙ КАБИНЕТ (portal-sot.kz) — поиск адреса по ИИН
+# office.sud.kz больше не работает. Схема та же, что в scripts/poiskvsk.py:
+# браузер нужен только для входа по ЭЦП (если нет живого токена) и сразу
+# закрывается, сам поиск — GET /api/secure/gbdfl/v2/byIin/<ИИН> через
+# PortalSotHttp (темп, обновление токена, стоп при блокировке — внутри него).
 # ============================================================
 
-BASE = "https://office.sud.kz"
-LOGIN_URL = f"{BASE}/index.xhtml"
-SEND_DOCS_URL = f"{BASE}/form/send/index.xhtml"
-CREATE_REQUEST_URL = f"{BASE}/form/requestType2/createRequest.xhtml"
-VIEWSTATE_NAMES = ("javax.faces.ViewState", "jakarta.faces.ViewState")
+GBDFL_BY_IIN_URL = "/api/secure/gbdfl/v2/byIin/"
 
 
-def init_driver() -> webdriver.Chrome:
-    opts = webdriver.ChromeOptions()
-    opts.add_argument("--start-maximized")
-    opts.page_load_strategy = "eager"
-    opts.add_experimental_option("prefs", {"profile.managed_default_content_settings.images": 2})
-    opts.add_argument("--blink-settings=imagesEnabled=false")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-gpu")
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=opts)
+def _portal_login():
+    return login_chain(COMPANY_ID, PORTAL_SOT_BY_COMPANY.get(COMPANY_ID) or {}, log=log4, dump_dir=str(OUT_DIR))
 
 
-def find_with_fallbacks(driver, variants, desc, tries=8, delay=0.4):
-    last = None
-    for _ in range(tries):
-        for by, sel in variants:
-            try:
-                return driver.find_element(by, sel)
-            except Exception as e:
-                last = e
-        time.sleep(delay)
-    raise NoSuchElementException(f"Не удалось найти {desc}. Последняя ошибка: {last}")
+def _portal_build_address(result: dict) -> str:
+    """'Место жительства' из ответа ГБД ФЛ. Страну (regCountryNameRu) НЕ
+    включаем: дальше pick_court и AddressesImport берут 1-й элемент адреса
+    как область, 2-й — как район/город."""
+    parts = []
+    for key in ("regDistrictNameRu", "regRegionNameRu", "regCity", "regStreet"):
+        s = str(result.get(key) or "").strip()
+        if s and s.lower() != "null":
+            parts.append(s)
+    if result.get("regBuilding"):
+        parts.append(f"дом {str(result['regBuilding']).strip()}")
+    if result.get("regFlat"):
+        parts.append(f"кв. {str(result['regFlat']).strip()}")
+    return ", ".join(parts)
 
 
-def sk_login(driver):
-    log4("Открываю страницу логина СК…")
-    driver.get(LOGIN_URL)
-    time.sleep(1.0)
+def _portal_fetch_address(portal, iin):
+    """Адрес по ИИН. '' — человека нет в ГБД ФЛ. RuntimeError('PORTAL_EMPTY_200')
+    — пустой 200: так портал отвечает, когда токен не принят."""
+    r = portal.get(GBDFL_BY_IIN_URL + iin)
+    body = (r.text or "").strip()
+    if r.status_code == 200 and not body:
+        raise RuntimeError("PORTAL_EMPTY_200")
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {body[:300]!r}")
     try:
-        ru = driver.find_elements(By.XPATH, "//a[contains(.,'РУС') and not(contains(@class,'active'))]")
-        if ru:
-            ru[0].click()
-            time.sleep(1.0)
+        js = r.json()
     except Exception:
-        pass
-
-    login_el = find_with_fallbacks(
-        driver,
-        [
-            (By.ID, "j_idt78:auth:xin"),
-            (By.XPATH, "//input[contains(@id,':auth:xin')]"),
-            (By.CSS_SELECTOR, "input[type='email']"),
-        ],
-        "поле ИИН/БИН",
-    )
-    pass_el = find_with_fallbacks(
-        driver,
-        [
-            (By.ID, "j_idt78:auth:password"),
-            (By.XPATH, "//input[contains(@id,':auth:password')]"),
-            (By.XPATH, "//input[@type='password']"),
-        ],
-        "поле Пароль",
-    )
-    submit = find_with_fallbacks(
-        driver,
-        [
-            (By.CSS_SELECTOR, "input.button-primary[type='submit']"),
-            (By.XPATH, "//input[@type='submit' and contains(@class,'button-primary')]"),
-        ],
-        "кнопка Войти",
-    )
-
-    login_el.clear(); login_el.send_keys(USER_AUTH)
-    pass_el.clear(); pass_el.send_keys(USER_PASSWORD)
-    submit.click()
-    log4("Вошёл в Судебный кабинет")
-    time.sleep(2.0)
-
-
-def _http_session_from_cookies(cookies, user_agent: str) -> requests.Session:
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": user_agent,
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Origin": BASE,
-    })
-    for cookie in cookies:
-        kwargs = {"name": cookie["name"], "value": cookie["value"], "path": cookie.get("path", "/")}
-        if cookie.get("domain"):
-            kwargs["domain"] = cookie["domain"]
-        session.cookies.set(**kwargs)
-    return session
-
-
-def selenium_login_get_session() -> requests.Session:
-    drv = init_driver()
-    try:
-        sk_login(drv)
-        cookies = drv.get_cookies()
-        user_agent = drv.execute_script("return navigator.userAgent;")
-    finally:
-        try:
-            drv.quit()
-        except Exception:
-            pass
-    return _http_session_from_cookies(cookies, user_agent)
-
-
-def _extract_viewstate_from_html(html: str):
-    m = re.search(r'name="javax\.faces\.ViewState"[^>]*value="([^"]*)"', html)
-    if m:
-        return m.group(1)
-    m = re.search(r'<input[^>]*value="([^"]*)"[^>]*name="javax\.faces\.ViewState"', html)
-    return m.group(1) if m else None
-
-
-@dataclass
-class _HttpNavState:
-    url: str
-    html: str = ""
-    viewstate: str = None
-
-
-class SudHttpClient:
-    """Минимальная реплика JSF/RichFaces HTTP-клиента для office.sud.kz."""
-
-    def __init__(self, session: requests.Session, base_url: str = BASE):
-        self.session = session
-        self.base_url = base_url.rstrip("/")
-        self.state = _HttpNavState(url=self.base_url)
-
-    def _check_auth(self, response):
-        low_url = response.url.lower()
-        low_text = response.text[:5000].lower()
-        if "login" in low_url or 'name="login"' in low_text or ("войти" in low_text and "судебный кабинет" in low_text):
-            raise RuntimeError("HTTP_SESSION_DEAD")
-
-    def get(self, url: str, referer: str = None):
-        full_url = urljoin(self.base_url + "/", url)
-        headers = {"Referer": referer} if referer else {}
-        response = self.session.get(full_url, headers=headers, timeout=60, allow_redirects=True)
-        response.raise_for_status()
-        self._check_auth(response)
-        self.state.url = response.url
-        self.state.html = response.text
-        vs = _extract_viewstate_from_html(response.text)
-        if vs:
-            self.state.viewstate = vs
-        return response
-
-    def post_form(self, url: str, data: dict, referer: str = None, ajax: bool = True):
-        full_url = urljoin(self.base_url + "/", url)
-        payload = {k: v for k, v in data.items() if k not in VIEWSTATE_NAMES}
-        if self.state.viewstate:
-            payload["javax.faces.ViewState"] = self.state.viewstate
-
-        headers = {"Referer": referer or self.state.url}
-        if ajax:
-            headers.update({"Accept": "*/*", "Faces-Request": "partial/ajax"})
-
-        response = self.session.post(full_url, data=payload, headers=headers, timeout=60, allow_redirects=True)
-        response.raise_for_status()
-        self._check_auth(response)
-
-        content_type = response.headers.get("Content-Type", "").lower()
-        if "xml" in content_type or response.text.lstrip().startswith("<?xml"):
-            updates, new_viewstate, redirect_url = _parse_partial_response_with_redirect(response.text)
-            if new_viewstate:
-                self.state.viewstate = new_viewstate
-            self.state.html = _merge_partial_updates_into_html(self.state.html, updates)
-            self.state.url = response.url
-            if redirect_url:
-                return self.get(urljoin(response.url, redirect_url), referer=response.url)
-        else:
-            self.state.url = response.url
-            self.state.html = response.text
-            vs = _extract_viewstate_from_html(response.text)
-            if vs:
-                self.state.viewstate = vs
-        return response
-
-
-def _parse_partial_response(xml_text: str):
-    updates = {}
-    viewstate = None
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return updates, viewstate
-    for node in root.iter():
-        tag = node.tag.rsplit("}", 1)[-1]
-        if tag == "update":
-            update_id = node.attrib.get("id", "")
-            value = node.text or ""
-            updates[update_id] = value
-            if "ViewState" in update_id and value.strip():
-                viewstate = value.strip()
-    return updates, viewstate
-
-
-def _parse_partial_response_with_redirect(xml_text: str):
-    updates, viewstate = _parse_partial_response(xml_text)
-    redirect_url = None
-    try:
-        root = ET.fromstring(xml_text)
-        for node in root.iter():
-            if node.tag.rsplit("}", 1)[-1] == "redirect":
-                redirect_url = node.attrib.get("url")
-    except ET.ParseError:
-        pass
-    return updates, viewstate, redirect_url
-
-
-def _extract_field_value(html_fragment: str) -> str:
-    if not html_fragment:
+        raise RuntimeError(f"не JSON: {body[:300]!r}")
+    result = js.get("result") or {}
+    if not result:
         return ""
-    m = re.search(r'value="([^"]*)"', html_fragment)
-    return (m.group(1) if m else "").strip()
-
-
-def _find_update_by_suffix(updates: dict, suffix: str) -> str:
-    for uid, html in updates.items():
-        if uid.endswith(suffix):
-            return _extract_field_value(html)
-    return ""
-
-
-def _dump_debug_html(html: str, tag: str) -> str:
-    try:
-        debug_dir = Path("sud_http_debug")
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        debug_path = debug_dir / f"{tag}_{time.strftime('%Y%m%d_%H%M%S')}.html"
-        debug_path.write_text(html, encoding="utf-8")
-        return str(debug_path)
-    except Exception:
-        return "<не удалось сохранить>"
-
-
-def _extract_js_triggered_ajax_id(html: str, func_name: str):
-    m = re.search(re.escape(func_name) + r"=function\([^)]*\)\{RichFaces\.ajax\(\"([^\"]+)\"", html)
-    return m.group(1) if m else None
-
-
-def _extract_person_form_context(html: str):
-    m_form = re.search(r"onclick=\"fillPersonData\('([^']+):person-iin'\)\"", html)
-    ajax_component = _extract_js_triggered_ajax_id(html, "fillPersonData")
-    if not m_form or not ajax_component:
-        debug_path = _dump_debug_html(html, "person_form")
-        raise RuntimeError(f"Не найдена разметка лупы (fillPersonData). HTML: {debug_path}")
-    return m_form.group(1), ajax_component
-
-
-def _merge_partial_updates_into_html(current_html: str, updates: dict) -> str:
-    if not updates:
-        return current_html
-    for update_id, value in updates.items():
-        if update_id.endswith("javax.faces.ViewRoot") or update_id == "javax.faces.ViewRoot":
-            if value and "<" in value:
-                return value
-    if not current_html:
-        html_parts = [v for k, v in updates.items() if "ViewState" not in k and v and "<" in v]
-        return "\n".join(html_parts) if html_parts else current_html
-
-    soup = BeautifulSoup(current_html, "lxml")
-    for update_id, fragment_html in updates.items():
-        if "ViewState" in update_id or not fragment_html or "<" not in fragment_html:
-            continue
-        target = soup.find(id=update_id)
-        fragment_soup = BeautifulSoup(fragment_html, "lxml")
-        replacement = fragment_soup.find(id=update_id)
-        if replacement is None:
-            body = fragment_soup.body
-            candidates = [n for n in (body.contents if body else fragment_soup.contents) if getattr(n, "name", None) is not None]
-            replacement = candidates[0] if candidates else None
-        if target is not None and replacement is not None:
-            target.replace_with(replacement)
-        elif replacement is not None:
-            (soup.body or soup).append(replacement)
-    return str(soup)
-
-
-def _patch_select_value(html: str, select_id: str, value: str) -> str:
-    soup = BeautifulSoup(html, "lxml")
-    sel = soup.find(id=select_id)
-    if sel is None:
-        return html
-    for opt in sel.find_all("option"):
-        if opt.has_attr("selected"):
-            del opt["selected"]
-    match = sel.find("option", attrs={"value": value})
-    if match is None:
-        match = next((o for o in sel.find_all("option") if o.get_text() == value), None)
-    if match is not None:
-        match["selected"] = "selected"
-    return str(soup)
-
-
-def _find_container_id(html: str, known_field_suffix: str) -> str:
-    m = re.search(r'id="([^"]+)' + re.escape(known_field_suffix) + r'"', html)
-    if not m:
-        raise RuntimeError(f"Не найден элемент с суффиксом {known_field_suffix!r} на странице.")
-    return m.group(1)
-
-
-def _serialize_naming_container(html: str, container_id: str) -> dict:
-    soup = BeautifulSoup(html, "lxml")
-    prefix = container_id + ":"
-    result = {}
-    for el in soup.find_all(["input", "select", "textarea"]):
-        el_id = el.get("id")
-        if not el_id or not el_id.startswith(prefix):
-            continue
-        name = el.get("name") or el_id
-        if el.name == "select":
-            chosen = el.find("option", selected=True) or el.find("option")
-            if chosen is not None:
-                result[name] = chosen.get("value")
-                if result[name] is None:
-                    result[name] = chosen.get_text()
-            else:
-                result[name] = ""
-        elif el.name == "textarea":
-            result[name] = el.get_text() or ""
-        else:
-            el_type = (el.get("type") or "text").lower()
-            if el_type in ("submit", "reset", "image"):
-                continue
-            if el_type in ("checkbox", "radio"):
-                if el.has_attr("checked"):
-                    result[name] = el.get("value", "on")
-            else:
-                result[name] = el.get("value", "")
-    result[container_id] = container_id
-    return result
-
-
-def _ajax_meta(ajax_component: str, event: str = None) -> dict:
-    meta = {
-        "javax.faces.source": ajax_component,
-        "javax.faces.partial.execute": f"{ajax_component} @component",
-        "javax.faces.partial.render": "@component",
-        "org.richfaces.ajax.component": ajax_component,
-        "rfExt": "null",
-        "AJAX:EVENTS_COUNT": "1",
-        "javax.faces.partial.ajax": "true",
-    }
-    if event:
-        meta["javax.faces.partial.event"] = event
-        if event == "change":
-            meta["javax.faces.behavior.event"] = event
-    if event != "change":
-        meta[ajax_component] = ajax_component
-    return meta
-
-
-def _ajax_select_change(client: SudHttpClient, url: str, container_id: str, field: str, value: str, referer: str):
-    state = _serialize_naming_container(client.state.html, container_id)
-    ajax_component = f"{container_id}:{field}"
-    state[ajax_component] = value
-    state.update(_ajax_meta(ajax_component, event="change"))
-    client.post_form(url, state, referer=referer)
-    client.state.html = _patch_select_value(client.state.html, ajax_component, value)
-
-
-def _click_js_triggered_button(client: SudHttpClient, url: str, container_id: str, func_name: str, referer: str, extra_state: dict = None):
-    ajax_component = _extract_js_triggered_ajax_id(client.state.html, func_name)
-    if not ajax_component:
-        debug_path = _dump_debug_html(client.state.html, f"missing_{func_name}")
-        raise RuntimeError(f"Не найдена кнопка ({func_name}). HTML: {debug_path}")
-    state = _serialize_naming_container(client.state.html, container_id)
-    if extra_state:
-        state.update(extra_state)
-    state.update(_ajax_meta(ajax_component))
-    client.post_form(url, state, referer=referer)
-
-
-def _extract_plain_ajax_button_id(html: str, near_field_suffix: str):
-    field_idx = html.find(near_field_suffix)
-    if field_idx < 0:
-        return None
-    window = html[field_idx: field_idx + 4000]
-    soup = BeautifulSoup(window, "lxml")
-    for el in soup.find_all("input"):
-        onclick = el.get("onclick") or ""
-        m = re.search(r'RichFaces\.ajax\("([^"]+)",event,\{"incId":"1"\}\s*\);return false;', onclick)
-        if m:
-            return m.group(1)
-    return None
-
-
-def open_person_form_via_http(client: SudHttpClient):
-    log4("[HTTP-nav] GET send/index.xhtml")
-    client.get(SEND_DOCS_URL)
-    container1 = _find_container_id(client.state.html, ":case-type")
-
-    _ajax_select_change(client, SEND_DOCS_URL, container1, "case-type", "CIVIL", client.state.url)
-    _ajax_select_change(client, SEND_DOCS_URL, container1, "instance", "FIRSTINSTANCE", client.state.url)
-    _ajax_select_change(client, SEND_DOCS_URL, container1, "request", "3", client.state.url)
-    _click_js_triggered_button(client, SEND_DOCS_URL, container1, "sendRequest", client.state.url)
-    log4(f"[HTTP-nav] -> {client.state.url}")
-
-    container2 = _find_container_id(client.state.html, ":edit-categoryGroup")
-    _ajax_select_change(client, CREATE_REQUEST_URL, container2, "edit-categoryGroup", "2", client.state.url)
-    _ajax_select_change(client, CREATE_REQUEST_URL, container2, "edit-category", "27", client.state.url)
-    _ajax_select_change(client, CREATE_REQUEST_URL, container2, "edit-character", "1", client.state.url)
-
-    _click_js_triggered_button(
-        client, CREATE_REQUEST_URL, container2, "renderAddPersonModalDialog", client.state.url,
-        extra_state={f"{container2}:edit-simpleProcess": "on"},
-    )
-
-    next_button_id = _extract_plain_ajax_button_id(client.state.html, ":pp-side")
-    if not next_button_id:
-        debug_path = _dump_debug_html(client.state.html, "missing_next_side_button")
-        raise RuntimeError(f"Не найдена кнопка «Далее» в форме выбора стороны. HTML: {debug_path}")
-
-    container3 = next_button_id.rsplit(":", 1)[0]
-    state = _serialize_naming_container(client.state.html, container3)
-    state.update(_ajax_meta(next_button_id, event="click"))
-    client.post_form(CREATE_REQUEST_URL, state, referer=client.state.url)
-
-    return _extract_person_form_context(client.state.html)
-
-
-def _fetch_person_by_iin_http(http_session, referer_url, form_id, ajax_component, viewstate, iin, timeout=30):
-    data = {
-        form_id: form_id,
-        f"{form_id}:person-iin": iin,
-        f"{form_id}:person-surname": "",
-        f"{form_id}:person-firstname": "",
-        f"{form_id}:person-patronymic": "",
-        f"{form_id}:person-livePlace": "",
-        f"{form_id}:person-workPlace": "",
-        f"{form_id}:person-phone": "",
-        f"{form_id}:person-email": "",
-        "javax.faces.ViewState": viewstate,
-        "javax.faces.source": ajax_component,
-        "javax.faces.partial.execute": f"{ajax_component} @component",
-        "javax.faces.partial.render": "@component",
-        "param1": f"{form_id}:person-iin",
-        "org.richfaces.ajax.component": ajax_component,
-        ajax_component: ajax_component,
-        "rfExt": "null",
-        "AJAX:EVENTS_COUNT": "1",
-        "javax.faces.partial.ajax": "true",
-    }
-    headers = {"Accept": "*/*", "Faces-Request": "partial/ajax", "Referer": referer_url, "Origin": BASE}
-    resp = http_session.post(CREATE_REQUEST_URL, data=data, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-
-    low = resp.text[:2000].lower()
-    if "войти" in low or "/index.xhtml" in resp.url.lower():
-        raise RuntimeError("HTTP_SESSION_DEAD")
-
-    updates, new_viewstate = _parse_partial_response(resp.text)
-    if not updates:
-        raise RuntimeError("HTTP_EMPTY_RESPONSE")
-
-    result = {
-        "sur":  _find_update_by_suffix(updates, ":person-surname"),
-        "name": _find_update_by_suffix(updates, ":person-firstname"),
-        "patr": _find_update_by_suffix(updates, ":person-patronymic"),
-        "live": _find_update_by_suffix(updates, ":person-livePlace"),
-    }
-
-    if not any(result.values()):
-        m_dup = re.search(r"processPersonListCode[^']*'\]\)\.val\('(\d+)'\)", resp.text)
-        if m_dup:
-            raise RuntimeError(f"HTTP_ALREADY_IN_PROCESS:{m_dup.group(1)}")
-
-    return result, (new_viewstate or viewstate)
+    return _portal_build_address(result)
 
 
 def fill_addresses(ws):
     """Ищет адрес по ИИН (колонка B) и пишет его в колонку G ('Актуальный адрес с СК')."""
-    MAX_TOTAL_ATTEMPTS_PER_ROW = 6
-    RETRY_ROW_PAUSE = 1.0
-    MAX_CONSECUTIVE_ERRORS = 3
+    MAX_TOTAL_ATTEMPTS_PER_ROW = 2   # темп/повторы при 429/5xx — внутри PortalSotHttp
+    MAX_CONSECUTIVE_FAIL = 5         # подряд «мёртвых» строк → портал недоступен
 
-    def _new_client():
-        log4("🔐 Логин в СК через Selenium (единственный раз за сессию)...")
-        session = selenium_login_get_session()
-        client = SudHttpClient(session)
-        log4("🧭 HTTP-навигация до формы участника...")
-        form_id, ajax_component = open_person_form_via_http(client)
-        log4(f"✅ Форма открыта: form_id={form_id}")
-        return client, form_id, ajax_component
+    rows = [(r, _norm_iin(ws.cell(row=r, column=2).value)) for r in range(2, ws.max_row + 1)]
+    rows = [(r, iin) for r, iin in rows if len(iin) == 12]
 
-    client = form_id = ajax_component = None
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            client, form_id, ajax_component = _new_client()
-            break
-        except Exception as e:
-            last_error = e
-            log4(f"❌ Попытка {attempt}/3 открыть форму не удалась: {e}")
-            if attempt < 3:
-                time.sleep(3)
-    if client is None:
-        log4(f"❌ Не удалось открыть форму участника после 3 попыток: {last_error} — адреса не будут найдены")
-        return 0, ws.max_row - 1
+    if not PORTAL_SOT_BY_COMPANY.get(COMPANY_ID):
+        log4(f"❌ Для компании {COMPANY_ID} нет записи в PORTAL_SOT_BY_COMPANY (scripts/config.py) — "
+             f"вход на portal-sot.kz не настроен, адреса не будут найдены")
+        return 0, len(rows)
 
-    found, not_found = 0, 0
-    consecutive_errors = 0
+    found = 0
+    consecutive_fail = 0
+    renewed_on_empty = False   # пустой 200 = токен не принят; входим заново один раз
 
-    for r in range(2, ws.max_row + 1):
-        src_iin = _norm_iin(ws.cell(row=r, column=2).value)
-        if not src_iin or len(src_iin) != 12:
-            continue
-
-        log4(f"Строка {r} → ИИН: {src_iin}")
-        success = False
-        total_attempts = 0
-
-        while not success and total_attempts < MAX_TOTAL_ATTEMPTS_PER_ROW:
-            total_attempts += 1
-            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                log4(f"⚠ {consecutive_errors} ошибок подряд — новый логин и новое дело")
-                try:
-                    client, form_id, ajax_component = _new_client()
-                    consecutive_errors = 0
-                except Exception as e:
-                    log4(f"❌ Не удалось перелогиниться: {e}")
-
-            try:
-                data, new_viewstate = _fetch_person_by_iin_http(
-                    client.session, client.state.url, form_id, ajax_component,
-                    client.state.viewstate, src_iin, timeout=30,
-                )
-                client.state.viewstate = new_viewstate
-            except RuntimeError as e:
-                if str(e).startswith("HTTP_ALREADY_IN_PROCESS"):
-                    consecutive_errors = MAX_CONSECUTIVE_ERRORS
+    try:
+        with PortalSotHttp(COMPANY_ID, _portal_login, log=log4) as portal:
+            for n, (r, iin) in enumerate(rows, 1):
+                log4(f"#{n}/{len(rows)} (строка {r}) → ИИН: {iin}")
+                success = False
+                for attempt in range(1, MAX_TOTAL_ATTEMPTS_PER_ROW + 1):
+                    try:
+                        live = _portal_fetch_address(portal, iin)
+                    except PortalBlocked:
+                        raise
+                    except Exception as e:
+                        if str(e) == "PORTAL_EMPTY_200" and not renewed_on_empty:
+                            renewed_on_empty = True
+                            log4("   🔄 пустой 200 — вход заново по ЭЦП")
+                            portal.renew(full=True)
+                        else:
+                            log4(f"   ⚠ {type(e).__name__}: {e} (попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW})")
+                        continue
+                    if live:
+                        ws.cell(row=r, column=7, value=live)
+                        log4(f"   → адрес: {live}")
+                        success = True
+                    else:
+                        log4("   ✗ ИИН не найден в ГБД ФЛ / адреса нет")
+                        consecutive_fail = 0   # портал ответил — это не сбой связи
+                    break
                 else:
-                    consecutive_errors += 1
-                log4(f"⚠ {e}")
-            except requests.RequestException as e:
-                consecutive_errors += 1
-                log4(f"⚠ ошибка HTTP-запроса: {e}")
-            else:
-                if any(data.values()):
-                    live = data.get("live", "")
-                    ws.cell(row=r, column=7, value=live)
-                    log4(f"→ адрес: {live}")
-                    success = True
-                    consecutive_errors = 0
-                else:
-                    consecutive_errors += 1
-                    log4("данных нет")
+                    consecutive_fail += 1
 
-            if success:
-                break
-            if total_attempts < MAX_TOTAL_ATTEMPTS_PER_ROW:
-                time.sleep(RETRY_ROW_PAUSE)
+                if success:
+                    found += 1
+                    consecutive_fail = 0
+                elif consecutive_fail >= MAX_CONSECUTIVE_FAIL:
+                    log4(f"❌ {consecutive_fail} строк подряд без ответа от portal-sot.kz — "
+                         f"портал недоступен, останавливаю поиск адресов")
+                    break
+    except PortalBlocked as e:
+        log4(f"⛔ {e}")
+    except Exception as e:
+        log4(f"❌ Поиск адресов на portal-sot.kz прерван: {type(e).__name__}: {e}")
 
-        if success:
-            found += 1
-        else:
-            not_found += 1
-            log4(f"→ строка {r}: адрес не найден после {MAX_TOTAL_ATTEMPTS_PER_ROW} попыток")
-
-        time.sleep(0.25)
-
-    return found, not_found
+    return found, len(rows) - found
 
 
 # ============================================================
@@ -1607,15 +1131,6 @@ def send_wamm_file(path: Path):
         log4(f"⚠ Не удалось отправить файл в WhatsApp (Wamm Chat): {e}")
 
 
-def build_wa_tags_text() -> str:
-    """Текст для упоминания (@тег) двух номеров из config.REESTR_GP_WA_TAGS.
-    К Excel-реестру подпись не прикладывается (Wamm Chat не поддерживает
-    caption у файлов) — тег уходит отдельным коротким сообщением перед файлом."""
-    nums = [re.sub(r"\D", "", str(n)) for n in (REESTR_GP_WA_TAGS or [])]
-    nums = [n for n in nums if n]
-    return " ".join(f"@{n}" for n in nums)
-
-
 # ============================================================
 # MAIN
 # ============================================================
@@ -1651,11 +1166,7 @@ if __name__ == "__main__":
     except Exception as e:
         log4(f"⚠ Не удалось сформировать AddressesImport.xlsx: {e}")
 
-    tags_text = build_wa_tags_text()
-    if tags_text:
-        send_wamm_message(tags_text)
-    else:
-        log4("⚠ config.REESTR_GP_WA_TAGS не заданы — упоминание номеров не отправлено")
+    send_wamm_message(WAMM_REESTR_TEXT)
     send_wamm_file(OUT_XLSX)
 
     log4("=== ГОТОВО ===")

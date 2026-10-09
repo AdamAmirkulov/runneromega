@@ -27,6 +27,7 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from webdriver_manager.firefox import GeckoDriverManager
@@ -59,16 +60,19 @@ def jwt_claims(token: str) -> dict:
 
 
 class PortalSotLogin:
-    def __init__(self, company_id: str, cfg: dict, log=print, dump_dir=None):
-        """cfg — PORTAL_SOT_BY_COMPANY[company_id] из config.py."""
+    def __init__(self, company_id: str, cfg: dict, log=print, dump_dir=None, browser="firefox"):
+        """cfg — PORTAL_SOT_BY_COMPANY[company_id] из config.py.
+        browser — "firefox" (профиль firefox_profile) или "chrome" (chrome_profile)."""
         self.company_id = str(company_id)
         self.cfg = cfg
         self.log = log
         self.dump_dir = dump_dir or os.getcwd()
-        self.profile = cfg.get("firefox_profile")
+        self.browser = browser
+        profile_key = "chrome_profile" if browser == "chrome" else "firefox_profile"
+        self.profile = cfg.get(profile_key)
         if not self.profile:
             raise RuntimeError(
-                f"Для компании {company_id} не задан firefox_profile в PORTAL_SOT_BY_COMPANY (scripts/config.py)"
+                f"Для компании {company_id} не задан {profile_key} в PORTAL_SOT_BY_COMPANY (scripts/config.py)"
             )
         self.ncalayer_path = cfg.get("ncalayer_path") or os.path.expandvars(
             r"%LOCALAPPDATA%\Programs\NCALayer\NCALayer.exe"
@@ -93,10 +97,27 @@ class PortalSotLogin:
             except Exception:
                 pass
 
+    def _init_chrome(self):
+        # Чужой chrome.exe не убиваем (в отличие от Firefox ниже): это может
+        # быть обычный браузер пользователя. Занят профиль — закройте его окно.
+        opts = ChromeOptions()
+        opts.add_argument(f"--user-data-dir={self.profile}")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_argument("--no-first-run")
+        opts.add_argument("--no-default-browser-check")
+        return webdriver.Chrome(options=opts)
+
     def init_driver(self):
         # Постоянный профиль компании (не копия!), где уже нажато «Разрешить»
         # для portal-sot.kz → NCALayer и принят self-signed сертификат NCALayer.
         os.makedirs(self.profile, exist_ok=True)
+        if self.browser == "chrome":
+            drv = self._init_chrome()
+            caps = drv.capabilities or {}
+            self.log(f"Браузер: {caps.get('browserName')} {caps.get('browserVersion')}, профиль: {self.profile}")
+            drv.set_page_load_timeout(120)
+            drv.maximize_window()
+            return drv
         opts = FirefoxOptions()
         opts.add_argument("-profile")
         opts.add_argument(self.profile)
@@ -266,7 +287,7 @@ class PortalSotLogin:
         if nca is None:
             raise RuntimeError(
                 "Окно подписи NCALayer так и не появилось после клика «Войти». Убедитесь, что NCALayer "
-                "запущен и в Firefox-профиле компании для portal-sot.kz нажато «Разрешить»."
+                f"запущен и в {self.browser}-профиле компании для portal-sot.kz нажато «Разрешить»."
             )
         nca.set_focus()
 
@@ -316,3 +337,71 @@ class PortalSotLogin:
             raise RuntimeError("access_token не найден после входа")
         self.log("✅ Вход на portal-sot.kz выполнен, access_token получен")
         return access, refresh
+
+
+# ============================================================
+# Цепочка входа для PortalSotHttp: без браузера → Chrome → Firefox
+# ============================================================
+
+def _http_login(company_id, cfg, log):
+    """Вход без браузера (scripts/portal_sot_auth.py): XML-челлендж → подпись
+    в NCALayer → токены. Браузер и его профиль не нужны."""
+    import portal_sot_auth
+
+    ncalayer_path = cfg.get("ncalayer_path") or os.path.expandvars(
+        r"%LOCALAPPDATA%\Programs\NCALayer\NCALayer.exe"
+    )
+    access, refresh, session = portal_sot_auth.login(
+        str(company_id), cfg["eds_password"], ncalayer_path, log=log
+    )
+    try:
+        cookies = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
+                   for c in getattr(session.cookies, "jar", session.cookies)]
+    except Exception:
+        cookies = []
+    # user_agent пустой: дальше PortalSotHttp ходит обычным requests со своим UA
+    return {"access_token": access, "refresh_token": refresh,
+            "cookies": cookies, "user_agent": ""}
+
+
+def _browser_login(company_id, cfg, log, dump_dir, browser):
+    """Браузер только для входа: ЭЦП → токены/cookies → браузер сразу закрыт."""
+    driver_login = PortalSotLogin(company_id, cfg, log=log, dump_dir=dump_dir, browser=browser)
+    driver = driver_login.init_driver()
+    try:
+        access, refresh = driver_login.login(driver)
+        try:
+            ua = driver.execute_script("return navigator.userAgent")
+        except Exception:
+            ua = ""
+        try:
+            cookies = driver.get_cookies()
+        except Exception:
+            cookies = []
+        return {"access_token": access, "refresh_token": refresh,
+                "cookies": cookies, "user_agent": ua}
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+def login_chain(company_id, cfg, log=print, dump_dir=None) -> dict:
+    """Функция входа для PortalSotHttp(company_id, lambda: login_chain(...)).
+    Сначала вход без браузера; не получилось (403 и т.п.) — Google Chrome,
+    затем Firefox. Браузер пробуется, только если для компании задан его
+    профиль (chrome_profile / firefox_profile)."""
+    ways = [("без браузера", lambda: _http_login(company_id, cfg, log))]
+    if cfg.get("chrome_profile"):
+        ways.append(("Google Chrome", lambda: _browser_login(company_id, cfg, log, dump_dir, "chrome")))
+    if cfg.get("firefox_profile"):
+        ways.append(("Firefox", lambda: _browser_login(company_id, cfg, log, dump_dir, "firefox")))
+
+    for n, (name, way) in enumerate(ways, 1):
+        try:
+            return way()
+        except Exception as e:
+            if n == len(ways):
+                raise
+            log(f"⚠ Вход ({name}) не удался ({type(e).__name__}: {e}) — пробую: {ways[n][0]}")

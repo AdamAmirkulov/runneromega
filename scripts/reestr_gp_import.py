@@ -19,9 +19,10 @@
            адрес/регион/суд подставить из реестра, сохранить
            out/Отчёт_реестр_ГП_*.xlsx; затем запустить scripts/sbor.py на этот
            файл (--excel_path).
-  Этап 3 — запустить scripts/podacha_iska_v2.py на тот же файл (--excel_path).
+  Этап 3 — запустить scripts/podacha_portal_sot.py (подача на portal-sot.kz,
+           без подписи) на тот же файл (--excel_path).
 
-Старые scripts/sbor.py и scripts/podacha_iska_v2.py НЕ меняются — откат = просто
+scripts/sbor.py и scripts/podacha_portal_sot.py НЕ меняются — откат = просто
 не пользоваться этим скриптом.
 """
 
@@ -80,7 +81,7 @@ LOANS_IMPORT_XLSX = (
     else OUT_DIR / "LoansImport.xlsx"
 )
 
-# Отчёт в формате «Отчёта по отменам» — его читают sbor.py и podacha_iska_v2.py.
+# Отчёт в формате «Отчёта по отменам» — его читают sbor.py и podacha_portal_sot.py.
 OTMENY_REPORT_XLSX = OUT_DIR / f"Отчёт_реестр_ГП_{datetime.now():%Y%m%d_%H%M}.xlsx"
 
 # БД crm — те же реквизиты, что в scripts/reestr_gosposhliny.py.
@@ -231,17 +232,62 @@ def parse_gp_pdf(pdf_path: Path) -> list[dict]:
     return rows
 
 
+def _read_reestr_grid(reestr_path: Path) -> list[list]:
+    """Читает лист «Реестр» (или первый/активный) в список строк. Формат
+    определяется по сигнатуре, а не по расширению: загруженный файл всегда
+    сохраняется как .xlsx, даже если это старый .xls."""
+    with open(reestr_path, "rb") as f:
+        sig = f.read(8)
+    if sig == bytes.fromhex("D0CF11E0A1B11AE1"):
+        import xlrd
+        book = xlrd.open_workbook(str(reestr_path))
+        sh = book.sheet_by_name("Реестр") if "Реестр" in book.sheet_names() else book.sheet_by_index(0)
+        grid = []
+        for r in range(sh.nrows):
+            row = []
+            for v in sh.row_values(r):
+                if isinstance(v, float) and v.is_integer():
+                    v = int(v)  # иначе ИИН/номер придут как 900101300123.0
+                row.append(None if v == "" else v)
+            grid.append(row)
+        return grid
+    wb = load_workbook(str(reestr_path), data_only=True)
+    ws = wb["Реестр"] if "Реестр" in wb.sheetnames else wb.active
+    return [list(row) for row in ws.iter_rows(values_only=True)]
+
+
 def load_reestr(reestr_path: Path) -> tuple[dict, list[dict]]:
     """Читает реестр -> (индекс norm_fio_key -> [строки], список всех строк).
     Строка: {row, uniq, iin, fio, gp, ugd, ugd_bin, address, court}."""
-    wb = load_workbook(str(reestr_path), data_only=True)
-    ws = wb["Реестр"] if "Реестр" in wb.sheetnames else wb.active
+    grid = _read_reestr_grid(reestr_path)
+
+    class _Cell:
+        def __init__(self, value):
+            self.value = value
+
+    class _Sheet:
+        max_row = len(grid)
+        max_column = max((len(row) for row in grid), default=0)
+
+        @staticmethod
+        def cell(row, column):
+            line = grid[row - 1] if row <= len(grid) else ()
+            return _Cell(line[column - 1] if column <= len(line) else None)
+
+    ws = _Sheet
 
     headers = {}
     for c in range(1, ws.max_column + 1):
         h = ws.cell(row=1, column=c).value
         if h:
             headers[str(h).strip().lower()] = c
+
+    if not any(s in key for key in headers for s in ("уникальн", "иин", "фио")):
+        raise ValueError(
+            "файл не похож на «Реестр на возврат госпошлины»: в первой строке нет "
+            "колонок «Уникальный номер» / «ИИН» / «ФИО». Заголовки файла: "
+            + (", ".join(list(headers)[:8]) or "(пусто)")
+        )
 
     def col(*substrings, default=None):
         for key, idx in headers.items():
@@ -380,7 +426,11 @@ def stage1_pdf_to_loans_import() -> dict:
     log(f"📥 Страниц в PDF: {len(pdf_rows)}; распознано платежей: "
         f"{sum(1 for r in pdf_rows if r.get('raw_ok'))}")
 
-    reestr_index, reestr_rows = load_reestr(reestr_path)
+    try:
+        reestr_index, reestr_rows = load_reestr(reestr_path)
+    except Exception as e:
+        log(f"❌ Не удалось прочитать реестр ({reestr_path.name}): {e}")
+        sys.exit(1)
     log(f"📋 Строк в реестре: {len(reestr_rows)}")
 
     summary = build_loans_import(pdf_rows, reestr_index)
@@ -696,7 +746,7 @@ def stage2b_run_sbor(report_path: Path):
 
 def stage3_run_podacha(report_path: Path):
     log("=== ЭТАП 3: подача иска (scripts/podacha_portal_sot.py) ===")
-    _run_subscript("scripts/podacha_portal_sot.py", ["--excel_path", str(report_path)])
+    return _run_subscript("scripts/podacha_portal_sot.py", ["--excel_path", str(report_path)])
 
 
 # ============================================================
@@ -724,6 +774,9 @@ if __name__ == "__main__":
     stage2b_run_sbor(report_path)
 
     if stage == "3":
-        stage3_run_podacha(report_path)
+        rc = stage3_run_podacha(report_path)
+        if rc != 0:
+            log("❌ Подача иска завершилась с ошибкой — подробности в логе выше и в out/portal_sot_results.xlsx")
+            sys.exit(rc)
 
     log("=== ГОТОВО ===")

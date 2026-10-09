@@ -5,6 +5,7 @@
 Используются и веб-приложением (app.py — при сохранении справочника ЧСИ),
 и скриптом-исполнителем (scripts/mailing_send.py).
 """
+import html
 import re
 
 # Фиксированный набор автоподстановок в теме/теле письма.
@@ -47,6 +48,28 @@ def render_placeholders(text: str, ctx: dict) -> str:
         var = key[2:-2]  # {{ФИО_ЧСИ}} -> ФИО_ЧСИ
         out = out.replace(key, str(ctx.get(var, "")))
     return out
+
+
+# Есть ли в тексте хоть один похожий на HTML-тег кусок — признак того, что
+# админ сознательно написал разметку, а не обычный текст.
+_HTML_TAG_RE = re.compile(r"<\s*/?\s*[a-zA-Z][a-zA-Z0-9]*[^>]*>")
+
+
+def render_body_html(text: str, ctx: dict) -> str:
+    """Готовит HTML-тело письма из поля «Текст письма».
+
+    Админ по умолчанию пишет обычный текст (без HTML-тегов) — тогда он
+    экранируется и переносы строк превращаются в <br>, чтобы письмо выглядело
+    так же, как было набрано. Если в шаблоне уже есть HTML-разметка (напр.
+    <b>, <a href=...>, <p>) — считаем это осознанным HTML и подставляем
+    плейсхолдеры как есть, без экранирования."""
+    if not text:
+        return ""
+    if _HTML_TAG_RE.search(text):
+        return render_placeholders(text, ctx)
+    rendered = render_placeholders(text, ctx)
+    escaped = html.escape(rendered)
+    return escaped.replace("\r\n", "\n").replace("\n", "<br>\n")
 
 
 _FORBIDDEN_SQL = re.compile(

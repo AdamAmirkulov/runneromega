@@ -1,5 +1,5 @@
 # database.py
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Table, Text, text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Date, ForeignKey, Table, Text, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime, timedelta
@@ -184,6 +184,8 @@ class Mailing(Base):
     schedule_hour = Column(Integer, nullable=True)
     schedule_minute = Column(Integer, nullable=True)
     schedule_weekdays = Column(String, default="0,1,2,3,4,5,6")
+    schedule_interval_weeks = Column(Integer, default=1)  # 1 = каждую неделю, 2 = раз в 2 недели, ...
+    schedule_anchor_date = Column(Date, nullable=True)     # опорная дата отсчёта интервала
     created_at = Column(DateTime, default=datetime.now)
 
     company = relationship("Company")
@@ -191,6 +193,17 @@ class Mailing(Base):
 
     def weekday_list(self):
         return [int(x) for x in (self.schedule_weekdays or "").split(",") if x != ""]
+
+    def is_due_on(self, day) -> bool:
+        """day — date. Учитывает интервал в неделях от опорной даты
+        (schedule_anchor_date); при interval=1 (по умолчанию) ведёт себя
+        как раньше — срабатывает каждую неделю."""
+        interval = self.schedule_interval_weeks or 1
+        if interval <= 1:
+            return True
+        anchor = self.schedule_anchor_date or (self.created_at.date() if self.created_at else day)
+        weeks_since = (day - anchor).days // 7
+        return weeks_since >= 0 and weeks_since % interval == 0
 
     def company_id_list(self):
         """Все компании рассылки: основная (company_id) + доп. (extra_company_ids),
@@ -377,6 +390,8 @@ def _ensure_columns():
         "ALTER TABLE job_runs ADD COLUMN company_id INTEGER",
         "ALTER TABLE job_runs ADD COLUMN company_name VARCHAR",
         "ALTER TABLE mailings ADD COLUMN extra_company_ids VARCHAR",
+        "ALTER TABLE mailings ADD COLUMN schedule_interval_weeks INTEGER DEFAULT 1",
+        "ALTER TABLE mailings ADD COLUMN schedule_anchor_date DATE",
     ]
     with engine.connect() as conn:
         for stmt in statements:

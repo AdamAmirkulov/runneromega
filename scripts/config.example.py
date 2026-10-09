@@ -135,7 +135,20 @@ IL_DECISION_CONFIG = {
         'project_name': 'ТОО «...»',
         'director': 'Фамилия И.',
         'template': 'OMEGA_IL_DECISION_TEMPLATE.docx',
+        # шаблон заявления «по определению» (scripts/portal_sot_il_opredelenie.py)
+        'template_definition': 'OMEGA_IL_DEFINITION_TEMPLATE.docx',
     },
+    # Заявление «по определению» (scripts/portal_sot_il_opredelenie.py) — шаблон
+    # общий, для других компаний достаточно project_name + director. Картинка
+    # «подпись директора + печать» в общем шаблоне — Омеги: для остальных
+    # положите свою PNG в scripts/templates/ и укажите в signature_image,
+    # иначе заявление уйдёт без картинки (подписывается ЭЦП в любом случае).
+    # '2': {'project_name': 'ТОО «...»', 'director': 'Фамилия И.',
+    #       'signature_image': 'KPI_IL_SIGNATURE.png'},
+    # '3': {'project_name': 'ТОО «...»', 'director': 'Фамилия И.',
+    #       'signature_image': 'ORION_IL_SIGNATURE.png'},
+    # '4': {'project_name': 'ТОО «...»', 'director': 'Фамилия И.',
+    #       'signature_image': 'INVESTWAY_IL_SIGNATURE.png'},
     # '2': { ... }, '3': { ... }, '4': { ... }
 }
 
@@ -156,13 +169,6 @@ PORTAL_SOT = {
     # необязательно:
     # 'ncalayer_path':  r'C:\Users\User\AppData\Local\Programs\NCALayer\NCALayer.exe',
 }
-
-# ═══════════════════════════════════════════════════════════════
-# WhatsApp (Wamm Chat) — теги при отправке реестра на возврат ГП
-# ═══════════════════════════════════════════════════════════════
-REESTR_GP_WA_TAGS = [
-    '+70000000000',
-]
 
 # ═══════════════════════════════════════════════════════════════
 # Ниже — производные значения, менять обычно не нужно

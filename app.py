@@ -225,6 +225,8 @@ def scheduler_loop():
                 if m.schedule_hour == now.hour and m.schedule_minute == now.minute:
                     if now.weekday() not in m.weekday_list():
                         continue
+                    if not m.is_due_on(now.date()):
+                        continue
                     key = ("mailing", m.id, today_key)
                     if _scheduler_ran_today.get(key):
                         continue
@@ -2379,8 +2381,12 @@ MAILING_FORM_HTML = """
     <input type="text" name="subject" required value="{{ mailing.subject if mailing else default_subject }}">
   </div>
   <div class="form-group">
-    <label>Текст письма (HTML)</label>
+    <label>Текст письма</label>
     <textarea name="body_html" rows="14" required>{{ mailing.body_html if mailing else default_body }}</textarea>
+    <div class="hint">Можно писать обычным текстом — переносы строк сохранятся такими же в письме.
+      Если нужна разметка (жирный текст, ссылка и т.п.) — можно вставить HTML-теги
+      (<code>&lt;b&gt;</code>, <code>&lt;a href="..."&gt;</code>, <code>&lt;br&gt;</code> и т.д.),
+      тогда весь текст будет обработан как HTML.</div>
     <div class="hint">Доступные подстановки:
       {% for ph, desc in placeholders.items() %}<code>{{ ph }}</code> — {{ desc }}{% if not loop.last %}; {% endif %}{% endfor %}</div>
   </div>
@@ -2418,6 +2424,24 @@ MAILING_FORM_HTML = """
           <label><input type="checkbox" name="weekdays" value="{{ i }}" {% if i in wl %}checked{% endif %}> {{ names[i] }}</label>
         {% endfor %}
       </div>
+    </div>
+    <div class="form-group">
+      <label>Периодичность</label>
+      {% set iw = mailing.schedule_interval_weeks if mailing and mailing.schedule_interval_weeks else 1 %}
+      <select name="schedule_interval_weeks">
+        <option value="1" {% if iw == 1 %}selected{% endif %}>Каждую неделю</option>
+        <option value="2" {% if iw == 2 %}selected{% endif %}>Раз в 2 недели</option>
+        <option value="3" {% if iw == 3 %}selected{% endif %}>Раз в 3 недели</option>
+        <option value="4" {% if iw == 4 %}selected{% endif %}>Раз в 4 недели</option>
+      </select>
+      <div class="hint">При «каждую неделю» дата ниже не нужна.</div>
+    </div>
+    <div class="form-group">
+      <label>Дата-опора (для «раз в N недель»)</label>
+      <input type="date" name="schedule_anchor_date"
+        value="{{ mailing.schedule_anchor_date.strftime('%Y-%m-%d') if mailing and mailing.schedule_anchor_date else '' }}">
+      <div class="hint">От этой даты считается отсчёт недель — рассылка сработает в её неделю,
+        затем каждую N-ю. Оставьте пустым при периодичности «каждую неделю».</div>
     </div>
   </fieldset>
 
@@ -2609,6 +2633,17 @@ def _mailing_form_values(form):
         sh, sm = [int(x) for x in t.split(":")]
     except Exception:
         sh, sm = 9, 0
+    try:
+        interval_weeks = max(1, int(form.get("schedule_interval_weeks") or 1))
+    except ValueError:
+        interval_weeks = 1
+    anchor_raw = (form.get("schedule_anchor_date") or "").strip()
+    try:
+        anchor_date = datetime.strptime(anchor_raw, "%Y-%m-%d").date() if anchor_raw else None
+    except ValueError:
+        anchor_date = None
+    if interval_weeks > 1 and not anchor_date:
+        anchor_date = datetime.now().date()  # без даты-опоры интервал считать не от чего
     report_id = form.get("report_id")
     company_ids = [int(x) for x in form.getlist("company_ids") if x.strip().isdigit()]
     return dict(
@@ -2628,6 +2663,8 @@ def _mailing_form_values(form):
         schedule_hour=sh,
         schedule_minute=sm,
         schedule_weekdays=",".join(form.getlist("weekdays")) or "0,1,2,3,4,5,6",
+        schedule_interval_weeks=interval_weeks,
+        schedule_anchor_date=anchor_date,
     )
 
 

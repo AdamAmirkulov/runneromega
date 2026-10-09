@@ -66,6 +66,7 @@ EXCEL_RESP_FILE  = MAIN_EXCEL
 EXCEL_RESP_SHEET = "Отмены"
 
 EXCEL_FIRST_ROW  = 2
+EXCEL_UID_COL    = "A"   # Уникальный номер — есть в имени папки займа ('ФИО, ИИН, №<номер>')
 PRODUCT_COL      = "B"
 EXCEL_RESP_COL   = "D"
 EXCEL_REGION_COL = "P"
@@ -1219,10 +1220,37 @@ def get_latest_cases_root():
     return latest
 
 
-def find_case_folder(fio, iin):
+def load_row_uid(row):
+    wb = load_workbook(EXCEL_RESP_FILE, data_only=True, read_only=True)
+    try:
+        ws = wb[EXCEL_RESP_SHEET] if EXCEL_RESP_SHEET else wb.active
+        value = ws[f"{EXCEL_UID_COL}{row}"].value
+    finally:
+        wb.close()
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value).strip()
+
+
+def find_case_folder(fio, iin, uid=""):
     root = get_latest_cases_root()
     if not os.path.isdir(root):
         raise FileNotFoundError(f"Папка с делами не найдена: {root}")
+
+    # Папки займов называются 'ФИО, ИИН, №<Уникальный номер>' — сначала
+    # ищем строго по номеру (у должника может быть несколько займов);
+    # старые партии без номера — как раньше, по ИИН/ФИО.
+    if uid:
+        uid_re = re.compile(rf"№\s*{re.escape(uid)}(?!\d)")
+        by_uid = [
+            os.path.join(root, name) for name in os.listdir(root)
+            if os.path.isdir(os.path.join(root, name)) and uid_re.search(name)
+        ]
+        if len(by_uid) == 1:
+            print(f"[ФАЙЛЫ] Папка по Уникальному номеру {uid}: {by_uid[0]}")
+            return by_uid[0]
 
     candidates_iin = []
     candidates_fio = []
@@ -1237,6 +1265,11 @@ def find_case_folder(fio, iin):
         elif fio and fio_upper.split()[0] in name.upper():
             candidates_fio.append(path)
 
+    if len(candidates_iin) > 1:
+        raise RuntimeError(
+            f"Несколько папок с ИИН={iin!r} (несколько займов) и нет папки с №{uid}: "
+            + "; ".join(sorted(candidates_iin))
+        )
     if candidates_iin:
         folder = sorted(candidates_iin)[0]
         print(f"[ФАЙЛЫ] Папка по ИИН: {folder}")
@@ -1295,7 +1328,7 @@ def block_payment_fill_and_next(driver, row, timeout=60):
     duty_input.send_keys(duty_str)
     print(f"✔ Госпошлина: {duty_str}")
 
-    folder = find_case_folder(fio, iin)
+    folder = find_case_folder(fio, iin, load_row_uid(row))
     pdf_path = find_duty_pdf(folder)
 
     file_input = w.until(EC.presence_of_element_located(
@@ -1537,7 +1570,7 @@ def block_documents_fill_and_next(driver, row, timeout=120):
     print("✅ Вкладка документов найдена")
 
     fio, iin, _, _ = load_payment_data(row)
-    folder = find_case_folder(fio, iin)
+    folder = find_case_folder(fio, iin, load_row_uid(row))
     claim_doc_path, claim_text = find_claim_doc_and_text(folder)
     print(f"[DOCX] Символов в иске: {len(claim_text)}")
 
@@ -1698,7 +1731,7 @@ def get_product_for_row(row):
 def check_required_docs_for_case(row):
     print("\n========== ПРОВЕРКА ПАКЕТА ДОКУМЕНТОВ ==========")
     fio, iin, _, _ = load_payment_data(row)
-    folder = find_case_folder(fio, iin)
+    folder = find_case_folder(fio, iin, load_row_uid(row))
     print(f"[CHECK] Папка: {folder}")
 
     product = get_product_for_row(row)

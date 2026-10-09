@@ -35,8 +35,13 @@ import ssl
 import subprocess
 import time
 
-from curl_cffi import requests as cf_requests
+import requests
 import websocket
+
+try:
+    from curl_cffi import requests as cf_requests
+except ImportError:   # запасной транспорт, без него работает обычный requests
+    cf_requests = None
 
 PORTAL_SOT_BASE = "https://portal-sot.kz"
 NCALAYER_WS_URL = "wss://127.0.0.1:13579/"
@@ -214,18 +219,30 @@ def _ncalayer_sign_xml(xml_data: str, eds_password: str, log=_default_log) -> st
 
 def login(company_id: str, eds_password: str, ncalayer_path: str, log=_default_log):
     """Полный вход на portal-sot.kz через ЭЦП без браузера.
-    Возвращает (access_token, refresh_token, curl_cffi.requests.Session)."""
+    Возвращает (access_token, refresh_token, session) — session либо
+    requests.Session, либо curl_cffi.requests.Session."""
     ensure_ncalayer_running(company_id, ncalayer_path, log=log)
 
-    session = cf_requests.Session(impersonate=IMPERSONATE)
-    session.headers.update({
-        "Referer": PORTAL_SOT_BASE + "/",
-        "Origin": PORTAL_SOT_BASE,
-        "Accept-Language": "ru",
-    })
+    # 2026-10-06: WAF отвечает 403 на curl_cffi с impersonate (браузерный
+    # отпечаток), а обычный requests пропускает — раньше было наоборот.
+    # Поэтому сначала requests, при 403 — curl_cffi.
+    transports = [("requests", requests.Session)]
+    if cf_requests is not None:
+        transports.append((f"curl_cffi/{IMPERSONATE}", lambda: cf_requests.Session(impersonate=IMPERSONATE)))
 
     log("🔐 Запрашиваю XML-челлендж для входа...")
-    r = session.get(PORTAL_SOT_BASE + "/api/public/auth/xml", timeout=30)
+    for n, (name, make) in enumerate(transports, 1):
+        session = make()
+        session.headers.update({
+            "Referer": PORTAL_SOT_BASE + "/",
+            "Origin": PORTAL_SOT_BASE,
+            "Accept-Language": "ru",
+        })
+        r = session.get(PORTAL_SOT_BASE + "/api/public/auth/xml", timeout=30)
+        if r.status_code != 403 or n == len(transports):
+            break
+        log(f"⚠ {name}: 403 на /auth/xml — пробую другой HTTP-транспорт")
+        time.sleep(3)
     r.raise_for_status()
     xml_challenge = r.text
     log(f"Получен челлендж: {xml_challenge.strip()[:150]}")

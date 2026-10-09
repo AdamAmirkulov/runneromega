@@ -99,7 +99,8 @@ from openpyxl import Workbook                          # noqa: E402
 
 import database                                        # noqa: E402
 from mailing_common import (                           # noqa: E402
-    normalize_fio, safe_filename, render_placeholders, check_select_only,
+    normalize_fio, safe_filename, render_placeholders, render_body_html,
+    check_select_only,
 )
 
 try:
@@ -283,7 +284,7 @@ def run_for_company(cid: str, mailing, base_sql: str):
         fio, gdf = groups[0]
         ctx = make_ctx(fio, len(gdf))
         subject = "[ТЕСТ] " + render_placeholders(mailing.subject, ctx)
-        body = render_placeholders(mailing.body_html, ctx)
+        body = render_body_html(mailing.body_html, ctx)
 
         attach_path = None
         if mailing.attach_enabled:
@@ -319,7 +320,7 @@ def run_for_company(cid: str, mailing, base_sql: str):
         to_email, _ = rec
         ctx = make_ctx(fio, len(gdf))
         subject = render_placeholders(mailing.subject, ctx)
-        body = render_placeholders(mailing.body_html, ctx)
+        body = render_body_html(mailing.body_html, ctx)
 
         attach_path = None
         if mailing.attach_enabled:
