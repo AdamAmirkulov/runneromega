@@ -34,15 +34,6 @@ CRM_DB = {
     'password': 'CRM_PASSWORD',
 }
 
-# Тот же сервер под учёткой sa — используется блоком «Исковое заявление»
-# (scripts/sbordoc_files/iskovoezayav.py).
-CRM_DB_SA = {
-    'server':   'DBSRV',
-    'database': 'crm',
-    'username': 'sa',
-    'password': 'CRM_SA_PASSWORD',
-}
-
 # Wamm Chat (WhatsApp) — токен API, используется scripts/reestr_gosposhliny.py.
 WAMM_TOKEN = 'WAMM_CHAT_TOKEN'
 

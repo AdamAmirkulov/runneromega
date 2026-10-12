@@ -12,8 +12,7 @@ import pyodbc
 from openpyxl import load_workbook
 from docx import Document
 
-from config import ROOT, TARGET_BASE, MAIN_EXCEL
-import config as _config
+from config import ROOT, TARGET_BASE, MAIN_EXCEL, CRM_DB
 from utils import ensure_client_folder, ensure_row_folder, norm_uid, safe_log, safe_update_summary
 
 # ═══════════════════════════════════════════════════════════════
@@ -34,12 +33,8 @@ TEMPLATES_SHEET_NAME = "Данные для шаблонов"
 # БД: ДАННЫЕ ДЛЯ ШАБЛОНОВ (напрямую из crm, без «Отчёта по отменам»)
 # ═══════════════════════════════════════════════════════════════
 
-DB_CONFIG = {
-    "server":   "DBSRV",
-    "database": "crm",
-    "username": "sa",
-    "password": getattr(_config, "CRM_DB_SA", {}).get("password", ""),  # scripts/config.py
-}
+# Реквизиты CRM — общие, из scripts/config.py (учётка user).
+DB_CONFIG = CRM_DB
 
 ISKOVOE_SQL_QUERY = r"""
 -- база: дата сегодня минус 7 дней (без времени)
