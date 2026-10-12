@@ -63,7 +63,7 @@ if project_root not in sys.path:
 # УЧЁТНЫЕ ДАННЫЕ ПО КОМПАНИИ — ИЗ config.py
 # =========================
 
-from config import CREDENTIALS, _company_id, DB_COMPANY_FILTER
+from config import CREDENTIALS, _company_id, DB_COMPANY_FILTER, CRM_DB
 
 print(f"🏢 Запуск проверки ограничения на выезд для компании ID={_company_id}")
 
@@ -212,7 +212,7 @@ DB_CONFIG = {
     "server":   "DBSRV",
     "database": "crm",
     "username": "user",
-    "password": "Log1cF",
+    "password": CRM_DB["password"],
 }
 
 # Фильтр по компании (l.F209) берётся из config.py:COMPANY_DB_FILTER по

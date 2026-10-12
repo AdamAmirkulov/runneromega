@@ -63,7 +63,7 @@ import pdfplumber
 import pandas as pd
 from openpyxl import Workbook, load_workbook
 
-from config import CREDENTIALS, DB_COMPANY_FILTER, ROOT
+from config import CREDENTIALS, DB_COMPANY_FILTER, ROOT, CRM_DB
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -89,7 +89,7 @@ DB_CONFIG = {
     "server":   "DBSRV",
     "database": "crm",
     "username": "user",
-    "password": "Log1cF",
+    "password": CRM_DB["password"],
 }
 
 

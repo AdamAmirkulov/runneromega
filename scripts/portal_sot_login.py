@@ -40,6 +40,9 @@ LOGIN_BTN_XPATH = (
     "[contains(normalize-space(.),'Войти') or contains(normalize-space(.),'Вход')"
     " or contains(normalize-space(.),'Кіру')]"
 )
+# Сама кнопка входа. Широкий LOGIN_BTN_XPATH первой находит вкладку «Вход по
+# ЭЦП» (тоже button) — клик по ней ничего не запускает, окно NCALayer не всплывает.
+LOGIN_BTN_EXACT_XPATH = "//button[normalize-space(.)='Войти' or normalize-space(.)='Кіру']"
 
 
 def _port_open(port: int) -> bool:
@@ -122,6 +125,11 @@ class PortalSotLogin:
         opts.add_argument("-profile")
         opts.add_argument(self.profile)
         opts.set_preference("dom.disable_beforeunload", True)
+        # Firefox спрашивает «portal-sot.kz хочет получить доступ к другим приложениям
+        # и службам на этом устройстве» (Local Network Access) и до ответа не даёт
+        # странице связаться с NCALayer (127.0.0.1:13579) — отключаем запрос.
+        opts.set_preference("network.lna.blocking", False)
+        opts.set_preference("network.lna.enabled", False)
         try:
             drv = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opts)
         except Exception as e:
@@ -214,7 +222,11 @@ class PortalSotLogin:
         # NoSuchElement — ловим и объясняем сами.
         for attempt in range(1, 3):
             try:
-                btn = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.XPATH, LOGIN_BTN_XPATH)))
+                try:
+                    btn = WebDriverWait(driver, 15).until(
+                        EC.element_to_be_clickable((By.XPATH, LOGIN_BTN_EXACT_XPATH)))
+                except TimeoutException:
+                    btn = WebDriverWait(driver, 15).until(EC.element_to_be_clickable((By.XPATH, LOGIN_BTN_XPATH)))
                 break
             except TimeoutException:
                 self.log(f"Кнопка «Войти» на {driver.current_url} не найдена за 30s "
@@ -352,7 +364,8 @@ def _http_login(company_id, cfg, log):
         r"%LOCALAPPDATA%\Programs\NCALayer\NCALayer.exe"
     )
     access, refresh, session = portal_sot_auth.login(
-        str(company_id), cfg["eds_password"], ncalayer_path, log=log
+        str(company_id), cfg["eds_password"], ncalayer_path, log=log,
+        portal_password=cfg.get("portal_password"),
     )
     try:
         cookies = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}

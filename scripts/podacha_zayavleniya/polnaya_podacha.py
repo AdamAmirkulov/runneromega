@@ -26,7 +26,11 @@ AISOIP_URL = "https://aisoip.adilet.gov.kz/cabinet/exec-productions"
 STATEMENTS_URL = "https://aisoip.adilet.gov.kz/cabinet/statements"
 
 LOGIN = "810813301334_230240016634"
-PASSWORD = "Qazaq123456*"
+# Пароль — из scripts/config.py (COMPANY_CREDENTIALS), в коде не хранится.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from config import COMPANY_CREDENTIALS as _COMPANY_CREDENTIALS
+PASSWORD = _COMPANY_CREDENTIALS['1']['aisoip_password']
 
 IL_FOLDER = r"C:\Users\user\Desktop\Подача по АИС ОИП\ИЛ"
 STATEMENTS_FOLDER = r"C:\Users\user\Desktop\Подача по АИС ОИП\Заявления"

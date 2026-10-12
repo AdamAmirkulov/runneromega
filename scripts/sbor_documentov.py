@@ -1297,7 +1297,11 @@ from selenium.common.exceptions import (
 
 # ========= КОНФИГ =========
 USER_AUTH     = "230240016634"        # твой ИИН/БИН
-USER_PASSWORD = "n3y&pAM5mD&4zKZ"     # твой пароль
+# Пароль — из scripts/config.py (COMPANY_CREDENTIALS), в коде не хранится.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from config import COMPANY_CREDENTIALS as _COMPANY_CREDENTIALS
+USER_PASSWORD = _COMPANY_CREDENTIALS['1']['sk_password']     # твой пароль
 
 BASE      = "https://office.sud.kz"
 LOGIN_URL = f"{BASE}/index.xhtml"
@@ -3690,7 +3694,7 @@ from pypdf import PdfReader
 # ================= НАСТРОЙКИ =================
 AISOIP_URL = "https://aisoip.adilet.gov.kz/cabinet/exec-productions"
 LOGIN = "810813301334_230240016634"
-PASSWORD = "Qazaq123456*"
+PASSWORD = _COMPANY_CREDENTIALS['1']['aisoip_password']
 
 EXCEL_PATH = r"C:\Users\User\Desktop\Документы для подачи Исков\Отчёт по отменам_Omega.xlsx"
 IIN_COLUMN_INDEX = 3  # колонка D (0-индексация)

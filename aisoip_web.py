@@ -40,17 +40,34 @@ LOGS_DIR = BASE_DIR / "logs" / "aisoip_sync"
 SYNC_TMP_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Логины/пароли АИС ОИП по company_id — те же значения, что в
-# scripts/config.py (COMPANY_CREDENTIALS[<id>]['aisoip_login'/'aisoip_password']).
-# Продублировано здесь намеренно: scripts/config.py при импорте делает glob по
-# сетевым папкам и печатает служебные сообщения — импортировать его в живой
-# веб-процесс небезопасно (может зависнуть, если сетевой диск недоступен).
-COMPANY_AISOIP_CREDENTIALS = {
-    1: {"login": "810813301334_230240016634", "password": "Qazaq123456*"},
-    2: {"login": "901021350973_210540032049", "password": "Kk12345%"},
-    3: {"login": "821029401373_251140014482", "password": "Aa12345%"},
-    4: {"login": "840622302062_260140035543", "password": "Aa12345%"},
-}
+# Логины/пароли АИС ОИП по company_id берутся из scripts/config.py
+# (COMPANY_CREDENTIALS[<id>]['aisoip_login'/'aisoip_password']) — в коде не
+# хранятся. config.py НЕ импортируется: при импорте он делает glob по сетевым
+# папкам и печатает служебные сообщения (в живом веб-процессе это может
+# зависнуть, если сетевой диск недоступен) — файл только разбирается как текст.
+def _load_aisoip_credentials() -> dict:
+    import ast
+    creds: dict = {}
+    try:
+        tree = ast.parse((BASE_DIR / "scripts" / "config.py").read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"aisoip_web: не удалось прочитать scripts/config.py ({e}) — учётных данных АИС ОИП нет")
+        return creds
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
+                and any(isinstance(t, ast.Name) and t.id == "COMPANY_CREDENTIALS" for t in node.targets)):
+            continue
+        for key, val in zip(node.value.keys, node.value.values):
+            if not (isinstance(key, ast.Constant) and isinstance(val, ast.Dict)):
+                continue
+            item = {k.value: v.value for k, v in zip(val.keys, val.values)
+                    if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)}
+            if item.get("aisoip_login") and item.get("aisoip_password"):
+                creds[int(key.value)] = {"login": item["aisoip_login"], "password": item["aisoip_password"]}
+    return creds
+
+
+COMPANY_AISOIP_CREDENTIALS = _load_aisoip_credentials()
 
 AISOIP_URL = "https://aisoip.adilet.gov.kz/cabinet/exec-productions"
 API_SEARCH_URL = "https://aisoip.adilet.gov.kz/extperson/api/rest/execproc/search"

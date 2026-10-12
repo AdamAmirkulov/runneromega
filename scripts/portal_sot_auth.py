@@ -20,7 +20,8 @@ curl_cffi) проходят нормально — похоже на фильт�
   3. POST /api/public/auth/eds   {"signedXml": base64(подписанный XML)}
      -> {"status":0,"data":{"user":..., "access_token":..., "refresh_token":...}}
 Портального пароля (второй фактор) в этом потоке НЕ было — одной подписи ЭЦП
-достаточно (наблюдение из реального входа, а не документация).
+достаточно (наблюдение из реального входа Омеги, а не документация). Для
+KPI/Orion/InvestWay этого мало — см. повтор с userPassword в login().
 
 HTTP-часть идёт через curl_cffi (импersonate="firefox135") — обходит
 TLS-фингерпринт-блокировку. WebSocket к NCALayer — локальный (127.0.0.1),
@@ -217,7 +218,7 @@ def _ncalayer_sign_xml(xml_data: str, eds_password: str, log=_default_log) -> st
             pass
 
 
-def login(company_id: str, eds_password: str, ncalayer_path: str, log=_default_log):
+def login(company_id: str, eds_password: str, ncalayer_path: str, log=_default_log, portal_password=None):
     """Полный вход на portal-sot.kz через ЭЦП без браузера.
     Возвращает (access_token, refresh_token, session) — session либо
     requests.Session, либо curl_cffi.requests.Session."""
@@ -259,6 +260,23 @@ def login(company_id: str, eds_password: str, ncalayer_path: str, log=_default_l
     )
     r2.raise_for_status()
     data = r2.json()
+    # 2026-10-09: KPI/Orion/InvestWay без пароля получают «USER NOT FOUND FOR
+    # XIN: <БИН>» — сам сайт шлёт в /auth/eds ещё и userPassword (пароль
+    # портала). Омега входит и без него, поэтому пароль досылаем только тут.
+    if data.get("status") != 0 and portal_password and "USER NOT FOUND" in str(data.get("message") or ""):
+        log("⚠ Без пароля портала вход отклонён — повторяю с userPassword")
+        r2 = session.post(
+            PORTAL_SOT_BASE + "/api/public/auth/eds",
+            json={"signedXml": signed_b64, "userPassword": portal_password},
+            timeout=30,
+        )
+        r2.raise_for_status()
+        data = r2.json()
+        if data.get("message") == "INVALID SIGN":
+            raise RuntimeError(
+                "portal-sot.kz /auth/eds: INVALID SIGN — неверный пароль портала "
+                f"(PORTAL_SOT_BY_COMPANY['{company_id}']['portal_password'] в scripts/config.py)"
+            )
     if data.get("status") != 0:
         raise RuntimeError(f"portal-sot.kz /auth/eds отклонил вход: {data.get('message') or data}")
 

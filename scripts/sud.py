@@ -60,7 +60,7 @@ if project_root not in sys.path:
 # УЧЁТНЫЕ ДАННЫЕ ПО КОМПАНИИ — ИЗ config.py
 # =========================
 
-from config import CREDENTIALS, DB_COMPANY_FILTER, _company_id
+from config import CREDENTIALS, DB_COMPANY_FILTER, _company_id, CRM_DB
 
 try:
     from config import PORTAL_SOT_BY_COMPANY
@@ -118,7 +118,7 @@ USER_PASSWORD = CREDENTIALS['sk_password']
 DB_SERVER = "DBSRV"
 DB_DATABASE = "crm"
 DB_USERNAME = "user"
-DB_PASSWORD = "Log1cF"
+DB_PASSWORD = CRM_DB["password"]
 
 LOADING_TIME = 60
 PAGELOAD_TIMEOUT = 120

@@ -87,3 +87,7 @@ desktop.ini
 
 # Токены portal-sot.kz (access/refresh/cookies) — секреты
 data/portal_sot_tokens/
+
+# Отладочные дампы portal-sot.kz (cookies, подписанные XML, данные сертификата) и копии БД
+data/portal_debug/
+*.db.bak_*

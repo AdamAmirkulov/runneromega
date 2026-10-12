@@ -55,7 +55,8 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from config import CREDENTIALS, DB_COMPANY_FILTER, PORTAL_SOT_BY_COMPANY
+from config import CREDENTIALS, DB_COMPANY_FILTER, PORTAL_SOT_BY_COMPANY, CRM_DB
+import config as _config
 from portal_sot_http import PortalSotHttp, PortalBlocked
 from portal_sot_login import login_chain
 
@@ -69,16 +70,20 @@ TEMPLATE_PATH = PROJECT_ROOT / "data" / "Шаблоны" / "Шаблон_рее�
 WORKDIR = Path(args.workdir) if args.workdir else Path(".")
 OUT_DIR = WORKDIR / "out"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-OUT_XLSX = OUT_DIR / f"Реестр_на_возврат_госпошлины_{datetime.now():%Y%m%d_%H%M}.xlsx"
+OUT_XLSX = OUT_DIR / f"Реестр_на_оплату_госпошлин_{datetime.now():%Y%m%d_%H%M}.xlsx"
 
 DB_CONFIG = {
     "server":   "DBSRV",
     "database": "crm",
     "username": "user",
-    "password": "Log1cF",
+    "password": CRM_DB["password"],
 }
 
-WAMM_TOKEN = 'dZ0ec89YqunW7GOB'
+# ВРЕМЕННО (12.10.2026): серверы Wamm Chat не работают (файл — 504), отправка
+# в WhatsApp выключена. Реестр забирают кнопкой «Скачать» у задачи (папка out).
+# Вернуть отправку — поставить True.
+WAMM_ENABLED = False
+WAMM_TOKEN = getattr(_config, 'WAMM_TOKEN', '')  # scripts/config.py
 WAMM_GROUP_ID = '120363160875851590'
 WAMM_MSG_URL = f"https://wamm.chat/api2/msg_to/{WAMM_TOKEN}/"
 WAMM_FILE_URL = f"https://wamm.chat/api2/file_from_base64/{WAMM_TOKEN}/"
@@ -1108,6 +1113,9 @@ def create_addresses_import_file(ws):
 # ============================================================
 
 def send_wamm_message(text: str):
+    if not WAMM_ENABLED:
+        log4("WhatsApp (Wamm Chat) временно выключен — сообщение не отправлялось.")
+        return
     if len(text) > WAMM_MAX_MSG_CHARS:
         text = text[:WAMM_MAX_MSG_CHARS] + "\n…сообщение сокращено"
     try:
@@ -1118,6 +1126,10 @@ def send_wamm_message(text: str):
 
 
 def send_wamm_file(path: Path):
+    if not WAMM_ENABLED:
+        log4(f"WhatsApp (Wamm Chat) временно выключен — файл не отправлялся. "
+             f"Скачайте реестр кнопкой «Скачать» у задачи: {path.name}")
+        return
     try:
         file_base64 = base64.b64encode(path.read_bytes()).decode("ascii")
         resp = requests.post(

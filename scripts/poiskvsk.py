@@ -1751,8 +1751,8 @@ def _portal_cfg_get(key: str, default: str = None):
     return default
 
 
-PORTAL_EDS_PASSWORD   = _portal_cfg_get("eds_password", "Qwerty1981")
-PORTAL_LOGIN_PASSWORD = _portal_cfg_get("portal_password", "n3y&pAM5mD&4zKZ")
+PORTAL_EDS_PASSWORD   = _portal_cfg_get("eds_password", "")
+PORTAL_LOGIN_PASSWORD = _portal_cfg_get("portal_password", "")
 PORTAL_FIREFOX_PROFILE = _portal_cfg_get("firefox_profile", r"C:\Users\User\Documents\FirefoxPortalSot")
 # NCALayer — приложение в трее, слушает ws://127.0.0.1:13579. Портал через него
 # подписывает ЭЦП. Если оно не запущено, клик «Войти» на портале молча ничего не
@@ -1798,6 +1798,11 @@ def _portal_init_driver():
     opts.add_argument("-profile")
     opts.add_argument(PORTAL_FIREFOX_PROFILE)
     opts.set_preference("dom.disable_beforeunload", True)
+    # Firefox спрашивает «portal-sot.kz хочет получить доступ к другим приложениям
+    # и службам на этом устройстве» (Local Network Access) и до ответа не даёт
+    # странице связаться с NCALayer (127.0.0.1:13579) — отключаем запрос.
+    opts.set_preference("network.lna.blocking", False)
+    opts.set_preference("network.lna.enabled", False)
     try:
         drv = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opts)
     except Exception as e:

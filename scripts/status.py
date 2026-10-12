@@ -1024,6 +1024,10 @@ try:
 
     # %%
     template_path = f'{loading_path_part}/Шаблон1.xlsx'
+    # Раннер всегда передаёт --workdir (папка задачи), а Шаблон1.xlsx лежит
+    # в папке load компании из config.py — берём его оттуда.
+    if not os.path.isfile(template_path):
+        template_path = f"{CREDENTIALS['loading_path_part']}/Шаблон1.xlsx"
 
     # %%
     final_table_col_rename.to_excel(path_format1, index=False)

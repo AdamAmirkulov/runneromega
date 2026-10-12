@@ -44,7 +44,11 @@ from selenium.common.exceptions import (
 
 # ========= КОНФИГ =========
 USER_AUTH     = "230240016634"        # твой ИИН/БИН
-USER_PASSWORD = "n3y&pAM5mD&4zKZ"     # твой пароль
+# Пароль — из scripts/config.py (COMPANY_CREDENTIALS), в коде не хранится.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from config import COMPANY_CREDENTIALS as _COMPANY_CREDENTIALS
+USER_PASSWORD = _COMPANY_CREDENTIALS['1']['sk_password']     # твой пароль
 
 BASE      = "https://office.sud.kz"
 LOGIN_URL = f"{BASE}/index.xhtml"

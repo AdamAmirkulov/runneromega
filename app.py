@@ -528,7 +528,7 @@ body { font-family: Arial; max-width: 1400px; margin: 20px auto; padding: 0 20px
   <table class="scripts-table">
     <tbody>
     {% for s in scripts %}
-      {% if s.key in ['sbor','poiskvsk', 'podacha_iska', 'podacha_iska_v2', 'chsi_podacha', 'reestr_gp_import'] %}
+      {% if s.key in ['sbor','poiskvsk', 'podacha_iska', 'podacha_iska_v2', 'chsi_podacha', 'reestr_gp_import', 'sk_zayavlenie_il', 'portal_sot_il_opredelenie'] %}
       <tr>
         <td style="width: 35%;">
           <div class="script-name">{{ s.title }}</div>

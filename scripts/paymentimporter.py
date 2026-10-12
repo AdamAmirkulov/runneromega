@@ -31,7 +31,11 @@ DESKTOP_DIR = r"C:\Users\User\Desktop"
 DB_SERVER   = "DBSRV"
 DB_DATABASE = "crm"
 DB_USERNAME = "user"
-DB_PASSWORD = "Log1cF"
+# Пароль CRM — из scripts/config.py (CRM_DB), в коде не хранится.
+os.environ["COMPANY_ID"] = str(args.company_id)  # до import config!
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import CRM_DB
+DB_PASSWORD = CRM_DB["password"]
 
 # Папка для результата: если передана --output_folder — берём её,
 # иначе --workdir/out (папка задачи в runner'е), иначе рабочий стол

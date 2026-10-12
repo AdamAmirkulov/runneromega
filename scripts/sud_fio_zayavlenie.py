@@ -265,6 +265,11 @@ def _portal_init_driver():
     opts.add_argument("-profile")
     opts.add_argument(PORTAL_FIREFOX_PROFILE)
     opts.set_preference("dom.disable_beforeunload", True)
+    # Firefox спрашивает «portal-sot.kz хочет получить доступ к другим приложениям
+    # и службам на этом устройстве» (Local Network Access) и до ответа не даёт
+    # странице связаться с NCALayer (127.0.0.1:13579) — отключаем запрос.
+    opts.set_preference("network.lna.blocking", False)
+    opts.set_preference("network.lna.enabled", False)
     try:
         driver = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opts)
     except Exception as e:

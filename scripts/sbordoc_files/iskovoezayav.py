@@ -13,6 +13,7 @@ from openpyxl import load_workbook
 from docx import Document
 
 from config import ROOT, TARGET_BASE, MAIN_EXCEL
+import config as _config
 from utils import ensure_client_folder, ensure_row_folder, norm_uid, safe_log, safe_update_summary
 
 # ═══════════════════════════════════════════════════════════════
@@ -37,7 +38,7 @@ DB_CONFIG = {
     "server":   "DBSRV",
     "database": "crm",
     "username": "sa",
-    "password": "QazWsxEdc123!@#",
+    "password": getattr(_config, "CRM_DB_SA", {}).get("password", ""),  # scripts/config.py
 }
 
 ISKOVOE_SQL_QUERY = r"""
