@@ -49,7 +49,27 @@ def parse_args():
                              "1 — только LoansImport; "
                              "2 — + отчёт по БД и сбор документов; "
                              "3 — + подача иска (по умолчанию 3)")
+    parser.add_argument('--mode', type=str, default='',
+                        help="какие шаги выполнять (важнее --stage): "
+                             "full — импорт + сбор + подача; "
+                             "no_import — сбор + подача, LoansImport не пишется; "
+                             "podacha_only — только подача; "
+                             "sbor_only — только сбор; "
+                             "import_sbor — импорт + сбор; "
+                             "import_only — только импорт")
     return parser.parse_known_args()[0]
+
+
+# режим -> (импорт в Дельту, сбор документов, подача иска)
+MODES = {
+    "full":         (True, True, True),
+    "no_import":    (False, True, True),
+    "podacha_only": (False, False, True),
+    "sbor_only":    (False, True, False),
+    "import_sbor":  (True, True, False),
+    "import_only":  (True, False, False),
+}
+STAGE_TO_MODE = {"1": "import_only", "2": "import_sbor", "3": "full"}
 
 
 args = parse_args()
@@ -327,10 +347,11 @@ def load_reestr(reestr_path: Path) -> tuple[dict, list[dict]]:
     return index, all_rows
 
 
-def build_loans_import(pdf_rows: list[dict], reestr_index: dict) -> dict:
+def build_loans_import(pdf_rows: list[dict], reestr_index: dict, write: bool = True) -> dict:
     """Сопоставляет платежи с реестром по точному ключу ФИО и пишет
     LoansImport.xlsx. Несопоставленные — пропускаются, дубли по ФИО —
-    все строки реестра с той же суммой. Возвращает сводку."""
+    все строки реестра с той же суммой. Возвращает сводку.
+    write=False — только сопоставление, файл для Дельты не создаётся."""
     matched: list[dict] = []      # {pdf, reestr}
     unmatched: list[dict] = []    # pdf-строки без совпадения / без парсинга
     ambiguous: list[dict] = []    # pdf-строка -> несколько строк реестра
@@ -348,6 +369,11 @@ def build_loans_import(pdf_rows: list[dict], reestr_index: dict) -> dict:
         if len(hits) > 1:
             ambiguous.append({**pr, "count": len(hits),
                               "uniqs": [h["uniq"] for h in hits]})
+
+    if not write:
+        log("⏭ Импорт в Дельту пропущен — LoansImport.xlsx не формируется")
+        return {"matched": matched, "unmatched": unmatched, "ambiguous": ambiguous,
+                "written_rows": 0}
 
     wb = Workbook()
     wsx = wb.active
@@ -410,8 +436,9 @@ def write_report(pdf_rows: list[dict], summary: dict):
     return path
 
 
-def stage1_pdf_to_loans_import() -> dict:
-    log("=== ЭТАП 1: PDF → LoansImport ===")
+def stage1_pdf_to_loans_import(write: bool = True) -> dict:
+    log("=== ЭТАП 1: PDF → LoansImport ===" if write
+        else "=== ЭТАП 1: сопоставление PDF с реестром (без импорта в Дельту) ===")
     pdf_path = Path(args.pdf_file) if args.pdf_file else None
     reestr_path = Path(args.reestr_file) if args.reestr_file else None
 
@@ -433,7 +460,7 @@ def stage1_pdf_to_loans_import() -> dict:
         sys.exit(1)
     log(f"📋 Строк в реестре: {len(reestr_rows)}")
 
-    summary = build_loans_import(pdf_rows, reestr_index)
+    summary = build_loans_import(pdf_rows, reestr_index, write=write)
     write_report(pdf_rows, summary)
 
     log(f"— сопоставлено платежей: "
@@ -639,6 +666,68 @@ def _eid_sql_list(eids) -> str:
     return ", ".join(clean) if clean else "NULL"
 
 
+# Сколько ждать, пока Дельта заберёт LoansImport.xlsx из папки автоимпорта.
+DELTA_IMPORT_TIMEOUT_SEC = 600
+DELTA_IMPORT_POLL_SEC = 10
+
+
+def wait_delta_import(matched: list[dict]) -> bool:
+    """Ждёт, пока Дельта импортирует LoansImport: у каждого сопоставленного
+    займа госпошлина в БД (F307) должна стать равна сумме из PDF. Иначе иск
+    (читает F307 из БД) уйдёт с госпошлиной 0. Возвращает False по таймауту."""
+    expected: dict[str, float] = {}
+    for m in matched:
+        eid = _eid(m["reestr"]["uniq"])
+        if eid:
+            expected.setdefault(eid, m["pdf"]["amount"])
+    if not expected:
+        return True
+
+    log(f"⏳ Жду импорт госпошлин в Дельту ({len(expected)} займов, "
+        f"до {DELTA_IMPORT_TIMEOUT_SEC // 60} мин)...")
+    sql = (f"SELECT l.EID, ISNULL(l.F307, 0) FROM loans l (NOLOCK) "
+           f"WHERE l.EID IN ({_eid_sql_list(expected)})")
+    deadline = time.time() + DELTA_IMPORT_TIMEOUT_SEC
+    pending = dict(expected)
+    while True:
+        conn = _db_connect()
+        try:
+            in_db = {_eid(eid): float(gp) for eid, gp in conn.cursor().execute(sql).fetchall()}
+        finally:
+            conn.close()
+        pending = {eid: amt for eid, amt in expected.items()
+                   if abs(in_db.get(eid, 0.0) - amt) >= 0.01}
+        if not pending:
+            log(f"✅ Дельта импортировала госпошлины: {len(expected)}/{len(expected)}")
+            return True
+        if time.time() >= deadline:
+            break
+        log(f"   … импортировано {len(expected) - len(pending)}/{len(expected)}")
+        time.sleep(DELTA_IMPORT_POLL_SEC)
+
+    log(f"❌ Дельта не импортировала госпошлины за {DELTA_IMPORT_TIMEOUT_SEC // 60} мин "
+        f"— не импортировано: {len(pending)}/{len(expected)}")
+    for eid, amt in sorted(pending.items()):
+        log(f"    · №{eid}: в PDF {amt}, в БД {in_db.get(eid, 'нет займа')}")
+    return False
+
+
+def _apply_paid_gp(vals: list, headers: list, gp_col: str, gp_paid):
+    """Отчёт строится сразу после записи LoansImport — Дельта его ещё не
+    импортировала, поэтому в БД госпошлина (F307) = 0 и не входит в остаток
+    (F34). Подставляем оплаченную сумму из PDF и добавляем её к «Остатку
+    задолженности» — так же, как это сделает Дельта после импорта. Если в БД
+    госпошлина уже есть (импорт прошёл / повторный запуск) — ничего не трогаем."""
+    if gp_paid is None:
+        return
+    i_gp = headers.index(gp_col)
+    i_debt = headers.index("Остаток задолженности")
+    if float(vals[i_gp] or 0) >= 1:
+        return
+    vals[i_gp] = gp_paid
+    vals[i_debt] = round(float(vals[i_debt] or 0) + gp_paid, 2)
+
+
 def stage2_build_report(matched: list[dict]) -> Path:
     """Тянет данные из БД по EID сопоставленных строк, добавляет адрес/регион/суд
     из реестра, пишет отчёт в формате «Отчёта по отменам» (2 листа)."""
@@ -687,6 +776,7 @@ def stage2_build_report(matched: list[dict]) -> Path:
         # K (кол. 11) «Госпошлина 3%» -> точная сумма из PDF
         if rec.get("gp_paid") is not None:
             vals[10] = rec["gp_paid"]
+        _apply_paid_gp(vals, OTMENY_HEADERS, "Оплаченная ранее госпошлина", rec.get("gp_paid"))
         vals += [addr, region_from_address(addr), rr.get("court")]
         ws_o.append(vals)
 
@@ -694,8 +784,10 @@ def stage2_build_report(matched: list[dict]) -> Path:
     ws_t.append(TEMPLATES_HEADERS)
     for _, row in df_tpl.iterrows():
         eid = _eid(row["Уникальный номер"])
-        rr = by_eid.get(eid, {}).get("reestr", {})
+        rec = by_eid.get(eid, {})
+        rr = rec.get("reestr", {})
         vals = [row.get(h) for h in TEMPLATES_HEADERS]
+        _apply_paid_gp(vals, TEMPLATES_HEADERS, "Госпошлина (расходы)", rec.get("gp_paid"))
         vals[6] = rr.get("address")   # «Адрес регистрации» <- адрес из реестра
         vals[22] = rr.get("court")    # «Судебный орган»    <- суд из реестра
         ws_t.append(vals)
@@ -754,12 +846,18 @@ def stage3_run_podacha(report_path: Path):
 # ============================================================
 
 if __name__ == "__main__":
-    stage = str(args.stage).strip()
-    log(f"Компания: {DB_COMPANY_FILTER} | этап: до {stage}")
+    mode = str(args.mode or "").strip() or STAGE_TO_MODE.get(str(args.stage).strip(), "import_only")
+    if mode not in MODES:
+        log(f"❌ Неизвестный режим «{mode}». Допустимые: {', '.join(MODES)}")
+        sys.exit(1)
+    do_import, do_sbor, do_podacha = MODES[mode]
+    steps = [name for on, name in ((do_import, "импорт в Дельту"), (do_sbor, "сбор документов"),
+                                   (do_podacha, "подача иска")) if on]
+    log(f"Компания: {DB_COMPANY_FILTER} | шаги: {' → '.join(steps)}")
 
-    summary = stage1_pdf_to_loans_import()
+    summary = stage1_pdf_to_loans_import(write=do_import)
 
-    if stage not in {"2", "3"}:
+    if not (do_sbor or do_podacha):
         log("=== ГОТОВО (этап 1) ===")
         sys.exit(0)
 
@@ -767,13 +865,22 @@ if __name__ == "__main__":
         log("❌ Нет сопоставленных платежей — этапы 2–3 пропущены.")
         sys.exit(0)
 
+    # Только подача: документы уже собраны, госпошлина в отчёт берётся из PDF.
+    if do_sbor and not wait_delta_import(summary["matched"]):
+        log("❌ Сбор и подача не запущены: в исках госпошлина была бы 0. Проверьте "
+            f"автоимпорт Дельты ({LOANS_IMPORT_XLSX}) и запустите заново.")
+        sys.exit(1)
+
     report_path = stage2_build_report(summary["matched"])
     if report_path is None:
         sys.exit(1)
 
-    stage2b_run_sbor(report_path)
+    if do_sbor:
+        stage2b_run_sbor(report_path)
+    else:
+        log("⏭ Сбор документов пропущен — подача возьмёт уже собранную папку партии")
 
-    if stage == "3":
+    if do_podacha:
         rc = stage3_run_podacha(report_path)
         if rc != 0:
             log("❌ Подача иска завершилась с ошибкой — подробности в логе выше и в out/portal_sot_results.xlsx")

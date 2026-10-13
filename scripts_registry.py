@@ -241,8 +241,9 @@ SCRIPTS: Dict[str, ScriptDef] = {
                 "в WhatsApp реестр. Сопоставляет платежи с реестром по ФИО, формирует "
                 "LoansImport.xlsx в папке автоимпорта Дельты, затем тянет данные из БД "
                 "по EID в формате «Отчёта по отменам» и прогоняет сбор документов и "
-                "подачу иска. Этап: 1 — только LoansImport; 2 — + сбор; 3 — + подача "
-                "(по умолчанию 3). Подача — на portal-sot.kz, без подписи."
+                "подачу иска. В поле «Что выполнять» можно отключить импорт в Дельту "
+                "и/или сбор — например, только подать иски по уже собранной партии "
+                "(PDF и реестр нужны в любом режиме). Подача — на portal-sot.kz, без подписи."
             ),
             command=["python", "-u", "scripts/reestr_gp_import.py"],
             params=[
@@ -261,7 +262,20 @@ SCRIPTS: Dict[str, ScriptDef] = {
                     "accept": ".xlsx,.xls",
                     "save_to": "uploads/gp_reestr_input.xlsx",
                 },
-                {"name": "stage", "label": "Этап (1 / 2 / 3, по умолчанию 3)", "type": "text"},
+                {
+                    "name": "mode",
+                    "label": "Что выполнять",
+                    "type": "select",
+                    "default": "full",
+                    "options": [
+                        {"value": "full", "label": "Всё: импорт в Дельту → сбор → подача"},
+                        {"value": "no_import", "label": "Без импорта в Дельту: сбор → подача"},
+                        {"value": "podacha_only", "label": "Только подача исков (без импорта и сбора)"},
+                        {"value": "sbor_only", "label": "Только сбор документов"},
+                        {"value": "import_sbor", "label": "Импорт в Дельту → сбор (без подачи)"},
+                        {"value": "import_only", "label": "Только импорт в Дельту"},
+                    ],
+                },
             ],
         ),
 

@@ -66,6 +66,7 @@ import json
 import mimetypes
 import random
 import re
+import socket
 import time
 import traceback
 import uuid
@@ -83,8 +84,9 @@ import win32con
 import win32gui
 import win32process
 from openpyxl import Workbook, load_workbook
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -473,16 +475,23 @@ def refresh_access():
         r = requests.post(
             BASE_URL + "/api/public/auth/refresh",
             json={"refreshToken": rt},
-            headers={"Origin": BASE_URL, "Referer": BASE_URL + "/cabinet"},
+            headers={
+                "Accept": "*/*", "accept-language": "ru",
+                "User-Agent": session.headers.get("User-Agent", ""),
+                "Origin": BASE_URL, "Referer": BASE_URL + "/cabinet",
+            },
             timeout=60,
         )
         if not r.ok:
+            log(f"refresh отклонён: HTTP {r.status_code}: {r.text[:300]}", "WARNING")
             return False
         data = api_data(r.json())
-    except Exception:
+    except Exception as e:
+        log(f"refresh не удался: {type(e).__name__}: {e}", "WARNING")
         return False
     at = data.get("access_token") if isinstance(data, dict) else None
     if not at:
+        log(f"refresh не вернул access_token: {str(data)[:300]}", "WARNING")
         return False
     tokens["access_token"] = at
     tokens["refresh_token"] = data.get("refresh_token") or rt
@@ -493,14 +502,26 @@ def refresh_access():
 def ensure_token_fresh(margin=90):
     """access_token живёт ~15 мин, пачка идёт дольше. Заранее: refresh по API,
     иначе — вход заново (живая сессия SPA → без ЭЦП, иначе полный ЭЦП-вход)."""
+    global _unrenewable_exp
     exp = jwt_claims(tokens.get("access_token") or "").get("exp", 0) or 0
     if not exp or exp > time.time() + margin:
+        return
+    # Этот токен уже пробовали продлить, и портал отдал его же: не дёргаем
+    # refresh и /cabinet перед каждым запросом, работаем до самого истечения.
+    if exp == _unrenewable_exp and exp > time.time() + 5:
         return
     if refresh_access():
         log("access_token обновлён через refresh")
         return
     log("access_token истекает — обновляю сессию через браузер")
     portal_sign_in()
+    if (jwt_claims(tokens.get("access_token") or "").get("exp", 0) or 0) == exp:
+        _unrenewable_exp = exp
+        log(f"Токен продлить не удалось — работаю на нём до {datetime.fromtimestamp(exp):%H:%M:%S}, "
+            f"затем вход через ЭЦП", "WARNING")
+
+
+_unrenewable_exp = 0  # exp токена, который не удалось продлить ни refresh, ни браузером
 
 
 API_MIN_GAP_SECONDS = (1.0, 2.0)   # пауза между любыми двумя API-вызовами
@@ -753,6 +774,7 @@ def classify_case_files(folder):
 
 EXCLUDED_REGION_IDS = {18, 23, 99}
 AKTAU_CIVIL_CODE = "194711"
+BOKEIKHAN_COURT2_CODE = "193571"  # Cуд №2 района Әлихан Бөкейхан города Караганды
 LOCAL_COURTS = []
 
 
@@ -793,10 +815,29 @@ def _match_norm(v):
     s = s.split("(", 1)[0]
     s = norm_text(s)
     # Казахские варианты букв → русское написание (только для сопоставления).
-    trans = str.maketrans({"ұ": "у", "ү": "у", "қ": "к", "ғ": "г", "ң": "н", "ө": "о", "ә": "а", "і": "и"})
+    # Латинская "c" — в справочнике портала так набрано «Cуд №2 района Әлихан Бөкейхан».
+    trans = str.maketrans({"ұ": "у", "ү": "у", "қ": "к", "ғ": "г", "ң": "н", "ө": "о", "ә": "а", "і": "и",
+                           "c": "с"})
     s = s.translate(trans)
     s = re.sub(r"(?:№|nº|no|n°)\s*", "n", s, flags=re.IGNORECASE)
     return s
+
+
+def _same_word(a, b):
+    """Одно слово в разных падежах: «бокейхана» / «бокейхан»."""
+    if a == b:
+        return True
+    short, long_ = sorted((a, b), key=len)
+    return len(short) >= 5 and len(long_) - len(short) <= 2 and long_.startswith(short)
+
+
+def _court_name_matches_loosely(source, name):
+    """Название из Excel совпадает с началом названия из справочника слово в
+    слово, с допуском на падежное окончание. Лишние слова в справочнике — только
+    в хвосте («… Карагандинской области»), поэтому «Суд №2 района …» не подойдёт
+    к «Суд района …»."""
+    src, cand = source.split(), name.split()
+    return bool(src) and len(src) <= len(cand) and all(_same_word(s, c) for s, c in zip(src, cand))
 
 
 def load_local_courts(courts_file):
@@ -856,12 +897,26 @@ def resolve_court(region_name, court_name):
         log(f"СУД АКТАУ: {court['NAME']} | CODE={court['CODE']}")
         return {"ID": court["REGION_ID"], "VALUE_RU": court["REGION"]}, court
 
+    # Район Әлихан Бөкейхан (Караганда): иски подаём в суд №2, даже если в Excel
+    # указан «Суд района …» без номера.
+    if nr == _match_norm("Карагандинская область") and "бокейхан" in source:
+        hits = [c for c in region_rows if c["CODE"] == BOKEIKHAN_COURT2_CODE]
+        if len(hits) != 1:
+            raise CourtDataError(f"В справочнике не найден суд №2 района Әлихан Бөкейхан "
+                                 f"CODE={BOKEIKHAN_COURT2_CODE}")
+        court = hits[0]
+        log(f"СУД БӨКЕЙХАН: {court['NAME']} | CODE={court['CODE']}")
+        return {"ID": court["REGION_ID"], "VALUE_RU": court["REGION"]}, court
+
     # 1) Полное совпадение названия без специализации.
     exact = [c for c in region_rows if _match_norm(c["NAME"]) == source]
     # 2) В старом Excel название иногда короче: без "... области".
     if not exact:
         exact = [c for c in region_rows
                  if source and (source in _match_norm(c["NAME"]) or _match_norm(c["NAME"]) in source)]
+    # 3) То же название, но слово в другом падеже («Бөкейхана» / «Бөкейхан»).
+    if not exact:
+        exact = [c for c in region_rows if _court_name_matches_loosely(source, _match_norm(c["NAME"]))]
 
     priority = {"civil": 0, "general": 1, "mixed": 2, "other": 3}
     exact.sort(key=lambda c: priority.get(_court_kind(c["NAME"]), 99))
@@ -1269,13 +1324,26 @@ def trusted_paste(name, value, label):
     _send_ctrl_combo(_VK_V, label)
 
     expected = len(value)
-    state = {}
-    deadline = time.time() + 5
-    while time.time() < deadline:
-        time.sleep(0.4)
-        state = _blank_field_state(name)
-        if state["valueLen"] == state["reactLen"] == state["trackerLen"] == expected:
-            break
+
+    def wait_pasted():
+        state = {}
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            time.sleep(0.4)
+            state = _blank_field_state(name)
+            if state["valueLen"] == state["reactLen"] == state["trackerLen"] == expected:
+                break
+        return state
+
+    state = wait_pasted()
+    if state["valueLen"] == 0:
+        # Нажатия с клавиатуры Windows не дошли до браузера (свёрнутый/отключённый
+        # RDP-сеанс, другое окно перехватило ввод) — те же Ctrl+A, Ctrl+V через драйвер.
+        log(f"{label}: {name} — вставка с клавиатуры Windows не дошла до поля, повтор через драйвер", "WARNING")
+        el.send_keys(Keys.CONTROL, "a")
+        time.sleep(0.15)
+        el.send_keys(Keys.CONTROL, "v")
+        state = wait_pasted()
     log(f"{label}: ВСТАВКА {name} | DOM={state['valueLen']} | React={state['reactLen']} | tracker={state['trackerLen']}")
     if not (state["valueLen"] == state["reactLen"] == state["trackerLen"] == expected):
         raise RuntimeError(f"{label}: {name} — вставилось не то: ожидалось {expected} символов, получено {state}")
@@ -1588,6 +1656,46 @@ def _is_data_error(e):
     return isinstance(e, (FileNotFoundError, ValueError, DraftStuckError))
 
 
+def _is_network_error(e):
+    """portal-sot.kz не отвечает по сети (requests или страница ошибки Firefox)."""
+    for _ in range(5):
+        if e is None:
+            break
+        if isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return True
+        if isinstance(e, WebDriverException) and "about:neterror" in str(e):
+            return True
+        e = e.__cause__
+    return False
+
+
+PORTAL_WAIT_MAX_SECONDS = 30 * 60
+PORTAL_WAIT_STEP_SECONDS = 60
+
+
+def wait_portal_online():
+    """Ждёт, пока portal-sot.kz снова начнёт принимать соединения (только TCP,
+    без запросов к порталу). False — не дождались за PORTAL_WAIT_MAX_SECONDS."""
+    host = BASE_URL.split("://", 1)[1]
+    deadline = time.time() + PORTAL_WAIT_MAX_SECONDS
+    waited = False
+    while True:
+        try:
+            socket.create_connection((host, 443), timeout=10).close()
+            if waited:
+                log("portal-sot.kz снова отвечает — продолжаю")
+            return True
+        except OSError:
+            pass
+        if time.time() >= deadline:
+            return False
+        if not waited:
+            log(f"portal-sot.kz не отвечает — жду до {PORTAL_WAIT_MAX_SECONDS // 60} мин., "
+                f"проверка раз в {PORTAL_WAIT_STEP_SECONDS} сек.", "WARNING")
+            waited = True
+        time.sleep(PORTAL_WAIT_STEP_SECONDS)
+
+
 def log_skipped(skipped):
     if not skipped:
         return
@@ -1696,6 +1804,10 @@ def main():
         write_results([], [], [], skipped)
         raise RuntimeError("Нет строк с полным комплектом документов — подавать нечего")
 
+    if not wait_portal_online():
+        raise RuntimeError(f"portal-sot.kz недоступен больше {PORTAL_WAIT_MAX_SECONDS // 60} мин. — "
+                           f"вход не выполнялся, запустите позже")
+
     global _lock
     _lock = portal_lock(log)
     _lock.acquire()  # другой скрипт уже на portal-sot.kz → ждём его
@@ -1783,6 +1895,15 @@ def main():
                         "ERROR")
                     break
 
+                network_error = _is_network_error(e)
+                if network_error and not wait_portal_online():
+                    errors.append((excel_row, fio, iin, f"{type(e).__name__}: {e}"))
+                    stop_row = excel_row
+                    log(f"СТОП ВСЕЙ ПАЧКИ на Excel строке {excel_row}: portal-sot.kz недоступен "
+                        f"больше {PORTAL_WAIT_MAX_SECONDS // 60} мин. Черновик сохранён, "
+                        f"повторный запуск продолжит его.", "ERROR")
+                    break
+
                 if row_attempt >= MAX_ROW_ATTEMPTS:
                     errors.append((excel_row, fio, iin, f"{type(e).__name__}: {e}"))
                     stop_row = excel_row
@@ -1790,7 +1911,8 @@ def main():
                         f"step=sign после {MAX_ROW_ATTEMPTS} попыток.", "ERROR")
                     break
 
-                if row_attempt > 1:
+                # Сеть легла — вход через ЭЦП не поможет, лимит входов не тратим.
+                if row_attempt > 1 and not network_error:
                     log(f"Excel строка {excel_row} всё ещё не завершена. Повторный вход и снова ЭТА ЖЕ сделка.")
                     try:
                         force_relogin_portal()
