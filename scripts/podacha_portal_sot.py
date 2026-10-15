@@ -565,9 +565,20 @@ def api_request(method, path, **kwargs):
     url = path if path.startswith("http") else BASE_URL + path
     r = _send(method, url, **kwargs)
     if r.status_code == 401:
+        rejected = tokens.get("access_token")
         if not refresh_access():
             log("HTTP 401 — обновляю сессию через браузер")
             portal_sign_in()
+            if tokens.get("access_token") == rejected:
+                # В браузере лежит тот же токен, который портал только что отверг
+                # (сессия закрыта на стороне портала) — поможет только вход через ЭЦП.
+                _full_eds_login("портал отверг токен, в браузере он же")
+        # файлы в multipart надо перемотать, иначе повтор уйдёт пустым
+        for f in (kwargs.get("files") or {}).values():
+            try:
+                f[1].seek(0)
+            except Exception:
+                pass
         r = _send(method, url, **kwargs)
     if not r.ok:
         raise RuntimeError(f"{method} {url} -> HTTP {r.status_code}: {r.text[:1000]}")
@@ -600,21 +611,27 @@ _full_relogins = 0
 def force_relogin_portal():
     """Сначала — обновление токена по API (без ЭЦП). Полный вход через ЭЦП —
     только если refresh не сработал, и не больше MAX_FULL_RELOGINS раз за прогон."""
-    global _full_relogins
     if refresh_access():
         check_org()
         log("ПОВТОРНЫЙ ВХОД не понадобился: токен обновлён через refresh — OK")
         return
+    _full_eds_login("refresh не сработал")
+    check_org()
+    log("ПОВТОРНЫЙ ВХОД: кабинет и API снова авторизованы — OK")
+
+
+def _full_eds_login(reason):
+    """Сброс web-сессии и вход через ЭЦП, не больше MAX_FULL_RELOGINS раз за прогон."""
+    global _full_relogins
     if _full_relogins >= MAX_FULL_RELOGINS:
         raise PortalBlocked(
             f"уже было {MAX_FULL_RELOGINS} полных входа через ЭЦП за прогон — "
             f"пачка остановлена, чтобы не вызвать блокировку"
         )
     _full_relogins += 1
-    log(f"ПОВТОРНЫЙ ВХОД ({_full_relogins}/{MAX_FULL_RELOGINS}): сбрасываю web-сессию portal-sot и вхожу через ЭЦП...")
+    log(f"ПОВТОРНЫЙ ВХОД ({_full_relogins}/{MAX_FULL_RELOGINS}, {reason}): "
+        f"сбрасываю web-сессию portal-sot и вхожу через ЭЦП...")
     portal_sign_in(force_fresh=True)
-    check_org()
-    log("ПОВТОРНЫЙ ВХОД: кабинет и API снова авторизованы — OK")
 
 
 # ============================================================
@@ -1631,9 +1648,13 @@ def run_one(row):
             f"остался только проход 2 («Мои дела»).")
 
     # 4. Проход 2: «Мои дела» → «Ожидается отправка» → тот же черновик → текст ещё раз.
-    #    После этой вставки портал текст сохраняет сам; второй «Следующий шаг» не нужен.
+    #    На сервер текст ушёл ещё в проходе 1 («Следующий шаг»). Поля же портал
+    #    заполняет только из localStorage браузера (ключ wizard_form_<тип>_<id>_blank),
+    #    с сервера не подтягивает. Эта вставка кладёт текст в localStorage профиля
+    #    скрипта — в другом браузере/на другом ПК поля черновика будут пустыми.
     open_draft_from_my_cases(declaration_id)
     paste_both_fields(claim_text, "ПРОХОД 2")
+    time.sleep(1.5)  # портал пишет поля в localStorage браузера с задержкой
     reg("READY_TO_SIGN", REG_STAGE_DONE)
 
     # 5. НЕ ПОДПИСЫВАЕМ И НЕ ОТПРАВЛЯЕМ.

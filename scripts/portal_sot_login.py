@@ -248,7 +248,19 @@ class PortalSotLogin:
         try:
             driver.get(BASE_URL + "/")
             time.sleep(1)
-            driver.execute_script("try{localStorage.clear()}catch(e){} try{sessionStorage.clear()}catch(e){}")
+            # wizard_form_* — тексты исков в черновиках: портал держит их только в
+            # localStorage, после очистки поля уже подготовленных исков стали бы пустыми.
+            driver.execute_script("""
+                const keep = {};
+                try {
+                  for (let i = 0; i < localStorage.length; i++) {
+                    const k = localStorage.key(i);
+                    if (k && k.startsWith('wizard_form_')) keep[k] = localStorage.getItem(k);
+                  }
+                } catch(e) {}
+                try{localStorage.clear()}catch(e){} try{sessionStorage.clear()}catch(e){}
+                try { for (const k in keep) localStorage.setItem(k, keep[k]); } catch(e) {}
+            """)
             driver.delete_all_cookies()
         except Exception:
             pass
