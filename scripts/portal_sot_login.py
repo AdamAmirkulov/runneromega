@@ -384,9 +384,12 @@ def _http_login(company_id, cfg, log):
                    for c in getattr(session.cookies, "jar", session.cookies)]
     except Exception:
         cookies = []
-    # user_agent пустой: дальше PortalSotHttp ходит обычным requests со своим UA
+    # user_agent пустой: у requests свой UA, curl_cffi подставляет UA своего
+    # отпечатка. transport — тот, что прошёл WAF при входе, PortalSotHttp
+    # продолжит через него же.
+    transport = "curl_cffi" if type(session).__module__.startswith("curl_cffi") else "requests"
     return {"access_token": access, "refresh_token": refresh,
-            "cookies": cookies, "user_agent": ""}
+            "cookies": cookies, "user_agent": "", "transport": transport}
 
 
 def _browser_login(company_id, cfg, log, dump_dir, browser):

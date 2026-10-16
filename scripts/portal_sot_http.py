@@ -28,6 +28,11 @@ from pathlib import Path
 
 import requests
 
+try:
+    from curl_cffi import requests as cf_requests
+except ImportError:
+    cf_requests = None
+
 PORTAL_SOT_BASE = "https://portal-sot.kz"
 
 TOKEN_DIR = Path(__file__).resolve().parent.parent / "data" / "portal_sot_tokens"
@@ -40,6 +45,13 @@ LONG_PAUSE_SECONDS = (30.0, 60.0)   # ... передышка
 BACKOFF_429_5XX = (60, 180, 600)    # ожидания при 429/5xx; после последнего — стоп
 MAX_REQUESTS_PER_RUN = 3000         # предохранитель на один запуск
 MAX_BROWSER_LOGINS_PER_RUN = 3      # входов по ЭЦП за запуск; больше — портал явно не пускает
+
+# HTTP-транспорты. WAF portal-sot.kz то режет обычный requests и пропускает
+# curl_cffi с отпечатком Firefox, то наоборот (2026-10-06 и 2026-10-16). Поэтому
+# транспорт, через который прошёл вход, запоминается в токенах, а на 403 от WAF
+# один раз пробуем второй и только потом считаем это блокировкой.
+CF_IMPERSONATE = "firefox135"       # тот же профиль, что portal_sot_auth.IMPERSONATE
+TRANSPORTS = ("requests", "curl_cffi") if cf_requests is not None else ("requests",)
 
 
 class PortalBlocked(RuntimeError):
@@ -156,13 +168,37 @@ class PortalSotHttp:
         tmp.write_text(json.dumps(self.tokens, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self.token_path)
 
-    def _build_session(self):
+    # ---------- транспорт ----------
+    @property
+    def transport(self):
+        t = self.tokens.get("transport")
+        return t if t in TRANSPORTS else TRANSPORTS[0]
+
+    def _new_http(self):
+        if self.transport == "curl_cffi":
+            return cf_requests.Session(impersonate=CF_IMPERSONATE)
         s = requests.Session()
+        s.headers["Accept-Encoding"] = "gzip, deflate"
+        return s
+
+    def _switch_transport(self) -> bool:
+        """403 от WAF: перейти на второй транспорт. False — переключаться некуда."""
+        others = [t for t in TRANSPORTS if t != self.transport]
+        if not others:
+            return False
+        self.log(f"⚠ portal-sot.kz: 403 от WAF на {self.transport} — пробую {others[0]}")
+        self.tokens["transport"] = others[0]
+        self._save_tokens()
+        if self.tokens.get("access_token"):
+            self._build_session()
+        return True
+
+    def _build_session(self):
+        s = self._new_http()
         s.headers.update({
             "Authorization": f"Bearer {self.tokens['access_token']}",
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "ru",
-            "Accept-Encoding": "gzip, deflate",
             "Origin": PORTAL_SOT_BASE,
             "Referer": PORTAL_SOT_BASE + "/",
         })
@@ -191,18 +227,24 @@ class PortalSotHttp:
 
     def _refresh(self) -> bool:
         """POST /api/public/auth/refresh — без браузера и без ЭЦП."""
-        self._throttle()
+        switched = False
         try:
-            r = requests.post(
-                PORTAL_SOT_BASE + "/api/public/auth/refresh",
-                json={"refreshToken": self.tokens.get("refresh_token", "")},
-                headers={
-                    "Accept": "*/*", "Accept-Language": "ru",
-                    "Origin": PORTAL_SOT_BASE, "Referer": PORTAL_SOT_BASE + "/cabinet",
-                    **({"User-Agent": self.tokens["user_agent"]} if self.tokens.get("user_agent") else {}),
-                },
-                timeout=30,
-            )
+            while True:
+                self._throttle()
+                r = self._new_http().post(
+                    PORTAL_SOT_BASE + "/api/public/auth/refresh",
+                    json={"refreshToken": self.tokens.get("refresh_token", "")},
+                    headers={
+                        "Accept": "*/*", "Accept-Language": "ru",
+                        "Origin": PORTAL_SOT_BASE, "Referer": PORTAL_SOT_BASE + "/cabinet",
+                        **({"User-Agent": self.tokens["user_agent"]} if self.tokens.get("user_agent") else {}),
+                    },
+                    timeout=30,
+                )
+                if is_waf_block(r) and not switched and self._switch_transport():
+                    switched = True
+                    continue
+                break
             js = r.json()
         except Exception as e:
             self.log(f"⚠ portal-sot.kz refresh не удался: {e}")
@@ -234,6 +276,9 @@ class PortalSotHttp:
             "refresh_token": got.get("refresh_token") or "",
             "cookies": got.get("cookies") or [],
             "user_agent": got.get("user_agent") or "",
+            # вход без браузера сообщает, какой транспорт прошёл WAF; после
+            # входа браузером оставляем тот, что работал раньше
+            "transport": got.get("transport") or self.tokens.get("transport") or "",
             "saved_at": time.time(),
         }
         self._save_tokens()
@@ -279,6 +324,7 @@ class PortalSotHttp:
         if _jwt_exp(self.tokens.get("access_token", "")) < time.time() + 30:
             self.renew()
         renew_stage = 0   # 0 — ещё не обновляли, 1 — был refresh, 2 — был вход по ЭЦП
+        switched = False  # второй транспорт после 403 от WAF уже пробовали
         backoff = list(backoff)
         while True:
             self._throttle()
@@ -299,6 +345,9 @@ class PortalSotHttp:
                 )
 
             if is_waf_block(r):
+                if not switched and self._switch_transport():
+                    switched = True
+                    continue
                 raise PortalBlocked(BLOCK_MESSAGE)
 
             if r.status_code == 429 or r.status_code >= 500:
