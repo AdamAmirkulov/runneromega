@@ -247,6 +247,11 @@ def load_tickets_from_db():
 
     norm = norm_ticket
 
+    # Исходный талон из CRM (с буквой, напр. 191166A00216174) — он идёт в итоговый
+    # файл; цифровой ключ в «Номер талона в СК» — только для сопоставления и поиска.
+    df_source["_ticket_raw"] = df_source["Номер талона в СК"].apply(
+        lambda v: re.sub(r"\s+", "", str(v or "").replace("\xa0", " "))
+    )
     df_source["Номер талона в СК"] = df_source["Номер талона в СК"].apply(norm)
     df_source = df_source.drop_duplicates(
         subset=["Уникальный номер", "Номер талона в СК"]
@@ -1442,22 +1447,18 @@ def build_final_dataframe(df_source, parsed_by_ticket):
 
     for _, src_row in df_source.iterrows():
         unique_number = src_row["Уникальный номер"]
-        ticket = re.sub(
-            r"\D+",
-            "",
-            str(src_row["Номер талона в СК"]).replace("\xa0", " ").strip()
-        )
+        ticket = norm_ticket(src_row["Номер талона в СК"])
+        ticket_raw = src_row.get("_ticket_raw") or ticket
 
         base = parsed_by_ticket.get(ticket)
 
         if base is None:
             d = create_dict_for_table()
-            d["ticket_number"] = ticket
             d["number_case"] = ""
             d["list_defendants"] = [create_dict_defendant()]
         else:
             d = deepcopy(base)
-            d["ticket_number"] = ticket
+        d["ticket_number"] = ticket_raw
 
         d["Уникальный номер"] = unique_number
         list_dicts_cases.append(d)
