@@ -489,7 +489,7 @@ body { font-family: Arial; max-width: 1400px; margin: 20px auto; padding: 0 20px
     </thead>
     <tbody>
     {% for s in scripts %}
-      {% if s.key in ['ogranichenie', 'otmeny', 'status' , 'sud', 'sudFIO', 'sud_download_mediation', 'reestr_gosposhliny'] %}
+      {% if s.key in ['ogranichenie', 'otmeny', 'otmeny_include_f235', 'status' , 'sud', 'sudFIO', 'sud_download_mediation', 'reestr_gosposhliny'] %}
       <tr>
         <td>
           <div class="script-name">{{ s.title }}</div>
@@ -1975,9 +1975,14 @@ def execute_job(job_id: str):
             lf.write(f"STARTED: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             lf.flush()
 
+            # stdout/stderr скрипта идут прямо в logs.txt (UTF-8); без
+            # PYTHONIOENCODING stderr пишется в cp1251, и в логе вместо
+            # кириллицы (пути, тексты ошибок Windows, tqdm) — «�����».
+            child_env = dict(os.environ, PYTHONIOENCODING="utf-8")
             p = subprocess.Popen(
                 cmd, stdout=lf, stderr=lf, cwd=str(BASE_DIR),
                 text=True, encoding="utf-8", errors="replace",
+                env=child_env,
             )
             PROCESSES[job_id] = p
             rc = p.wait()
@@ -2320,6 +2325,9 @@ MAILINGS_LIST_HTML = """
     <td>{% if m.schedule_enabled %}{{ '%02d:%02d' % (m.schedule_hour or 0, m.schedule_minute or 0) }}{% else %}—{% endif %}</td>
     <td>{% if m.is_active %}<span style="color:#28a745;">вкл</span>{% else %}<span style="color:#6c757d;">выкл</span>{% endif %}</td>
     <td style="white-space:nowrap;">
+      <form method="post" action="/admin/mailings/{{ m.id }}/check" style="display:inline;">
+        <button class="btn b-test" style="background:#17a2b8;" title="Прогнать всю рассылку без отправки писем: журнал + вложения в результате" onclick="return confirm('Проверить рассылку целиком БЕЗ отправки писем?')">Проверка</button>
+      </form>
       <form method="post" action="/admin/mailings/{{ m.id }}/test" style="display:inline;">
         <button class="btn b-test" onclick="return confirm('Отправить ТЕСТОВОЕ письмо на {{ m.test_email or 'адрес из рассылки' }}?')">Тест</button>
       </form>
@@ -2759,6 +2767,17 @@ def mailing_test(mailing_id: int, current_user: User = Depends(get_admin_user)):
     if not m:
         return HTMLResponse("Рассылка не найдена", status_code=404)
     _enqueue_mailing_job(m, "test", getattr(current_user, "username", "—"))
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/admin/mailings/{mailing_id}/check")
+def mailing_check(mailing_id: int, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    _enqueue_mailing_job(m, "check", getattr(current_user, "username", "—"))
     return RedirectResponse("/", status_code=303)
 
 

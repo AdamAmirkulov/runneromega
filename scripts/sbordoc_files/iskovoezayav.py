@@ -165,7 +165,8 @@ JOIN states    s             ON s.ID = l.State
 JOIN Dictionary dF246        ON dF246.ID = l.F246
 JOIN Constants constF234     ON constF234.ID = l.F234
 LEFT JOIN Constants constF235 ON constF235.ID = l.F235
-JOIN      Constants constF236 ON constF236.ID = l.F236
+-- LEFT: у новых займов статус АИС ОИП (F236) бывает пустым — иначе они выпадают
+LEFT JOIN Constants constF236 ON constF236.ID = l.F236
 LEFT JOIN LoanCounts lc        ON c.F293 = lc.ИИН
 LEFT JOIN addresses a (NOLOCK)
        ON a.CID = l.CID

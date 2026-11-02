@@ -46,7 +46,24 @@ SCRIPTS: Dict[str, ScriptDef] = {
             {"name": "password", "label": "Пароль системы", "type": "password"},
         ],
     ),
-    
+
+    "otmeny_include_f235": ScriptDef(
+        key="otmeny_include_f235",
+        title="🔄 АИС ОИП - Отмены (без условия F235)",
+        description=(
+            "То же, что «АИС ОИП - Отмены», но без условия F235 IS NULL: "
+            "проверяются и займы с заполненным F235."
+        ),
+        command=["python", "-u", "scripts/otmeny.py", "--include_f235"],
+        params=[
+            {"name": "company_id", "label": "Компания", "type": "select"},
+            {"name": "date_from", "label": "Дата с", "type": "date"},
+            {"name": "date_to", "label": "Дата по", "type": "date"},
+            {"name": "login", "label": "Логин системы", "type": "text"},
+            {"name": "password", "label": "Пароль системы", "type": "password"},
+        ],
+    ),
+
     "ogranichenie": ScriptDef(
         key="ogranichenie",
         title="🔍АИС ОИП - Ограничение на выезд",
@@ -71,8 +88,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         title="⚖️ Выгрузка с СК",
         description=(
             "Выгрузка статусов дел из Судебного кабинета по талонам компании: "
-            "новый портал portal-sot.kz (вход по ЭЦП) + старый office.sud.kz "
-            "для талонов, которых нет на новом"
+            "только portal-sot.kz (вход по ЭЦП); старый office.sud.kz отключён"
         ),
         command=["python", "-u", "scripts/sud.py"],
         params=[
@@ -533,7 +549,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
         params=[
             {"name": "company_id", "label": "Компания", "type": "select"},
             {"name": "mailing_id", "label": "ID рассылки", "type": "text"},
-            {"name": "mode", "label": "Режим (test/real)", "type": "text"},
+            {"name": "mode", "label": "Режим (check/test/real)", "type": "text"},
         ],
     ),
 }

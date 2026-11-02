@@ -6,7 +6,7 @@
 исполнитель, который раннер запускает подпроцессом:
 
     python -u scripts/mailing_send.py --workdir <dir> --company_id <id[,id2,...]>
-                                      --mailing_id <id> --mode <test|real>
+                                      --mailing_id <id> --mode <check|test|real>
 
 --company_id может быть списком через запятую (мульти-компанийная рассылка,
 mailing.company_id_list() в database.py) — тогда весь цикл (SQL с подстановкой
@@ -24,6 +24,9 @@ mailing.company_id_list() в database.py) — тогда весь цикл (SQL 
      в xlsx-вложении. Тема/тело — из рассылки, с автоподстановками.
 
 Режимы:
+  * check — ПРОВЕРКА без отправки: весь боевой цикл (SQL, группировка, поиск
+    email в справочнике, вложения), но письма не уходят. Журнал показывает,
+    кому что ушло бы; вложения лежат в out/ — их можно открыть и проверить;
   * real — реальная отправка каждому ЧСИ (+ BCC из рассылки и из config);
   * test — одно письмо на test_email по данным ПЕРВОЙ группы, тема «[ТЕСТ] …»,
     реальные адреса ЧСИ не затрагиваются.
@@ -66,7 +69,7 @@ def _parse_args():
     p.add_argument("--workdir", default=None)
     p.add_argument("--company_id", default=None)
     p.add_argument("--mailing_id", default=None)
-    p.add_argument("--mode", default="test", choices=["test", "real"])
+    p.add_argument("--mode", default="test", choices=["check", "test", "real"])
     p.add_argument("--test_email", default=None)
     return p.parse_args()
 
@@ -294,14 +297,17 @@ def run_for_company(cid: str, mailing, base_sql: str):
         print(f"✉️  [{company_name}] ТЕСТ → {test_to} (данные ЧСИ «{fio}», строк {len(gdf)})", flush=True)
         try:
             send_one(smtp_cfg, test_to, [], subject, body, attach_path)
-            journal.append((company_name, fio, test_to, "ОК (тест)", len(gdf), ""))
+            journal.append((company_name, fio, test_to, "ОК (тест)", len(gdf), "", subject))
             print("✅ Тестовое письмо отправлено", flush=True)
         except Exception as e:
-            journal.append((company_name, fio, test_to, "Ошибка", len(gdf), str(e)))
+            journal.append((company_name, fio, test_to, "Ошибка", len(gdf), str(e), subject))
             print(f"❌ Ошибка отправки: {e}", flush=True)
         return journal
 
-    # ── БОЕВОЙ РЕЖИМ ─────────────────────────────────────────
+    # ── БОЕВОЙ РЕЖИМ / ПРОВЕРКА (check — то же самое, но без отправки) ──
+    dry = MODE == "check"
+    if dry:
+        print(f"🔍 [{company_name}] РЕЖИМ ПРОВЕРКИ — письма НЕ отправляются", flush=True)
     bcc_list = _split_emails(mailing.bcc) + _split_emails(smtp_cfg.get("bcc"))
     bcc_list = list(dict.fromkeys(bcc_list))  # уникальные, порядок сохранён
     if bcc_list:
@@ -313,7 +319,7 @@ def run_for_company(cid: str, mailing, base_sql: str):
         rec = fio_to_email.get(key)
         if not rec:
             skipped += 1
-            journal.append((company_name, fio, "", "Без email", len(gdf), "нет в справочнике ЧСИ"))
+            journal.append((company_name, fio, "", "Без email", len(gdf), "нет в справочнике ЧСИ", ""))
             print(f"[{company_name} {i}/{len(groups)}] ⏭  {fio} — нет email в справочнике", flush=True)
             continue
 
@@ -327,20 +333,27 @@ def run_for_company(cid: str, mailing, base_sql: str):
             attach_path = OUT_DIR / (safe_filename(f"{company_name}_{fio}") + ".xlsx")
             build_attachment(attach_path, gdf.columns, gdf.itertuples(index=False, name=None))
 
+        if dry:
+            sent += 1
+            journal.append((company_name, fio, to_email, "Будет отправлено", len(gdf), "", subject))
+            print(f"[{company_name} {i}/{len(groups)}] 🔍 {fio} → {to_email} (строк {len(gdf)})", flush=True)
+            continue
+
         try:
             send_one(smtp_cfg, to_email, bcc_list, subject, body, attach_path)
             sent += 1
-            journal.append((company_name, fio, to_email, "ОК", len(gdf), ""))
+            journal.append((company_name, fio, to_email, "ОК", len(gdf), "", subject))
             print(f"[{company_name} {i}/{len(groups)}] ✅ {fio} → {to_email}", flush=True)
         except Exception as e:
             errors += 1
-            journal.append((company_name, fio, to_email, "Ошибка", len(gdf), str(e)))
+            journal.append((company_name, fio, to_email, "Ошибка", len(gdf), str(e), subject))
             print(f"[{company_name} {i}/{len(groups)}] ❌ {fio} → {to_email} | {e}", flush=True)
         finally:
             if delay and i < len(groups):
                 time.sleep(delay)
 
-    print(f"=== ИТОГ [{company_name}] === отправлено: {sent} | без email: {skipped} | ошибок: {errors}", flush=True)
+    sent_label = "будет отправлено" if dry else "отправлено"
+    print(f"=== ИТОГ [{company_name}] === {sent_label}: {sent} | без email: {skipped} | ошибок: {errors}", flush=True)
     return journal
 
 
@@ -376,11 +389,12 @@ def _split_emails(s):
 
 
 def write_journal(mailing, journal):
-    path = OUT_DIR / f"Рассылка_{safe_filename(mailing.name)}_{datetime.now():%Y%m%d_%H%M}.xlsx"
+    prefix = "ПРОВЕРКА_Рассылка" if MODE == "check" else "Рассылка"
+    path = OUT_DIR / f"{prefix}_{safe_filename(mailing.name)}_{datetime.now():%Y%m%d_%H%M}.xlsx"
     wb = Workbook()
     ws = wb.active
     ws.title = "Журнал"
-    ws.append(["Компания", "ЧСИ", "Email", "Статус", "Строк", "Ошибка"])
+    ws.append(["Компания", "ЧСИ", "Email", "Статус", "Строк", "Ошибка", "Тема письма"])
     for row in journal:
         ws.append(list(row))
     wb.save(path)

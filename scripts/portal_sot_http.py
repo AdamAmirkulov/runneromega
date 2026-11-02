@@ -29,9 +29,9 @@ from pathlib import Path
 import requests
 
 try:
-    from curl_cffi import requests as cf_requests
+    from curl_cffi import requests as cf_requests, CurlMime
 except ImportError:
-    cf_requests = None
+    cf_requests = CurlMime = None
 
 PORTAL_SOT_BASE = "https://portal-sot.kz"
 
@@ -315,6 +315,26 @@ class PortalSotHttp:
         """POST с теми же правилами, что и get()."""
         return self.request("POST", url, **kwargs)
 
+    def _send(self, method, url, kwargs):
+        """curl_cffi не принимает files= (NotImplementedError) — для него файлы
+        собираются в CurlMime. MIME строится заново на каждую попытку: после
+        401/5xx запрос повторяется."""
+        files = kwargs.get("files")
+        if not files or self.transport != "curl_cffi":
+            return self.session.request(method, url, **kwargs)
+        mp = CurlMime()
+        for field, f in files.items():
+            filename, content, ctype = (tuple(f) + (None, None))[:3]
+            if hasattr(content, "read"):
+                content = content.read()
+            mp.addpart(name=field, filename=filename,
+                       content_type=ctype or "application/octet-stream", data=content)
+        try:
+            rest = {k: v for k, v in kwargs.items() if k != "files"}
+            return self.session.request(method, url, multipart=mp, **rest)
+        finally:
+            mp.close()
+
     def request(self, method, url, backoff=BACKOFF_429_5XX, **kwargs):
         """backoff — ожидания при 429/5xx. Свой короткий список нужен там, где
         5xx — обычный ответ на конкретный объект, а не признак перегрузки."""
@@ -328,7 +348,7 @@ class PortalSotHttp:
         backoff = list(backoff)
         while True:
             self._throttle()
-            r = self.session.request(method, url, **kwargs)
+            r = self._send(method, url, kwargs)
 
             if r.status_code == 401:
                 if renew_stage == 0:

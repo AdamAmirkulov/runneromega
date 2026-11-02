@@ -2582,14 +2582,16 @@ def fill_courts_column():
 # ========= БЛОК 6: формирование ProcessImport.xlsx =========
 PROCESS_IMPORT_HEADERS = [
     'Уникальный номер сделки',
+    'Номер талона в СК',
     'Дата подачи заявления на выписку ИЛ',
     'Дата получения ИЛ',
     'Дата передачи ИЛ ЧСИ',
     'Комментарии по суду',
-    'Дата подачи заявления на выдазу СП',
+    'Дата подачи заявления на выдачу СП',
     'Дата получения СП',
     'Дата передачи СП ЧСИ',
     'Комментарий',
+    'Номер талона письма ЕПСО',
     'Представитель истца',
     'Номер судебного дела',
     'Судебный орган',
@@ -2613,6 +2615,11 @@ PROCESS_IMPORT_HEADERS = [
     'Тип процесса',
     'Статус процесса',
 ]
+
+def _pi_col(header):
+    """Номер колонки (с 1) в ProcessImport по заголовку."""
+    return PROCESS_IMPORT_HEADERS.index(header) + 1
+
 
 def create_process_import_file():
     """
@@ -2698,10 +2705,11 @@ def create_process_import_file():
         else:
             court_value = default_court
 
-        ws_out.cell(row=out_row, column=1,  value=uniq_val)      # A "Уникальный номер сделки"
-        ws_out.cell(row=out_row, column=12, value=court_value)   # L "Судебный орган"
-        ws_out.cell(row=out_row, column=30, value="1. Упрощённое производство")  # AD "Тип процесса"
-        ws_out.cell(row=out_row, column=31, value="Рассмотрение дела")          # AE "Статус процесса"
+        # номера колонок берём по заголовкам, чтобы не сдвигались при смене шаблона
+        ws_out.cell(row=out_row, column=_pi_col('Уникальный номер сделки'), value=uniq_val)
+        ws_out.cell(row=out_row, column=_pi_col('Судебный орган'), value=court_value)
+        ws_out.cell(row=out_row, column=_pi_col('Тип процесса'), value="1. Упрощённое производство")
+        ws_out.cell(row=out_row, column=_pi_col('Статус процесса'), value="Рассмотрение дела")
 
         out_row += 1
 

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Выгрузка из Судебного кабинета — оба портала в один processimport.xlsx.
+Выгрузка из Судебного кабинета в processimport.xlsx — только portal-sot.kz.
+Старый портал office.sud.kz отключён (main() его не вызывает; код ниже
+оставлен на случай возврата).
 
 1) НОВЫЙ портал portal-sot.kz (JSON API). Портировано из ноутбука
    PORTAL_SOT_Vygruzka_Statusov.ipynb (ONECLICK v9): все отправленные талоны
@@ -11,7 +13,6 @@
    Vigruzka_SK_po_Talony_HTTP_API_v2_FINAL.ipynb, логика без изменений.
    Сюда идут только талоны из SQL_QUERY, которых НЕТ на новом портале.
 
-Порталы независимы: если один недоступен, в файл попадают данные второго.
 Selenium нужен только для входа; все талоны обрабатываются HTTP-запросами.
 """
 
@@ -241,6 +242,16 @@ def norm_ticket(v):
     return re.sub(r"\D+", "", str(v).replace("\xa0", " ").strip())
 
 
+def restore_ticket_letter(v):
+    """Талон для итогового файла: 19111000798669 -> 191110A00798669.
+    Все талоны с буквой имеют вид 6 цифр + A + 8 цифр; в CRM часть из них
+    внесена вручную без буквы (14 цифр) — букву возвращаем на место."""
+    s = re.sub(r"\s+", "", str(v or "").replace("\xa0", " "))
+    if re.fullmatch(r"\d{14}", s):
+        return s[:6] + "A" + s[6:]
+    return s
+
+
 def load_tickets_from_db():
     print("Подключение к БД...")
     df_source = read_sql_from_db(SQL_QUERY)
@@ -249,9 +260,7 @@ def load_tickets_from_db():
 
     # Исходный талон из CRM (с буквой, напр. 191166A00216174) — он идёт в итоговый
     # файл; цифровой ключ в «Номер талона в СК» — только для сопоставления и поиска.
-    df_source["_ticket_raw"] = df_source["Номер талона в СК"].apply(
-        lambda v: re.sub(r"\s+", "", str(v or "").replace("\xa0", " "))
-    )
+    df_source["_ticket_raw"] = df_source["Номер талона в СК"].apply(restore_ticket_letter)
     df_source["Номер талона в СК"] = df_source["Номер талона в СК"].apply(norm)
     df_source = df_source.drop_duplicates(
         subset=["Уникальный номер", "Номер талона в СК"]
@@ -1384,7 +1393,7 @@ def get_latest_date(val):
 
 
 FINAL_COLS = [
-    "Уникальный номер",
+    "Уникальный номер сделки",
     "Номер талона в СК",
     "Дата подачи заявления на выписку ИЛ",
     "Дата получения ИЛ",
@@ -1394,6 +1403,7 @@ FINAL_COLS = [
     "Дата получения СП",
     "Дата передачи СП ЧСИ",
     "Комментарий",
+    "Номер талона письма ЕПСО",
     "Представитель истца",
     "Номер судебного дела",
     "Судебный орган",
@@ -1406,7 +1416,6 @@ FINAL_COLS = [
     "Зарегистрировано",
     "Судья",
     "Вынесено определение о возврате искового заявления",
-    "Вынесено определение об оставлении заявления без рассмотрения",
     "Вынесено определение об утверждении соглашения об урегулировании спора",
     "Вынесено определение о рассмотрении дела в порядке упрощенного производства",
     "Вынесено решение первой инстанции",
@@ -1420,6 +1429,7 @@ FINAL_COLS = [
 ]
 
 RENAME_COLS = {
+    "Уникальный номер": "Уникальный номер сделки",
     "ticket_number": "Номер талона в СК",
     "number_case": "Номер судебного дела",
     "date_court_order": "Вынесен судебный приказ",
@@ -1531,45 +1541,14 @@ def build_final_dataframe(df_source, parsed_by_ticket):
 # ============================================================
 
 def main():
-    df_source, tickets_uniq = load_tickets_from_db()
-
-    # --- новый портал ---
-    sot_failed = False
-    try:
-        sot_parsed, sot_tickets = run_portal_sot()
-    except Exception as e:
-        sot_failed = True
-        sot_parsed, sot_tickets = [], set()
-        print(f"⚠ portal-sot.kz недоступен ({type(e).__name__}: {e}) — "
-              f"продолжаю только со старым порталом.")
-    df_sot = build_portal_sot_dataframe(sot_parsed)
-
-    # --- старый портал: только талоны, которых нет на новом ---
-    df_source = df_source[~df_source["Номер талона в СК"].isin(sot_tickets)].reset_index(drop=True)
-    total_tickets = len(tickets_uniq)
-    tickets_uniq = [t for t in tickets_uniq if t not in sot_tickets]
-
-    print("\n=== СТАРЫЙ ПОРТАЛ office.sud.kz ===")
-    print(f"Талонов из БД для старого портала: {len(tickets_uniq)} "
-          f"(ещё {total_tickets - len(tickets_uniq)} уже есть на portal-sot.kz)")
-
-    df_old = pd.DataFrame(columns=FINAL_COLS)
-    if tickets_uniq:
-        try:
-            session = login_and_make_session()
-        except Exception as e:
-            if sot_failed or df_sot.empty:
-                raise
-            print(f"⚠ Старый портал недоступен ({e}) — в файл попадут только данные portal-sot.kz.")
-        else:
-            df_old = fetch_old_portal(session, df_source, tickets_uniq)
-
-    df = pd.concat([df_sot, df_old.reindex(columns=FINAL_COLS)], ignore_index=True)
+    # Старый портал office.sud.kz отключён: выгрузка только с portal-sot.kz.
+    # Если portal-sot недоступен — запуск падает с ошибкой (файл не публикуется).
+    sot_parsed, _ = run_portal_sot()
+    df = build_portal_sot_dataframe(sot_parsed)
 
     df.to_excel(LOCAL_OUTPUT_XLSX, index=False, engine="openpyxl")
     print(f"\n✓ Итоговый Excel сохранён: {LOCAL_OUTPUT_XLSX}")
-    print(f"Строк: {len(df)} (portal-sot.kz: {len(df_sot)}, office.sud.kz: {len(df_old)}), "
-          f"колонок: {len(df.columns)}")
+    print(f"Строк: {len(df)}, колонок: {len(df.columns)}")
 
     if df.empty:
         print("Данных нет — файл в папку автоимпорта CRM не копируется.")

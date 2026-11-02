@@ -567,7 +567,7 @@ JOIN clients c (NOLOCK) ON l.CID = c.ID
 JOIN states s ON s.ID = l.State
 JOIN Dictionary dF246 ON dF246.ID = l.F246
 LEFT JOIN Constants constF235 ON constF235.ID = l.F235
-JOIN Constants constF236 ON constF236.ID = l.F236
+LEFT JOIN Constants constF236 ON constF236.ID = l.F236
 LEFT JOIN LoanCounts lc ON c.F293 = lc.ИИН
 WHERE l.EID IN ({eids}) AND l.F209 = N'{company}'
 GROUP BY l.EID, dF246.F249, c.FIO, c.F293, l.F34, constF235.Caption,
@@ -623,7 +623,7 @@ JOIN states s ON s.ID = l.State
 JOIN Dictionary dF246 ON dF246.ID = l.F246
 JOIN Constants constF234 ON constF234.ID = l.F234
 LEFT JOIN Constants constF235 ON constF235.ID = l.F235
-JOIN Constants constF236 ON constF236.ID = l.F236
+LEFT JOIN Constants constF236 ON constF236.ID = l.F236
 LEFT JOIN LoanCounts lc ON c.F293 = lc.ИИН
 LEFT JOIN Emails e (NOLOCK) ON e.CID = l.CID
 OUTER APPLY (

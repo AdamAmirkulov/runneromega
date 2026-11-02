@@ -560,12 +560,22 @@ def _send(method, url, **kwargs):
                 pass
 
 
+def _rewind_files(kwargs):
+    """Файлы в multipart надо перемотать, иначе повтор уйдёт пустым."""
+    for f in (kwargs.get("files") or {}).values():
+        try:
+            f[1].seek(0)
+        except Exception:
+            pass
+
+
 def api_request(method, path, **kwargs):
     ensure_token_fresh()
     url = path if path.startswith("http") else BASE_URL + path
     r = _send(method, url, **kwargs)
     if r.status_code == 401:
         rejected = tokens.get("access_token")
+        eds_done = False
         if not refresh_access():
             log("HTTP 401 — обновляю сессию через браузер")
             portal_sign_in()
@@ -573,13 +583,15 @@ def api_request(method, path, **kwargs):
                 # В браузере лежит тот же токен, который портал только что отверг
                 # (сессия закрыта на стороне портала) — поможет только вход через ЭЦП.
                 _full_eds_login("портал отверг токен, в браузере он же")
-        # файлы в multipart надо перемотать, иначе повтор уйдёт пустым
-        for f in (kwargs.get("files") or {}).values():
-            try:
-                f[1].seek(0)
-            except Exception:
-                pass
+                eds_done = True
+        _rewind_files(kwargs)
         r = _send(method, url, **kwargs)
+        if r.status_code == 401 and not eds_done:
+            # refresh выдал новый токен, но портал отверг и его — сессия закрыта
+            # на стороне портала, поможет только вход через ЭЦП.
+            _full_eds_login("портал отверг и токен после refresh")
+            _rewind_files(kwargs)
+            r = _send(method, url, **kwargs)
     if not r.ok:
         raise RuntimeError(f"{method} {url} -> HTTP {r.status_code}: {r.text[:1000]}")
     try:
@@ -612,8 +624,9 @@ def force_relogin_portal():
     """Сначала — обновление токена по API (без ЭЦП). Полный вход через ЭЦП —
     только если refresh не сработал, и не больше MAX_FULL_RELOGINS раз за прогон."""
     if refresh_access():
+        # check_org сам дойдёт до входа через ЭЦП, если портал отвергнет новый токен
         check_org()
-        log("ПОВТОРНЫЙ ВХОД не понадобился: токен обновлён через refresh — OK")
+        log("ПОВТОРНЫЙ ВХОД: токен обновлён через refresh, API авторизован — OK")
         return
     _full_eds_login("refresh не сработал")
     check_org()
@@ -792,6 +805,12 @@ def classify_case_files(folder):
 EXCLUDED_REGION_IDS = {18, 23, 99}
 AKTAU_CIVIL_CODE = "194711"
 BOKEIKHAN_COURT2_CODE = "193571"  # Cуд №2 района Әлихан Бөкейхан города Караганды
+# Суды районов города Актобе. В Excel: «Суд города Актобе района Астана»,
+# в справочнике портала: «Суд города Актобе Актюбинской области, район "Астана"».
+AKTOBE_DISTRICT_COURT_CODES = {
+    "астана": "191510",  # Суд города Актобе Актюбинской области, район "Астана" (Гражданские дела)
+    "алматы": "191514",  # Суд № 3 города Актобе Актюбинской области, район "Алматы" (Гражданские дела)
+}
 LOCAL_COURTS = []
 
 
@@ -924,6 +943,19 @@ def resolve_court(region_name, court_name):
         court = hits[0]
         log(f"СУД БӨКЕЙХАН: {court['NAME']} | CODE={court['CODE']}")
         return {"ID": court["REGION_ID"], "VALUE_RU": court["REGION"]}, court
+
+    # Районы города Актобе: в Excel и в справочнике другой порядок слов.
+    if nr == _match_norm("Актюбинская область") and "актобе" in source:
+        district = re.search(r"район\w*\s+\W*(астана|алматы)\b", source)
+        if district:
+            code = AKTOBE_DISTRICT_COURT_CODES[district.group(1)]
+            hits = [c for c in region_rows if c["CODE"] == code]
+            if len(hits) != 1:
+                raise CourtDataError(f"В справочнике не найден суд города Актобе района "
+                                     f"{district.group(1)!r} CODE={code}")
+            court = hits[0]
+            log(f"СУД АКТОБЕ: {court['NAME']} | CODE={court['CODE']}")
+            return {"ID": court["REGION_ID"], "VALUE_RU": court["REGION"]}, court
 
     # 1) Полное совпадение названия без специализации.
     exact = [c for c in region_rows if _match_norm(c["NAME"]) == source]
@@ -1326,7 +1358,14 @@ def _blank_field_state(name):
 def trusted_paste(name, value, label):
     """Ctrl+A, Ctrl+V в textarea[name] и проверка, что текст дошёл до DOM и до состояния React."""
     _set_clipboard_text(value)
-    _activate_browser_window(label)
+    # Свёрнутый/отключённый RDP-сеанс: окно не активируется и SendInput не проходит.
+    # Это не повод останавливать пачку — ниже есть вставка через драйвер.
+    windows_input = True
+    try:
+        _activate_browser_window(label)
+    except RuntimeError as e:
+        windows_input = False
+        log(f"{label}: {name} — {e}; вставляю через драйвер", "WARNING")
 
     el = _blank_field(name)
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
@@ -1336,9 +1375,13 @@ def trusted_paste(name, value, label):
     if not driver.execute_script("return document.activeElement===arguments[0];", el):
         raise RuntimeError(f"{label}: поле {name} не получило фокус")
 
-    _send_ctrl_combo(_VK_A, label)
-    time.sleep(0.15)
-    _send_ctrl_combo(_VK_V, label)
+    if windows_input:
+        try:
+            _send_ctrl_combo(_VK_A, label)
+            time.sleep(0.15)
+            _send_ctrl_combo(_VK_V, label)
+        except RuntimeError as e:
+            log(f"{label}: {name} — {e}", "WARNING")
 
     expected = len(value)
 
@@ -1352,8 +1395,8 @@ def trusted_paste(name, value, label):
                 break
         return state
 
-    state = wait_pasted()
-    if state["valueLen"] == 0:
+    state = wait_pasted() if windows_input else _blank_field_state(name)
+    if state["valueLen"] != expected:
         # Нажатия с клавиатуры Windows не дошли до браузера (свёрнутый/отключённый
         # RDP-сеанс, другое окно перехватило ввод) — те же Ctrl+A, Ctrl+V через драйвер.
         log(f"{label}: {name} — вставка с клавиатуры Windows не дошла до поля, повтор через драйвер", "WARNING")

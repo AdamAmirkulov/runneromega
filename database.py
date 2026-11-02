@@ -152,16 +152,16 @@ class MailingReport(Base):
 class ChsiContact(Base):
     __tablename__ = "chsi_contacts"
 
+    # Справочник общий для всех компаний: в users.db у chsi_contacts нет
+    # колонки company_id. Параметр company_id в функциях ниже принимается
+    # для совместимости, но не используется.
     id = Column(Integer, primary_key=True, index=True)
-    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
     fio = Column(String, nullable=False)
     fio_norm = Column(String, index=True, default="")
     email = Column(String, nullable=False)
     is_active = Column(Boolean, default=True)
     note = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
-
-    company = relationship("Company")
 
 
 class Mailing(Base):
@@ -591,7 +591,7 @@ def delete_mailing_report(report_id: int):
 
 def get_chsi_contacts(company_id: int, only_active: bool = False) -> list:
     db = SessionLocal()
-    q = db.query(ChsiContact).filter(ChsiContact.company_id == company_id)
+    q = db.query(ChsiContact)
     if only_active:
         q = q.filter(ChsiContact.is_active == True)  # noqa: E712
     result = q.order_by(ChsiContact.fio).all()
@@ -609,7 +609,7 @@ def get_chsi_contact(contact_id: int):
 def create_chsi_contact(company_id: int, fio: str, email: str, is_active: bool = True, note: str = None):
     db = SessionLocal()
     c = ChsiContact(
-        company_id=company_id, fio=fio, fio_norm=_fio_norm(fio),
+        fio=fio, fio_norm=_fio_norm(fio),
         email=(email or "").strip(), is_active=is_active, note=note,
     )
     db.add(c)
@@ -647,7 +647,7 @@ def bulk_add_chsi_contacts(company_id: int, rows: list) -> int:
     added = 0
     existing = {
         (c.fio_norm, (c.email or "").strip().lower())
-        for c in db.query(ChsiContact).filter(ChsiContact.company_id == company_id).all()
+        for c in db.query(ChsiContact).all()
     }
     for fio, email in rows:
         fio = (fio or "").strip()
@@ -659,7 +659,7 @@ def bulk_add_chsi_contacts(company_id: int, rows: list) -> int:
             continue
         existing.add(key)
         db.add(ChsiContact(
-            company_id=company_id, fio=fio, fio_norm=_fio_norm(fio),
+            fio=fio, fio_norm=_fio_norm(fio),
             email=email, is_active=True,
         ))
         added += 1

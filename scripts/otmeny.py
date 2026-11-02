@@ -25,6 +25,8 @@ def parse_args():
     parser.add_argument('--date_to', default='')
     parser.add_argument('--login', default='')
     parser.add_argument('--password', default='')
+    # Без условия l.F235 IS NULL — берутся все окончённые, в т.ч. с заполненным F235
+    parser.add_argument('--include_f235', action='store_true')
     return parser.parse_args()
 
 
@@ -50,6 +52,8 @@ if project_root not in sys.path:
 from config import CREDENTIALS, _company_id, DB_COMPANY_FILTER, CRM_DB
 
 print(f"🏢 Запуск АИС ОИП отмен для компании ID={_company_id}")
+if args.include_f235:
+    print("Режим: без условия F235 IS NULL (включая займы с заполненным F235)")
 
 # =========================
 # ГЛОБАЛЬНЫЕ ПАРАМЕТРЫ
@@ -431,6 +435,7 @@ def otmeny_normalize_text(value) -> str:
 
 
 def otmeny_get_debtors_from_db():
+    f235_filter = "" if args.include_f235 else "l.F235 IS NULL\n        AND "
     query = f"""
     SELECT
         l.EID,
@@ -447,8 +452,7 @@ def otmeny_get_debtors_from_db():
         AND constF236.Caption = N'Окончено'
     JOIN clients c ON c.ID = l.CID
     WHERE
-        l.F235 IS NULL
-        AND l.State NOT IN (7, 8)
+        {f235_filter}l.State NOT IN (7, 8)
         AND l.F209 = N'{OTMENY_COMPANY_FILTER}'
     """
 
