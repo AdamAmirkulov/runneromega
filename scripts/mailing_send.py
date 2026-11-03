@@ -295,6 +295,7 @@ def run_for_company(cid: str, mailing, base_sql: str):
     delay = float(smtp_cfg.get("send_delay_sec", 5) or 0)
     today_str = datetime.now().strftime("%d.%m.%Y")
     signature = MAILING_SIGNATURE.get(cid, {})
+    requisites = database.get_company_requisites_text(int(cid))
 
     def make_ctx(fio, n):
         return {
@@ -304,6 +305,7 @@ def run_for_company(cid: str, mailing, base_sql: str):
             "компания_ru": signature.get("full_name_ru") or company_name,
             "компания_kz": signature.get("full_name_kz") or company_name,
             "телефон": signature.get("phone") or "",
+            "реквизиты": requisites,
             "дата": today_str,
         }
 

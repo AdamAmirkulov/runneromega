@@ -164,6 +164,17 @@ class ChsiContact(Base):
     created_at = Column(DateTime, default=datetime.now)
 
 
+class CompanyRequisites(Base):
+    """Реквизиты компании — один текстовый блок (4–5 строк), задаётся в
+    админке (/admin/companies). В письмах рассылок — {{реквизиты}}."""
+    __tablename__ = "company_requisites"
+
+    company_id = Column(Integer, ForeignKey("companies.id"), primary_key=True)
+    text = Column(Text, nullable=True)
+    updated_by = Column(String, nullable=True)
+    updated_at = Column(DateTime, default=datetime.now)
+
+
 class MailingExcludedEid(Base):
     """EID (уникальный номер займа), строки по которым выкидываются из
     КОНКРЕТНОЙ рассылки до группировки по ЧСИ (scripts/mailing_send.py)."""
@@ -406,6 +417,7 @@ def _ensure_columns():
         "ALTER TABLE mailings ADD COLUMN extra_company_ids VARCHAR",
         "ALTER TABLE mailings ADD COLUMN schedule_interval_weeks INTEGER DEFAULT 1",
         "ALTER TABLE mailings ADD COLUMN schedule_anchor_date DATE",
+        "ALTER TABLE company_requisites ADD COLUMN text TEXT",
     ]
     with engine.connect() as conn:
         for stmt in statements:
@@ -739,6 +751,33 @@ def toggle_mailing(mailing_id: int):
     if m:
         m.is_active = not m.is_active
         db.commit()
+    db.close()
+
+
+# ── Реквизиты компаний ───────────────────────────────────────
+
+def get_company_requisites(company_id: int):
+    db = SessionLocal()
+    r = db.query(CompanyRequisites).filter(CompanyRequisites.company_id == company_id).first()
+    db.close()
+    return r
+
+
+def get_company_requisites_text(company_id: int) -> str:
+    r = get_company_requisites(company_id)
+    return (r.text or "").strip() if r else ""
+
+
+def save_company_requisites(company_id: int, text_value: str, updated_by: str = None):
+    db = SessionLocal()
+    r = db.query(CompanyRequisites).filter(CompanyRequisites.company_id == company_id).first()
+    if not r:
+        r = CompanyRequisites(company_id=company_id)
+        db.add(r)
+    r.text = chr(10).join(line.rstrip() for line in (text_value or "").splitlines()).strip() or None
+    r.updated_by = updated_by
+    r.updated_at = datetime.now()
+    db.commit()
     db.close()
 
 

@@ -17,6 +17,7 @@ PLACEHOLDERS = {
     "{{компания_ru}}":    "полное название компании на русском (config.MAILING_SIGNATURE)",
     "{{компания_kz}}":    "полное название компании на казахском (config.MAILING_SIGNATURE)",
     "{{телефон}}":        "контактный телефон компании (config.MAILING_SIGNATURE)",
+    "{{реквизиты}}":      "реквизиты компании (Админка → 🏢 Реквизиты компаний)",
     "{{дата}}":           "текущая дата (ДД.ММ.ГГГГ)",
 }
 
@@ -66,6 +67,9 @@ def render_body_html(text: str, ctx: dict) -> str:
     if not text:
         return ""
     if _HTML_TAG_RE.search(text):
+        # в HTML-шаблоне многострочные реквизиты иначе слиплись бы в одну строку
+        if ctx.get("реквизиты"):
+            ctx = dict(ctx, реквизиты=html.escape(str(ctx["реквизиты"])).replace("\n", "<br>\n"))
         return render_placeholders(text, ctx)
     rendered = render_placeholders(text, ctx)
     escaped = html.escape(rendered)

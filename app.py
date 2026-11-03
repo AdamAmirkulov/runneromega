@@ -32,6 +32,7 @@ from database import (
     update_chsi_contact, delete_chsi_contact, bulk_add_chsi_contacts,
     get_excluded_eids, add_excluded_eids, count_excluded_eids, delete_excluded_eid, delete_excluded_eids,
     parse_eid_list,
+    get_company_requisites, save_company_requisites,
 )
 from mailing_common import PLACEHOLDERS
 from auth import (
@@ -950,6 +951,7 @@ th { background: #28a745; color: white; }
 <a href="/admin/user/new" class="btn btn-add">➕ Добавить пользователя</a>
 <a href="/admin/schedule" class="btn-add" style="text-decoration:none;">⏰ Расписание автозапуска</a>
 <a href="/admin/mailings" class="btn-add" style="text-decoration:none; background:#e67e22;">📨 Рассылки по отчётам</a>
+<a href="/admin/companies" class="btn-add" style="text-decoration:none; background:#2c3e50;">🏢 Реквизиты компаний</a>
 <a href="/monitoring" class="btn-add" style="text-decoration:none; background:#17a2b8;">📊 Мониторинг</a>
 <table>
   <tr><th>Логин</th><th>ФИО</th><th>Компания</th><th>Роль</th><th>Скрипты</th><th>Статус</th><th>Действия</th></tr>
@@ -2648,6 +2650,30 @@ function filt(){
 """
 
 
+COMPANY_REQUISITES_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><title>Реквизиты компаний</title>
+<style>""" + _MAIL_CSS + """</style></head><body>
+<a href="/admin">← Назад в админку</a>
+<h2>🏢 Реквизиты компаний</h2>
+<div class="tabs">
+  {% for c in companies %}
+    <a href="/admin/companies?company_id={{ c.id }}" class="{% if c.id == company_id %}active{% endif %}">{{ c.name }}</a>
+  {% endfor %}
+</div>
+{% if company_id %}
+<form method="post" action="/admin/companies/{{ company_id }}" style="margin-top:16px;">
+  <label>Реквизиты</label>
+  <textarea name="text" rows="6" placeholder="ТОО «…»&#10;БИН …&#10;IBAN … в АО «…»&#10;БИК …&#10;Адрес: …">{{ r.text if r and r.text else '' }}</textarea>
+  <div class="hint">В тексте письма рассылки вставляются через <code>{{ '{{реквизиты}}' }}</code>.</div>
+  <p><button type="submit" class="btn b-add">💾 Сохранить</button>
+  {% if saved %}<span style="color:#28a745; margin-left:10px;">✅ Сохранено</span>
+  {% elif r and r.updated_at %}<span class="hint" style="margin-left:10px;">Изменено: {{ r.updated_by or '—' }}, {{ r.updated_at.strftime('%d.%m.%Y %H:%M') }}</span>{% endif %}</p>
+</form>
+{% endif %}
+</body></html>
+"""
+
+
 def _mailing_company_map(db):
     return {c.id: c.name for c in db.query(Company).all()}
 
@@ -3092,6 +3118,35 @@ def mailing_exclusion_delete(mailing_id: int, item_id: int, current_user: User =
         return current_user
     delete_excluded_eid(mailing_id, item_id)
     return RedirectResponse(_excl_url(mailing_id), status_code=303)
+
+
+# ── Реквизиты компаний ───────────────────────────────────────
+
+@app.get("/admin/companies", response_class=HTMLResponse)
+def company_requisites_page(
+    company_id: Optional[int] = None, saved: Optional[int] = None,
+    current_user: User = Depends(get_admin_user), db: Session = Depends(get_db),
+):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    companies = db.query(Company).order_by(Company.id).all()
+    if company_id is None and companies:
+        company_id = companies[0].id
+    return render(
+        COMPANY_REQUISITES_HTML,
+        companies=companies, company_id=company_id, saved=saved,
+        r=get_company_requisites(company_id) if company_id else None,
+    )
+
+
+@app.post("/admin/companies/{company_id}")
+async def company_requisites_save(company_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    form = await request.form()
+    save_company_requisites(company_id, form.get("text") or "",
+                            updated_by=getattr(current_user, "username", None))
+    return RedirectResponse(f"/admin/companies?company_id={company_id}&saved=1", status_code=303)
 
 
 MONITORING_HTML = """
