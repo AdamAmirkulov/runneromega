@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional
+from urllib.parse import urlencode
 from database import init_db, get_db, User, Company
 from fastapi import FastAPI, Request, Depends, Form, HTTPException, UploadFile, File, Cookie
 from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, Response, JSONResponse
@@ -29,6 +30,8 @@ from database import (
     update_mailing_report, delete_mailing_report,
     get_chsi_contacts, get_chsi_contact, create_chsi_contact,
     update_chsi_contact, delete_chsi_contact, bulk_add_chsi_contacts,
+    get_excluded_eids, add_excluded_eids, count_excluded_eids, delete_excluded_eid, delete_excluded_eids,
+    parse_eid_list,
 )
 from mailing_common import PLACEHOLDERS
 from auth import (
@@ -2333,6 +2336,7 @@ MAILINGS_LIST_HTML = """
       </form>
       <a href="/admin/mailings/{{ m.id }}/send" class="btn b-send">Отправить</a>
       <a href="/admin/mailings/{{ m.id }}/edit" class="btn b-edit">Изменить</a>
+      <a href="/admin/mailings/{{ m.id }}/exclusions" class="btn b-del" title="Исключённые EID">🚫 {{ excl_counts.get(m.id, 0) }}</a>
       <a href="/admin/mailings/{{ m.id }}/toggle" class="btn b-del">{% if m.is_active %}Выкл{% else %}Вкл{% endif %}</a>
       <a href="/admin/mailings/{{ m.id }}/delete" class="btn b-del" onclick="return confirm('Удалить рассылку?')">✕</a>
     </td>
@@ -2592,6 +2596,57 @@ CHSI_CONTACTS_HTML = """
 </body></html>
 """
 
+MAILING_EXCLUSIONS_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><title>Исключённые EID</title>
+<style>""" + _MAIL_CSS + """</style></head><body>
+<a href="/admin/mailings">← Назад к рассылкам</a>
+<h2>🚫 Исключённые EID — «{{ mailing.name }}»</h2>
+<p class="hint">Строки с этими EID (уникальный номер займа) выкидываются <b>только из этой рассылки</b>
+до отправки ЧСИ — и в боевом, и в тестовом режиме. В отчёте (SQL) должна быть колонка
+<code>EID</code> или <code>Уникальный номер</code>, иначе исключения не применятся (в логе будет ⚠️).</p>
+
+<h3 style="margin-top:18px;">Добавить</h3>
+<form method="post" action="/admin/mailings/{{ mailing.id }}/exclusions/add">
+  <label>EID — один или много: через запятую, пробел или с новой строки (можно вставить столбец из Excel)</label>
+  <textarea name="eids" rows="6" required style="width:100%; font-family:monospace;"></textarea>
+  <div style="display:flex; gap:10px; align-items:end; margin-top:8px;">
+    <div style="flex:3;"><label>Комментарий (необязательно)</label><input type="text" name="note" placeholder="напр. погасил / жалоба / по просьбе ЧСИ"></div>
+    <div><button type="submit" class="btn b-add">Добавить</button></div>
+  </div>
+</form>
+{% if msg %}<p style="color:#28a745;">{{ msg }}</p>{% endif %}
+
+<h3 style="margin-top:18px;">Убрать из исключений пачкой</h3>
+<form method="post" action="/admin/mailings/{{ mailing.id }}/exclusions/remove">
+  <textarea name="eids" rows="3" required style="width:100%; font-family:monospace;"></textarea>
+  <button type="submit" class="btn b-del" style="margin-top:8px;" onclick="return confirm('Убрать эти EID из исключений?')">Убрать</button>
+</form>
+
+<h3 style="margin-top:18px;">Список ({{ items|length }})</h3>
+<p><input type="text" id="q" placeholder="Поиск по EID / комментарию" oninput="filt()" style="max-width:320px;"></p>
+<table id="tbl">
+  <tr><th>EID</th><th>Комментарий</th><th>Кто добавил</th><th>Когда</th><th></th></tr>
+  {% for x in items %}
+  <tr>
+    <td>{{ x.eid }}</td>
+    <td>{{ x.note or '' }}</td>
+    <td>{{ x.created_by or '' }}</td>
+    <td>{{ x.created_at.strftime('%d.%m.%Y %H:%M') if x.created_at else '' }}</td>
+    <td><a href="/admin/mailings/{{ mailing.id }}/exclusions/{{ x.id }}/delete" class="btn b-del" onclick="return confirm('Убрать {{ x.eid }} из исключений?')">✕</a></td>
+  </tr>
+  {% endfor %}
+  {% if not items %}<tr><td colspan="5" style="color:#666;">Список пуст.</td></tr>{% endif %}
+</table>
+<script>
+function filt(){
+  var q=document.getElementById('q').value.toLowerCase();
+  var rows=document.querySelectorAll('#tbl tr');
+  for(var i=1;i<rows.length;i++){rows[i].style.display=rows[i].innerText.toLowerCase().indexOf(q)>=0?'':'none';}
+}
+</script>
+</body></html>
+"""
+
 
 def _mailing_company_map(db):
     return {c.id: c.name for c in db.query(Company).all()}
@@ -2619,6 +2674,7 @@ def mailings_list(current_user: User = Depends(get_admin_user), db: Session = De
         company_map=cmap,
         mailing_company_names=mailing_company_names,
         report_map=report_map,
+        excl_counts=count_excluded_eids(),
     )
 
 
@@ -2986,6 +3042,56 @@ async def chsi_contacts_import(request: Request, current_user: User = Depends(ge
             except OSError:
                 pass
     return RedirectResponse(f"/admin/mailings/contacts?company_id={cid}&imported={added}", status_code=303)
+
+
+# ── Исключённые EID (у каждой рассылки свои) ─────────────────
+
+def _excl_url(mailing_id: int, msg: str = None) -> str:
+    url = f"/admin/mailings/{mailing_id}/exclusions"
+    return url + ("?" + urlencode({"msg": msg}) if msg else "")
+
+
+@app.get("/admin/mailings/{mailing_id}/exclusions", response_class=HTMLResponse)
+def mailing_exclusions_page(mailing_id: int, msg: Optional[str] = None, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    return render(MAILING_EXCLUSIONS_HTML, mailing=m, items=get_excluded_eids(mailing_id), msg=msg)
+
+
+@app.post("/admin/mailings/{mailing_id}/exclusions/add")
+async def mailing_exclusions_add(mailing_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    if not get_mailing(mailing_id):
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    form = await request.form()
+    eids = parse_eid_list(form.get("eids") or "")
+    added = add_excluded_eids(
+        mailing_id, eids, note=(form.get("note") or "").strip() or None,
+        created_by=getattr(current_user, "username", None),
+    )
+    msg = f"Добавлено: {added} из {len(eids)}" + (f" (уже были в списке: {len(eids) - added})" if len(eids) - added else "")
+    return RedirectResponse(_excl_url(mailing_id, msg), status_code=303)
+
+
+@app.post("/admin/mailings/{mailing_id}/exclusions/remove")
+async def mailing_exclusions_remove(mailing_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    form = await request.form()
+    n = delete_excluded_eids(mailing_id, parse_eid_list(form.get("eids") or ""))
+    return RedirectResponse(_excl_url(mailing_id, f"Убрано из исключений: {n}"), status_code=303)
+
+
+@app.get("/admin/mailings/{mailing_id}/exclusions/{item_id}/delete")
+def mailing_exclusion_delete(mailing_id: int, item_id: int, current_user: User = Depends(get_admin_user)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    delete_excluded_eid(mailing_id, item_id)
+    return RedirectResponse(_excl_url(mailing_id), status_code=303)
 
 
 MONITORING_HTML = """

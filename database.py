@@ -1,5 +1,5 @@
 # database.py
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Date, ForeignKey, Table, Text, text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Date, ForeignKey, Table, Text, text, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime, timedelta
@@ -161,6 +161,20 @@ class ChsiContact(Base):
     email = Column(String, nullable=False)
     is_active = Column(Boolean, default=True)
     note = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.now)
+
+
+class MailingExcludedEid(Base):
+    """EID (уникальный номер займа), строки по которым выкидываются из
+    КОНКРЕТНОЙ рассылки до группировки по ЧСИ (scripts/mailing_send.py)."""
+    __tablename__ = "mailing_eid_exclusions"
+    __table_args__ = (UniqueConstraint("mailing_id", "eid", name="uq_mailing_eid"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    mailing_id = Column(Integer, ForeignKey("mailings.id"), nullable=False, index=True)
+    eid = Column(String, nullable=False, index=True)
+    note = Column(String, nullable=True)
+    created_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
 
 
@@ -713,6 +727,7 @@ def delete_mailing(mailing_id: int):
     db = SessionLocal()
     m = db.query(Mailing).filter(Mailing.id == mailing_id).first()
     if m:
+        db.query(MailingExcludedEid).filter(MailingExcludedEid.mailing_id == mailing_id).delete()
         db.delete(m)
         db.commit()
     db.close()
@@ -725,6 +740,97 @@ def toggle_mailing(mailing_id: int):
         m.is_active = not m.is_active
         db.commit()
     db.close()
+
+
+def normalize_eid(v) -> str:
+    """EID → строка из цифр целой части: 107020, '107020', Decimal('107020.00'),
+    ' 107 020 ' → '107020'. Пусто/мусор → ''."""
+    if v is None:
+        return ""
+    s = str(v).strip().replace(" ", "").replace(" ", "")
+    if "." in s or "," in s:
+        s = s.replace(",", ".").split(".")[0]
+    s = "".join(ch for ch in s if ch.isdigit())
+    return s.lstrip("0") or ("0" if s else "")
+
+
+def parse_eid_list(text_value: str) -> list:
+    """Разбирает вставленный текст (через запятую/пробел/перенос/«;») в
+    список уникальных EID, порядок сохранён."""
+    import re as _re
+    out = []
+    for tok in _re.split(r"[\s,;]+", text_value or ""):
+        e = normalize_eid(tok)
+        if e and e not in out:
+            out.append(e)
+    return out
+
+
+def get_excluded_eids(mailing_id: int) -> list:
+    db = SessionLocal()
+    result = (db.query(MailingExcludedEid)
+              .filter(MailingExcludedEid.mailing_id == mailing_id)
+              .order_by(MailingExcludedEid.created_at.desc()).all())
+    db.close()
+    return result
+
+
+def get_excluded_eid_set(mailing_id: int) -> set:
+    db = SessionLocal()
+    rows = db.query(MailingExcludedEid.eid).filter(MailingExcludedEid.mailing_id == mailing_id).all()
+    db.close()
+    return {r[0] for r in rows if r[0]}
+
+
+def count_excluded_eids() -> dict:
+    """{mailing_id: кол-во исключённых EID} — для списка рассылок."""
+    from sqlalchemy import func
+    db = SessionLocal()
+    rows = (db.query(MailingExcludedEid.mailing_id, func.count(MailingExcludedEid.id))
+            .group_by(MailingExcludedEid.mailing_id).all())
+    db.close()
+    return {mid: n for mid, n in rows}
+
+
+def add_excluded_eids(mailing_id: int, eids: list, note: str = None, created_by: str = None) -> int:
+    """Добавляет EID в исключения рассылки; уже существующие пропускает.
+    Возвращает кол-во реально добавленных."""
+    db = SessionLocal()
+    existing = {r[0] for r in db.query(MailingExcludedEid.eid)
+                .filter(MailingExcludedEid.mailing_id == mailing_id).all()}
+    added = 0
+    for e in eids:
+        e = normalize_eid(e)
+        if not e or e in existing:
+            continue
+        db.add(MailingExcludedEid(mailing_id=mailing_id, eid=e, note=(note or None), created_by=created_by))
+        existing.add(e)
+        added += 1
+    db.commit()
+    db.close()
+    return added
+
+
+def delete_excluded_eid(mailing_id: int, item_id: int):
+    db = SessionLocal()
+    db.query(MailingExcludedEid).filter(
+        MailingExcludedEid.id == item_id, MailingExcludedEid.mailing_id == mailing_id).delete()
+    db.commit()
+    db.close()
+
+
+def delete_excluded_eids(mailing_id: int, eids: list) -> int:
+    norm = [normalize_eid(e) for e in eids]
+    norm = [e for e in norm if e]
+    if not norm:
+        return 0
+    db = SessionLocal()
+    n = (db.query(MailingExcludedEid)
+         .filter(MailingExcludedEid.mailing_id == mailing_id, MailingExcludedEid.eid.in_(norm))
+         .delete(synchronize_session=False))
+    db.commit()
+    db.close()
+    return n
 
 
 def get_scheduled_mailings() -> list:

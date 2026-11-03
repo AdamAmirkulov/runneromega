@@ -181,6 +181,40 @@ def send_one(smtp_cfg, to_email, bcc_list, subject, body_html, attach_path):
         server.sendmail(smtp_cfg["user"], recipients, msg.as_string())
 
 
+# Как может называться колонка с EID в результате SQL отчёта (без учёта регистра/пробелов)
+EID_COLUMN_NAMES = ("eid", "уникальный номер", "уник.номер", "уник. номер", "уникальный номер займа")
+
+
+def find_eid_column(df):
+    by_norm = {str(c).strip().lower(): c for c in df.columns}
+    for name in EID_COLUMN_NAMES:
+        if name in by_norm:
+            return by_norm[name]
+    return None
+
+
+def apply_eid_exclusions(df, company_name, mailing):
+    """Выкидывает строки, чей EID в списке исключений ЭТОЙ рассылки (Админка → Рассылки →
+    🚫 у рассылки). Если в отчёте нет колонки EID — предупреждает и ничего
+    не трогает."""
+    excluded = database.get_excluded_eid_set(mailing.id)
+    if not excluded or df.empty:
+        return df
+    col = find_eid_column(df)
+    if col is None:
+        print(f"⚠️  [{company_name}] в списке исключений {len(excluded)} EID, но в отчёте нет колонки "
+              f"EID / «Уникальный номер» — исключения НЕ применены", flush=True)
+        return df
+    mask = df[col].map(database.normalize_eid).isin(excluded)
+    n = int(mask.sum())
+    if n:
+        print(f"🚫 [{company_name}] исключено строк по списку EID: {n} "
+              f"({', '.join(sorted(set(df.loc[mask, col].map(database.normalize_eid))))[:500]})", flush=True)
+    else:
+        print(f"🚫 [{company_name}] исключённых EID в отчёте нет", flush=True)
+    return df.loc[~mask]
+
+
 def run_for_company(cid: str, mailing, base_sql: str):
     """Прогоняет весь цикл (SQL → группировка → отправка) для одной компании.
     Возвращает список строк журнала (fio, email, статус, строк, ошибка) с
@@ -222,6 +256,8 @@ def run_for_company(cid: str, mailing, base_sql: str):
         return []
     conn.close()
     print(f"📊 [{company_name}] Строк в отчёте: {len(df)} | колонки: {', '.join(map(str, df.columns))}", flush=True)
+
+    df = apply_eid_exclusions(df, company_name, mailing)
 
     if df.empty:
         print(f"❌ [{company_name}] SQL вернул 0 строк — рассылать нечего", flush=True)
