@@ -418,6 +418,9 @@ def _ensure_columns():
         "ALTER TABLE mailings ADD COLUMN schedule_interval_weeks INTEGER DEFAULT 1",
         "ALTER TABLE mailings ADD COLUMN schedule_anchor_date DATE",
         "ALTER TABLE company_requisites ADD COLUMN text TEXT",
+        "ALTER TABLE company_requisites ADD COLUMN updated_by VARCHAR",
+        # старая версия таблицы хранила блок реквизитов в full_text
+        "UPDATE company_requisites SET text = full_text WHERE text IS NULL AND full_text IS NOT NULL",
     ]
     with engine.connect() as conn:
         for stmt in statements:
