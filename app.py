@@ -2513,11 +2513,11 @@ MAILINGS_LIST_HTML = """
   <a href="/admin/mailings/contacts" class="btn b-add" style="background:#6610f2;">📇 Справочник ЧСИ</a>
 </p>
 <table>
-  <tr><th>Название</th><th>Компания</th><th>Источник</th><th>Колонка-ЧСИ</th><th>Расписание</th><th>Статус</th><th>Действия</th></tr>
+  <tr><th>Название</th>{% if show_companies %}<th>Компания</th>{% endif %}<th>Источник</th><th>Колонка-ЧСИ</th><th>Расписание</th><th>Статус</th><th>Действия</th></tr>
   {% for m in mailings %}
   <tr>
     <td>{{ m.name }}</td>
-    <td>{{ mailing_company_names.get(m.id, '—') }}</td>
+    {% if show_companies %}<td>{{ mailing_company_names.get(m.id, '—') }}</td>{% endif %}
     <td>{% if m.sql_text and m.sql_text.strip() %}свой SQL{% elif m.report_id %}{{ report_map.get(m.report_id, 'отчёт') }}{% else %}<span style="color:#dc3545;">не задан</span>{% endif %}</td>
     <td>{{ m.group_column }}</td>
     <td>{% if m.schedule_enabled %}{{ '%02d:%02d' % (m.schedule_hour or 0, m.schedule_minute or 0) }}{% else %}—{% endif %}</td>
@@ -2537,7 +2537,7 @@ MAILINGS_LIST_HTML = """
     </td>
   </tr>
   {% endfor %}
-  {% if not mailings %}<tr><td colspan="7" style="color:#666;">Пока нет ни одной рассылки.</td></tr>{% endif %}
+  {% if not mailings %}<tr><td colspan="{{ 7 if show_companies else 6 }}"style="color:#666;">Пока нет ни одной рассылки.</td></tr>{% endif %}
 </table>
 </body></html>
 """
@@ -2665,7 +2665,7 @@ MAILING_CONFIRM_HTML = """
 <div class="warn">
   <p>Письма уйдут <b>каждому ЧСИ</b> на его адрес из справочника. Действие необратимо.</p>
   <ul>
-    <li>Компани{{ 'я' if company_count == 1 else 'и' }}: <b>{{ company_name }}</b></li>
+    {% if show_companies %}<li>Компани{{ 'я' if company_count == 1 else 'и' }}: <b>{{ company_name }}</b></li>{% endif %}
     <li>Источник: {% if mailing.sql_text and mailing.sql_text.strip() %}свой SQL{% else %}{{ report_name }}{% endif %}</li>
     <li>Активных ЧСИ в справочнике: <b>{{ contacts_count }}</b></li>
     <li>Вложение: {{ 'да' if mailing.attach_enabled else 'нет' }}</li>
@@ -2886,10 +2886,29 @@ def _mail_company_ok(user, company_id) -> bool:
 
 
 def _mailing_ok(user, m) -> bool:
-    """Рассылка доступна, только если ВСЕ её компании доступны пользователю."""
+    """Рассылка доступна, если пользователю доступна хотя бы одна её компания.
+    Остальные компании рассылки ему не показываются (см. _keep_hidden_companies)."""
     scope = _mail_scope(user)
-    ids = set(m.company_id_list())
-    return scope is None or (bool(ids) and ids <= scope)
+    return scope is None or bool(set(m.company_id_list()) & scope)
+
+
+def _keep_hidden_companies(user, m, vals):
+    """При сохранении рассылки сотрудник видит галочки только своих компаний —
+    недоступные ему компании рассылки дописываем обратно, чтобы они не терялись."""
+    scope = _mail_scope(user)
+    if scope is None:
+        return
+    hidden = [cid for cid in m.company_id_list() if cid not in scope]
+    if not hidden:
+        return
+    ids = [vals["company_id"]] + [int(x) for x in (vals["extra_company_ids"] or "").split(",") if x]
+    # основная компания рассылки остаётся первой, если она из скрытых
+    if m.company_id in hidden:
+        ids = [m.company_id] + ids + [c for c in hidden if c != m.company_id]
+    else:
+        ids = ids + hidden
+    vals["company_id"] = ids[0]
+    vals["extra_company_ids"] = ",".join(str(x) for x in ids[1:]) or None
 
 
 def _report_view_ok(user, r) -> bool:
@@ -2938,6 +2957,8 @@ def mailings_list(current_user: User = Depends(get_mailing_user), db: Session = 
         mailings=mailings,
         company_map=cmap,
         mailing_company_names=mailing_company_names,
+        # сотруднику с доступом по компаниям не показываем, для каких компаний рассылка
+        show_companies=_mail_scope(current_user) is None,
         report_map=report_map,
         excl_counts=count_excluded_eids(),
         is_admin=current_user.role == "admin",
@@ -3045,6 +3066,7 @@ async def mailing_edit_submit(mailing_id: int, request: Request, current_user: U
         return HTMLResponse("Рассылка не найдена", status_code=404)
     if not _mailing_ok(current_user, m) or not _check_mailing_vals(current_user, vals):
         return _mail_forbidden()
+    _keep_hidden_companies(current_user, m, vals)
     update_mailing(mailing_id, **vals)
     return RedirectResponse("/admin/mailings", status_code=303)
 
@@ -3145,7 +3167,7 @@ def mailing_send_confirm(mailing_id: int, current_user: User = Depends(get_maili
     return render(
         MAILING_CONFIRM_HTML,
         mailing=m, company_name=", ".join(cname_by_id.get(cid, f"#{cid}") for cid in ids),
-        company_count=len(ids),
+        company_count=len(ids), show_companies=_mail_scope(current_user) is None,
         contacts_count=len(get_chsi_contacts(None, only_active=True)), report_name=report_name,
     )
 
