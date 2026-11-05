@@ -56,6 +56,8 @@ class User(Base):
     role = Column(String)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
     is_active = Column(Boolean, default=True)
+    # Доступ к разделу «Рассылки по отчётам» без роли администратора
+    can_mailings = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.now)
     
     company = relationship("Company", back_populates="users")
@@ -112,6 +114,23 @@ class Schedule(Base):
         if self.company_id:
             p["company_id"] = str(self.company_id)
         return p
+
+class UserEds(Base):
+    """Личная ЭЦП сотрудника для входа на portal-sot.kz (см. user_eds.py).
+    Файл .p12 — в data/eds_store/, пароли — зашифрованы (Fernet)."""
+    __tablename__ = "user_eds"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    iin = Column(String, nullable=False)
+    full_name = Column(String)
+    org_bin = Column(String)            # БИН из сертификата (сотрудник ЮЛ), может быть пустым
+    valid_from = Column(DateTime)
+    valid_to = Column(DateTime)
+    file_name = Column(String)          # исходное имя загруженного файла
+    eds_password_enc = Column(Text, nullable=False)
+    portal_password_enc = Column(Text, nullable=False)
+    uploaded_at = Column(DateTime, default=datetime.now)
+    uploaded_by = Column(String)
 
 class JobRun(Base):
     __tablename__ = "job_runs"
@@ -421,6 +440,7 @@ def _ensure_columns():
         "ALTER TABLE company_requisites ADD COLUMN updated_by VARCHAR",
         # старая версия таблицы хранила блок реквизитов в full_text
         "UPDATE company_requisites SET text = full_text WHERE text IS NULL AND full_text IS NOT NULL",
+        "ALTER TABLE users ADD COLUMN can_mailings BOOLEAN DEFAULT 0",
     ]
     with engine.connect() as conn:
         for stmt in statements:

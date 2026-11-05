@@ -53,6 +53,18 @@ def get_admin_user(current_user: User = Depends(get_current_user)) -> User:
         )
     return current_user
 
+def get_mailing_user(current_user: User = Depends(get_current_user)) -> User:
+    """Раздел «Рассылки»: администратор или пользователь с галочкой «Доступ к рассылкам»."""
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+
+    if current_user.role != "admin" and not getattr(current_user, "can_mailings", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Доступ запрещён"
+        )
+    return current_user
+
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Проверка пароля"""
     return bcrypt.checkpw(plain_password.encode(), hashed_password.encode())

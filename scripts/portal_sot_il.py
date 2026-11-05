@@ -55,6 +55,8 @@ def _parse_args():
     p.add_argument("--company_id", default=None, help="ID компании (config)")
     p.add_argument("--max_rows", default=None, help="ограничить число сделок (тест)")
     p.add_argument("--no_sign", default=None, help="1 = только черновики, без подписи и отправки")
+    p.add_argument("--excel_file", default=None,
+                   help="Excel со списком EID (первый столбец) — вместо SQL-отбора; только --kind reshenie")
     return p.parse_args()
 
 
@@ -135,7 +137,7 @@ KIND = _args.kind
 KCFG = KINDS[KIND]
 
 # Пока подаём только по Омеге. Остальные компании настроены (IL_DECISION_CONFIG,
-# печати, фильтр кредитора), но выключены — чтобы включить, добавьте ID сюда.
+# печати, ЭЦП, фильтр кредитора), но выключены — чтобы включить, добавьте ID сюда.
 ENABLED_COMPANIES = {"1"}
 if COMPANY_ID not in ENABLED_COMPANIES:
     print(f"❌ Заявления на ИЛ через portal-sot.kz пока включены только для Омеги "
@@ -260,9 +262,9 @@ def log(message=""):
 # - исключаем закрывающие статусы
 # - F236 не "На исполнении"
 # - F235 не "Погасил"
-# - F329 и F326 последнего процесса = NULL
+# - F329 и F326 последнего процесса этой сделки (Process.F344 = loans.EID) = NULL
 # - F323 = "Судебное примерение"
-# В выборку также тянем: F157 = суд, F35 = сумма без госпошлины
+# В выборку также тянем: F157 = суд, F65 = № дела, F35 = сумма без госпошлины
 # ============================================================
 _SQL_OPREDELENIE = r"""
 SELECT
@@ -272,6 +274,7 @@ SELECT
     c.FIO                                 AS FIO,
     c.F293                                AS IIN,
     LTRIM(RTRIM(l.F157))                  AS Sud,
+    l.F65                                 AS CaseNumber,
     CAST(l.F35 AS DECIMAL(18,2))          AS DebtRestWithoutStateDuty,
     s.Caption                             AS CreditStatus,
     constF323.Caption                     AS F323,
@@ -304,6 +307,7 @@ OUTER APPLY (
     JOIN dbo.Process p WITH (NOLOCK)
         ON p.ID = pl.ProcessID
     WHERE pl.LoanID = l.ID
+      AND LTRIM(RTRIM(p.F344)) = CONVERT(NVARCHAR(100), l.EID)
     ORDER BY p.ID DESC
 ) pLast
 
@@ -342,9 +346,10 @@ WHERE
 
 ORDER BY l.ID ASC;
 """
-# ПО РЕШЕНИЮ: решение вынесено (F186 первого процесса) более 33 дней назад,
-# заявление на ИЛ ещё не подавалось (F318 пуст), F220 = 0/NULL.
-_SQL_RESHENIE = r"""
+# ПО РЕШЕНИЮ: решение вынесено (F186 процесса этой сделки, F344 = EID) более
+# 33 дней назад, заявление на ИЛ ещё не подавалось (F318 пуст), F220 = 0/NULL;
+# исключаем закрывающие статусы (в т.ч. Банкрот), F236 «На исполнении», F235 «Погасил».
+_SQL_RESHENIE_HEAD = r"""
 WITH LoanCounts AS (
     SELECT
         c.F293 AS ИИН,
@@ -368,9 +373,12 @@ SELECT
     LTRIM(RTRIM(l.F157))                  AS Sud,
     l.F65                                 AS CaseNumber,
     l.F49                                 AS Judge,
-    ISNULL(lc.LoanCount, 0)               AS LoanCount
+    ISNULL(lc.LoanCount, 0)               AS LoanCount,
+    l.F34                                 AS DebtBalance
 FROM loans l WITH (NOLOCK)
 
+-- Процесс — только карточка этой сделки: Process.F344 = loans.EID
+-- (EID — numeric без дробной части, CONVERT даёт '305861').
 OUTER APPLY (
     SELECT TOP (1)
         p.F186,
@@ -378,6 +386,7 @@ OUTER APPLY (
     FROM ProcessCreatedInLoans pcl WITH (NOLOCK)
     JOIN dbo.Process p WITH (NOLOCK) ON p.Id = pcl.ProcessId
     WHERE pcl.LoanId = l.Id
+      AND LTRIM(RTRIM(p.F344)) = CONVERT(NVARCHAR(100), l.EID)
     ORDER BY p.Id ASC
 ) psel
 
@@ -386,12 +395,15 @@ JOIN Constants constF238 WITH (NOLOCK) ON constF238.ID = c.F238
 JOIN states s WITH (NOLOCK) ON s.ID = l.State
 JOIN Dictionary dF246 WITH (NOLOCK) ON dF246.ID = l.F246
 LEFT JOIN Constants constF236 WITH (NOLOCK) ON constF236.ID = l.F236
+LEFT JOIN Constants constF235 WITH (NOLOCK) ON constF235.ID = l.F235
 LEFT JOIN LoanCounts lc ON c.F293 = lc.ИИН
-
+"""
+_SQL_RESHENIE = _SQL_RESHENIE_HEAD + r"""
 WHERE
-    s.Caption NOT IN (N'Погашен', N'Обратный выкуп', N'В графике', N'Умерший')
+    s.Caption NOT IN (N'Погашен', N'Обратный выкуп', N'В графике', N'Банкрот', N'Умерший')
     AND l.F209 = N'{F209}'
     AND (constF236.ID IS NULL OR constF236.Caption NOT IN (N'На исполнении'))
+    AND (constF235.ID IS NULL OR constF235.Caption NOT IN (N'Погасил'))
     AND psel.F186 IS NOT NULL
     AND (l.F220 = 0 OR l.F220 IS NULL)
     AND psel.F186 < DATEADD(DAY, -33, GETDATE())
@@ -412,6 +424,20 @@ _SQL_CREDITOR = (
 SQL_QUERY = (_SQL_TEMPLATE
              .replace("{F209}", DB_COMPANY_FILTER.replace("'", "''"))
              .replace("{CREDITOR}", _SQL_CREDITOR))
+
+# Ручной список EID из Excel (--excel_file): берём сделки по списку, без условий
+# отбора (решение > 33 дней, F318, статусы). Остаются только фильтр компании
+# (F209 + кредитор) и пропуск уже поданного (журнал / ProcessImport).
+EXCEL_FILE = (_args.excel_file or "").strip() or None
+if EXCEL_FILE and KIND != "reshenie":
+    print("❌ Список EID из Excel поддержан только для заявлений по решению (--kind reshenie).")
+    sys.exit(1)
+_SQL_BY_EIDS = (_SQL_RESHENIE_HEAD + r"""
+WHERE
+    l.F209 = N'{F209}'
+    {CREDITOR}
+    AND l.EID IN ({EIDS})
+""").replace("{F209}", DB_COMPANY_FILTER.replace("'", "''")).replace("{CREDITOR}", _SQL_CREDITOR)
 
 
 # ============================================================
@@ -444,10 +470,17 @@ def defendant_line(row):
     """Строка ответчика — общая для DOCX ({DefendantsData}) и электронного бланка."""
     fio = normalize_text(row["FIO"])
     iin = normalize_text(row["IIN"])
+    case_number = normalize_text(row.get("CaseNumber", ""))
+    case_part = f", № судебного дела {case_number}" if case_number else ""
     if KIND == "reshenie":
-        return f"1. {fio}, ИИН {iin}"
+        line = f"1. {fio}, ИИН {iin}{case_part}"
+        debt = row.get("DebtBalance")
+        if debt is not None and not pd.isna(debt) and str(debt).strip() != "":
+            line += f", остаток задолженности {format_money_kz(debt)} тг"
+        return line
     # В шаблоне «по определению» номер «1.» — часть списка Word, в бланк он дописывается отдельно.
-    return f"{fio}, ИИН {iin}, сумма задолженности {format_money_kz(row['DebtRestWithoutStateDuty'])} тенге"
+    return (f"{fio}, ИИН {iin}{case_part}, "
+            f"сумма задолженности {format_money_kz(row['DebtRestWithoutStateDuty'])} тенге")
 
 
 def build_letter_text_reshenie(row, project_cfg):
@@ -477,10 +510,7 @@ def build_letter_text_reshenie(row, project_cfg):
 
 
 def build_letter_text_opredelenie(row, project_cfg):
-    amount = format_money_kz(row["DebtRestWithoutStateDuty"])
     sud = normalize_text(row["Sud"])
-    fio = normalize_text(row["FIO"])
-    iin = normalize_text(row["IIN"])
     project_name = project_cfg["project_name"]
 
     return (
@@ -490,7 +520,7 @@ def build_letter_text_opredelenie(row, project_cfg):
         f"ЗАЯВЛЕНИЕ\n\n"
         f"В производстве - {sud} находится гражданское дело по иску "
         f"{project_name} о взыскании задолженности к следующему ответчику:\n"
-        f"1. {fio}, ИИН {iin}, сумма задолженности {amount} тенге\n\n"
+        f"1. {defendant_line(row)}\n\n"
         f"Ранее между {project_name} и вышеуказанным Ответчикам было заключено "
         f"медиативное соглашение, однако до настоящего времени со стороны Ответчика "
         f"не было произведено оплаты в пользу погашения задолженности перед "
@@ -697,16 +727,53 @@ def _read_processimport_eids(path):
     return {_id_str(v) for v in pi["Уникальный номер сделки"].dropna() if _id_str(v)}
 
 
+def read_eids_from_excel(path):
+    """EID из первого столбца первого листа; заголовок и нечисловые ячейки пропускаются."""
+    raw = pd.read_excel(path, header=None, usecols=[0], dtype=str, engine="openpyxl")
+    eids = []
+    for v in raw.iloc[:, 0].dropna():
+        v = str(v).strip()
+        if re.fullmatch(r"\d+(\.0+)?", v):
+            eid = _id_str(v)
+            if eid not in eids:
+                eids.append(eid)
+    return eids
+
+
+def _query_by_eids(conn, eids):
+    parts = []
+    for i in range(0, len(eids), 500):
+        chunk = eids[i:i + 500]  # только цифры (см. read_eids_from_excel) — подставлять безопасно
+        parts.append(pd.read_sql(_SQL_BY_EIDS.replace("{EIDS}", ", ".join(chunk)), conn))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
 def load_source():
+    eid_list = None
+    if EXCEL_FILE:
+        if not Path(EXCEL_FILE).exists():
+            raise FileNotFoundError(f"Файл со списком EID не найден: {EXCEL_FILE}")
+        eid_list = read_eids_from_excel(EXCEL_FILE)
+        log(f"Режим СПИСКА EID из Excel: {Path(EXCEL_FILE).name} — {len(eid_list)} уникальных EID "
+            f"(условия SQL-отбора не применяются)")
+        if not eid_list:
+            log("❌ В первом столбце файла не найдено ни одного EID.")
+            return pd.DataFrame()
     log("Подключение к БД...")
     conn = get_db_connection()
     try:
-        df = pd.read_sql(SQL_QUERY, conn)
+        df = _query_by_eids(conn, eid_list) if eid_list is not None else pd.read_sql(SQL_QUERY, conn)
         log(f"SQL выполнен: {len(df)} строк")
     finally:
         conn.close()
     df["LoanID"] = df["LoanID"].apply(_id_str)
     df["EID"] = df["EID"].apply(_id_str)
+    if eid_list is not None:
+        missing = [e for e in eid_list if e not in set(df["EID"])]
+        if missing:
+            log(f"⚠ Не найдено в БД для этой компании ({len(missing)}): {', '.join(missing)}")
+        order = {e: i for i, e in enumerate(eid_list)}
+        df = df.sort_values("EID", key=lambda s: s.map(order), kind="stable").reset_index(drop=True)
     df["IIN"] = df["IIN"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
     df["Sud"] = df["Sud"].apply(normalize_text)
     df["FIO"] = df["FIO"].apply(normalize_text)
@@ -1340,10 +1407,12 @@ def main():
             with PortalSotHttp(COMPANY_ID, _portal_login, log=log) as portal:
                 PORTAL = portal
 
-                # Проверка авторизации
-                org = api_data(api_request("GET", f"/api/secure/gbdul/v2/byBin/{ORG_BIN}"))
-                log(f"Авторизация portal-sot.kz: OK — "
-                    f"{org.get('fullNameRu') if isinstance(org, dict) else ORG_BIN}")
+                # Проверка авторизации — ВРЕМЕННО ОТКЛЮЧЕНА: ГБД ЮЛ на portal-sot.kz не работает.
+                # Как заработает — вернуть запрос:
+                # org = api_data(api_request("GET", f"/api/secure/gbdul/v2/byBin/{ORG_BIN}"))
+                # log(f"Авторизация portal-sot.kz: OK — "
+                #     f"{org.get('fullNameRu') if isinstance(org, dict) else ORG_BIN}")
+                log(f"Авторизация portal-sot.kz: проверка через ГБД ЮЛ пропущена (БИН {ORG_BIN})")
 
                 if SIGN_AND_SEND:
                     # NCALayer должен работать с сертификатом ЭТОЙ компании (вход мог пройти

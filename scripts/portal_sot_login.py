@@ -62,12 +62,47 @@ def jwt_claims(token: str) -> dict:
         return {}
 
 
+# Отметка в localStorage профиля: чьей ЭЦП выполнен вход. Профиль браузера
+# общий для компании, а входить в нём могут и ЭЦП компании, и личные ЭЦП
+# сотрудников — живую сессию переиспользуем, только если она «наша».
+LOGIN_MARK_KEY = "runner_login_owner"
+
+
+def switch_ncalayer_cert(cert_path: str, log=print):
+    """Переключает NCALayer на файл ЭЦП cert_path (recentPath в
+    %APPDATA%/NCALayer/settings.json; при смене — перезапуск NCALayer, иначе
+    он не перечитает настройку). В отличие от config.ensure_ncalayer_cert,
+    ошибка здесь фатальна: войти не тем сертификатом хуже, чем не войти."""
+    if not os.path.isfile(cert_path):
+        raise RuntimeError(f"Файл ЭЦП не найден: {cert_path}")
+    settings_path = os.path.join(os.environ["APPDATA"], "NCALayer", "settings.json")
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    if data.get("settings", {}).get("recentPath") == cert_path:
+        return
+    data.setdefault("settings", {})["recentPath"] = cert_path
+    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+    with open(settings_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    subprocess.run(["taskkill", "/IM", "NCALayer.exe", "/F"], capture_output=True)
+    time.sleep(1.5)
+    log("NCALayer переключён на личную ЭЦП (перезапуск)")
+
+
 class PortalSotLogin:
     def __init__(self, company_id: str, cfg: dict, log=print, dump_dir=None, browser="firefox"):
         """cfg — PORTAL_SOT_BY_COMPANY[company_id] из config.py.
-        browser — "firefox" (профиль firefox_profile) или "chrome" (chrome_profile)."""
+        browser — "firefox" (профиль firefox_profile) или "chrome" (chrome_profile).
+        Вход личной ЭЦП сотрудника: в cfg ещё personal_cert_path и personal_iin,
+        а eds_password/portal_password — его собственные."""
         self.company_id = str(company_id)
         self.cfg = cfg
+        self.personal_cert = cfg.get("personal_cert_path")
+        self.login_owner = (f"iin:{cfg['personal_iin']}" if self.personal_cert
+                            else f"company:{self.company_id}")
         self.log = log
         self.dump_dir = dump_dir or os.getcwd()
         self.browser = browser
@@ -145,12 +180,16 @@ class PortalSotLogin:
     # ---------- NCALayer ----------
 
     def ensure_ncalayer(self, timeout=70):
-        """NCALayer обязан работать с сертификатом ЭТОЙ компании ДО клика «Войти»."""
-        try:
-            from config import ensure_ncalayer_cert
-            ensure_ncalayer_cert(self.company_id)  # при смене сертификата перезапускает NCALayer
-        except Exception as e:
-            self.log(f"ensure_ncalayer_cert: {e}")
+        """NCALayer обязан работать с нужным сертификатом ДО клика «Войти»:
+        личной ЭЦП сотрудника, если она задана, иначе ЭЦП компании."""
+        if self.personal_cert:
+            switch_ncalayer_cert(self.personal_cert, log=self.log)
+        else:
+            try:
+                from config import ensure_ncalayer_cert
+                ensure_ncalayer_cert(self.company_id)  # при смене сертификата перезапускает NCALayer
+            except Exception as e:
+                self.log(f"ensure_ncalayer_cert: {e}")
 
         if _port_open(NCALAYER_WS_PORT):
             self.log("NCALayer уже запущен (порт 13579)")
@@ -287,7 +326,13 @@ class PortalSotLogin:
             time.sleep(3)
             access = driver.execute_script("return localStorage.getItem('access_token');")
             has_pwd_field = driver.execute_script("return !!document.querySelector(\"input[type='password']\");")
-            if access and "/cabinet" in driver.current_url.lower() and not has_pwd_field:
+            owner = driver.execute_script(f"return localStorage.getItem('{LOGIN_MARK_KEY}');")
+            # Сессия без отметки — от входа до появления личных ЭЦП, т.е. ЭЦП компании.
+            same_owner = owner == self.login_owner or (owner is None and not self.personal_cert)
+            if access and not same_owner:
+                self.log("В профиле браузера сессия под другой ЭЦП — вхожу заново")
+                self.clear_session(driver)
+            elif access and "/cabinet" in driver.current_url.lower() and not has_pwd_field:
                 exp = jwt_claims(access).get("exp", 0) or 0
                 if exp and exp > time.time() + 30:
                     self.log(f"✅ Сессия portal-sot.kz жива (токен действует до "
@@ -359,6 +404,7 @@ class PortalSotLogin:
         access, refresh = self.read_tokens(driver)
         if not access:
             raise RuntimeError("access_token не найден после входа")
+        driver.execute_script(f"localStorage.setItem('{LOGIN_MARK_KEY}', arguments[0]);", self.login_owner)
         self.log("✅ Вход на portal-sot.kz выполнен, access_token получен")
         return access, refresh
 

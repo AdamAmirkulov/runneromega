@@ -21,10 +21,13 @@ scripts/podacha_iska_v2.py (office.sud.kz больше не работает).
 
 Всё, что в ноутбуке было захардкожено под Омегу, берётся по --company_id:
   COMPANY_ROOTS[id]              → папка «Документы для подачи Исков», Excel, партии
-  COMPANY_CREDENTIALS[id]        → org_bin, org_bank, rep_iin
+  COMPANY_CREDENTIALS[id]        → org_bin, org_bank
                                    (+ необяз. org_legal_address / org_display_address)
-  PORTAL_SOT_BY_COMPANY[id]      → eds_password, portal_password, firefox_profile,
-                                   cert_path (+ необяз. ncalayer_path)
+  PORTAL_SOT_BY_COMPANY[id]      → firefox_profile (+ необяз. ncalayer_path)
+
+Вход и представитель — ЛИЧНАЯ ЭЦП сотрудника, запустившего подачу (user_eds.py,
+переменные окружения PORTAL_PERSONAL_*): файл .p12, пароли ЭЦП и portal-sot.kz,
+ИИН (= представитель в иске). ЭЦП компании / rep_iin здесь не используются.
 
 Логика v24 сохранена: документы строго по 6-значному номеру из колонки A,
 локальный справочник судов (без уголовных, Актау → CODE 194711), retry
@@ -125,7 +128,19 @@ SIMPLE_CASE = True
 
 ORG_BIN = CREDENTIALS["org_bin"]
 ORG_BANK = CREDENTIALS["org_bank"]
-REP_IIN = CREDENTIALS["rep_iin"]
+
+# Вход — ЛИЧНОЙ ЭЦП сотрудника, запустившего подачу (раздел «🔑 Моя ЭЦП»,
+# user_eds.py). app.py передаёт её только через окружение процесса. ЭЦП
+# компании для подачи не используется: нет личной — не подаём.
+PERSONAL_EDS = {k: os.environ.get(f"PORTAL_PERSONAL_{k}", "").strip()
+                for k in ("EDS_CERT", "EDS_PASSWORD", "PORTAL_PASSWORD", "IIN", "FIO", "BIN", "USERNAME")}
+if not (PERSONAL_EDS["EDS_CERT"] and PERSONAL_EDS["EDS_PASSWORD"] and PERSONAL_EDS["IIN"]):
+    print("❌ Не передана личная ЭЦП сотрудника. Подача исков запускается только из веб-интерфейса "
+          "пользователем, у которого загружена ЭЦП (раздел «🔑 Моя ЭЦП»).")
+    sys.exit(1)
+
+# Представитель в иске — владелец ЭЦП, которой выполнен вход.
+REP_IIN = PERSONAL_EDS["IIN"]
 
 # Адреса истца: из COMPANY_CREDENTIALS (org_legal_address/org_display_address),
 # иначе — известные значения (Омега из ноутбука), иначе — из ГБД ЮЛ.
@@ -146,6 +161,15 @@ if not PORTAL_CFG:
     print(f"❌ Для компании {COMPANY_ID} нет записи в PORTAL_SOT_BY_COMPANY (scripts/config.py): "
           f"нужны ЭЦП-сертификат, пароли и Firefox-профиль с разрешением portal-sot.kz → NCALayer.")
     sys.exit(1)
+
+# Профиль браузера и путь к NCALayer — от компании, сертификат и пароли — личные.
+PORTAL_CFG = {
+    **PORTAL_CFG,
+    "personal_cert_path": PERSONAL_EDS["EDS_CERT"],
+    "personal_iin": PERSONAL_EDS["IIN"],
+    "eds_password": PERSONAL_EDS["EDS_PASSWORD"],
+    "portal_password": PERSONAL_EDS["PORTAL_PASSWORD"],
+}
 
 FIREFOX_PROFILE_DIR = Path(PORTAL_CFG["firefox_profile"])
 
@@ -1877,7 +1901,12 @@ def main():
     _lock.acquire()  # другой скрипт уже на portal-sot.kz → ждём его
 
     portal_login = PortalSotLogin(COMPANY_ID, PORTAL_CFG, log=log, dump_dir=str(OUT_DIR))
-    log("🔐 Вход на portal-sot.kz через ЭЦП...")
+    log(f"🔐 Вход на portal-sot.kz личной ЭЦП: {PERSONAL_EDS['FIO']} (ИИН {REP_IIN}, "
+        f"пользователь {PERSONAL_EDS['USERNAME'] or '—'}) — он же представитель в исках")
+    if PERSONAL_EDS["BIN"] and PERSONAL_EDS["BIN"] != ORG_BIN:
+        log(f"⚠ БИН в сертификате ({PERSONAL_EDS['BIN']}) не совпадает с БИН компании ({ORG_BIN})")
+    elif not PERSONAL_EDS["BIN"]:
+        log("⚠ Сертификат физлица (без БИН организации) — подача пойдёт от этого физлица как представителя")
     driver = portal_login.init_driver()
     portal_sign_in()
     check_org()

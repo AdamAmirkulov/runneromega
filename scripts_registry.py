@@ -15,6 +15,7 @@ class ScriptDef:
     allow_scheduled_start: bool = False   # ✅ новое поле, по умолчанию выключено
     hidden: bool = False                  # не показывать в списке скриптов / в правах пользователей
                                           # (запускается только служебными механизмами, напр. рассылки)
+    requires_personal_eds: bool = False   # вход на portal-sot.kz личной ЭЦП того, кто запустил (user_eds.py)
 
 SCRIPTS: Dict[str, ScriptDef] = {
     
@@ -174,6 +175,7 @@ SCRIPTS: Dict[str, ScriptDef] = {
             ),
             # Раньше: scripts/podacha_iska_v2.py (office.sud.kz, больше не работает).
             command=["python", "-u", "scripts/podacha_portal_sot.py"],
+            requires_personal_eds=True,
             allow_scheduled_start=True,
             params=[
                 {"name": "company_id", "label": "Компания", "type": "select"},
@@ -211,6 +213,14 @@ SCRIPTS: Dict[str, ScriptDef] = {
                 {"name": "company_id", "label": "Компания", "type": "select"},
                 {"name": "max_rows", "label": "Макс. сделок (пусто = все; для теста поставьте 1)", "type": "text"},
                 {"name": "no_sign", "label": "Без подписи (1 = только черновики в кабинете; пусто = подписать и отправить)", "type": "text"},
+                {
+                    "name": "excel_file",
+                    "label": "Список EID (необязательно): Excel, EID в первом столбце. "
+                             "Если загружен — подаются сделки из списка вместо отбора из БД",
+                    "type": "file",
+                    "accept": ".xlsx",
+                    "save_to": "uploads/portal_sot_il_eids.xlsx",
+                },
             ],
         ),
 

@@ -137,7 +137,23 @@ def init_aisoip_db():
         CREATE INDEX IF NOT EXISTS idx_productions_status ON productions(company_id, status);
         CREATE INDEX IF NOT EXISTS idx_productions_start_date ON productions(company_id, start_date);
         CREATE INDEX IF NOT EXISTS idx_productions_document_no ON productions(company_id, document_no);
+        CREATE TABLE IF NOT EXISTS last_update (
+            company_id INTEGER PRIMARY KEY,
+            updated_at TEXT NOT NULL,
+            source TEXT
+        );
         """)
+
+
+def mark_updated(company_id: int, source: str):
+    """Время последнего УСПЕШНОГО обновления базы компании (синхронизация или
+    импорт Excel). Упавшая на середине синхронизация сюда не пишет."""
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO last_update(company_id, updated_at, source) VALUES (?, ?, ?) "
+            "ON CONFLICT(company_id) DO UPDATE SET updated_at=excluded.updated_at, source=excluded.source",
+            (company_id, datetime.now().isoformat(timespec="seconds"), source),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -335,8 +351,14 @@ def get_stats(company_id: int):
             "GROUP BY status ORDER BY cnt DESC",
             (company_id,),
         ).fetchall()
+        last = conn.execute(
+            "SELECT updated_at, source FROM last_update WHERE company_id = ?", (company_id,),
+        ).fetchone()
+    # Для данных, загруженных до появления last_update, — время последней записанной строки.
     return {
-        "total": row["total"], "debtors": row["debtors"], "updated": row["updated"],
+        "total": row["total"], "debtors": row["debtors"],
+        "updated": last["updated_at"] if last else row["updated"],
+        "updated_source": last["source"] if last else None,
         "statuses": [dict(r) for r in statuses],
     }
 
@@ -687,6 +709,7 @@ class SyncManager:
             self._set(total_elements=total_elements)
 
             if total_elements == 0:
+                mark_updated(self.company_id, "sync")
                 self._set(
                     stage="Готово", running=False,
                     finished_at=datetime.now().isoformat(timespec="seconds"),
@@ -759,6 +782,7 @@ class SyncManager:
                     f"Получено меньше строк, чем сообщил API: {rows_received} < {total_elements}"
                 )
 
+            mark_updated(self.company_id, "sync")
             self._set(
                 stage="Готово", running=False,
                 finished_at=datetime.now().isoformat(timespec="seconds"),

@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from scripts_registry import SCRIPTS
 from database import (
-    init_db, get_db, User, Company, SessionLocal,
+    init_db, get_db, User, Company, SessionLocal, ChsiContact,
     Schedule, get_all_schedules, get_active_schedules, get_schedule,
     create_schedule, update_schedule, delete_schedule, toggle_schedule,
     create_job_run, update_job_run_status, get_job_runs, get_job_run_script_keys, count_job_runs,
@@ -36,12 +36,14 @@ from database import (
 )
 from mailing_common import PLACEHOLDERS
 from auth import (
-    create_session, get_current_user, get_admin_user,
+    create_session, get_current_user, get_admin_user, get_mailing_user,
     verify_password, SESSIONS, user_can_access_company,
     get_user_allowed_company_ids,
     get_active_company_id, set_active_company_id,
 )
 import aisoip_web
+from html import escape as html_escape
+import user_eds
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "runs"
@@ -454,6 +456,8 @@ body { font-family: Arial; max-width: 1400px; margin: 20px auto; padding: 0 20px
       <span class="company-badge" style="background:#6c757d;">Все компании</span>
     {% endif %}
     <a href="/aisoip" class="admin-btn" style="background:#0b4f6c;">🔎 АИС ОИП поиск</a>
+    <a href="/eds" class="admin-btn" style="background:#5a4b8a;">🔑 Моя ЭЦП</a>
+    {% if user.role != 'admin' and user.can_mailings %}<a href="/admin/mailings" class="admin-btn" style="background:#e67e22;">📨 Рассылки</a>{% endif %}
     {% if user.role == 'admin' %}<a href="/admin" class="admin-btn">⚙️ Админка</a>{% endif %}
     <a href="/logout" class="logout-btn">Выход</a>
   </div>
@@ -625,7 +629,7 @@ body { font-family: Arial; max-width: 1400px; margin: 20px auto; padding: 0 20px
   </table>
 </div>
 
-<div class="history-container">
+<div class="history-container" id="history">
   <h3 style="margin-top: 0;">История запусков</h3>
   <table class="history-table">
     <tr>
@@ -669,6 +673,13 @@ body { font-family: Arial; max-width: 1400px; margin: 20px auto; padding: 0 20px
     </tr>
     {% endfor %}
   </table>
+  <div style="display:flex; align-items:center; justify-content:space-between; margin-top:12px;">
+    <span style="color:#666; font-size:13px;">Всего запусков: {{ total_jobs }} | страница {{ page }} из {{ total_pages }}</span>
+    <span>
+      {% if page > 1 %}<a href="{{ history_url(page-1) }}">← Назад</a>{% endif %}
+      {% if page < total_pages %}&nbsp;&nbsp;<a href="{{ history_url(page+1) }}">Вперёд →</a>{% endif %}
+    </span>
+  </div>
 </div>
 
 </body></html>
@@ -758,7 +769,7 @@ function fmtMoney(n){if(n===null||n===undefined||n==='')return '—';return new 
 function params(){const p=new URLSearchParams();ids.forEach(id=>{const v=$(id).value.trim();if(v)p.set(id,v)});if(COMPANY_ID)p.set('company_id',COMPANY_ID);return p}
 function renderChips(){const c=$('chips');c.innerHTML='';ids.forEach(id=>{const v=$(id).value.trim();if(!v)return;const el=document.createElement('div');el.className='chip';el.innerHTML=`<b>${esc(names[id])}</b>${esc(id.startsWith('date_')?fmtDate(v):v)}<span class="x">×</span>`;el.querySelector('.x').onclick=()=>{$(id).value='';renderChips();search()};c.appendChild(el)})}
 async function loadOptions(){if(!COMPANY_ID)return;const r=await fetch('/api/aisoip/options?company_id='+COMPANY_ID);const d=await r.json();d.executors.forEach(v=>$('executor').insertAdjacentHTML('beforeend',`<option>${esc(v)}</option>`));d.statuses.forEach(v=>$('status').insertAdjacentHTML('beforeend',`<option>${esc(v)}</option>`))}
-async function loadStats(){if(!COMPANY_ID)return;const r=await fetch('/api/aisoip/stats?company_id='+COMPANY_ID);const d=await r.json();$('stats').textContent=`В базе: ${d.total.toLocaleString('ru-RU')} производств · ${d.debtors.toLocaleString('ru-RU')} ИИН/БИН`}
+async function loadStats(){if(!COMPANY_ID)return;const r=await fetch('/api/aisoip/stats?company_id='+COMPANY_ID);const d=await r.json();let upd='';if(d.updated){const t=new Date(d.updated);const src=d.updated_source==='sync'?' (синхронизация с АИС ОИП)':d.updated_source==='import'?' (импорт Excel)':'';upd=` · Последнее обновление: <b>${t.toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'})}</b>${src}`}else{upd=' · Ещё не обновлялась'}$('stats').innerHTML=`В базе: ${d.total.toLocaleString('ru-RU')} производств · ${d.debtors.toLocaleString('ru-RU')} ИИН/БИН`+upd}
 async function search(){if(!COMPANY_ID)return;renderChips();$('spinner').style.display='inline';try{const r=await fetch('/api/aisoip/search?'+params().toString());const d=await r.json();$('found').textContent=`Найдено: ${d.count.toLocaleString('ru-RU')}`;const c=$('cards');c.innerHTML='';if(!d.items.length){c.innerHTML='<div class="empty">По заданным параметрам исполнительные производства не найдены.</div>';return}d.items.forEach(x=>{const card=document.createElement('div');card.className='card';card.innerHTML=`
 <div class="cell"><div class="label2">Исполнительный документ:</div><div class="value">${esc(x.document_no||'—')} &nbsp; от ${fmtDate(x.document_date)}</div><div class="label2">Орган, выдавший исполнительный документ:</div><div class="value">${esc(x.issuer||'—')}</div></div>
 <div class="cell"><div class="label2">Исполнительное производство:</div><div class="value linklike">${esc(x.production_no)}</div><div class="label2">Дата возбуждения:</div><div class="value">${fmtDate(x.start_date)}</div></div>
@@ -895,6 +906,13 @@ button:hover { background: #0056b3; }
     {% endfor %}
   </div>
   
+  <div class="form-group" id="mailings-group">
+    <label>
+      <input name="can_mailings" type="checkbox" {% if user and user.can_mailings %}checked{% endif %}> 📨 Доступ к рассылкам
+    </label>
+    <p style="color: #666; font-size: 13px; margin: 4px 0 0 0;">Раздел «Рассылки по отчётам» целиком (рассылки, отчёты SQL, справочник ЧСИ, отправка) — без остальной админки. Администратору не нужно.</p>
+  </div>
+
   <div class="form-group">
     <label>
       <input name="is_active" type="checkbox" {% if not user or user.is_active %}checked{% endif %}> Активен
@@ -913,6 +931,7 @@ function toggleFields() {
   companyGroup.style.display = (role === 'operator') ? 'block' : 'none';
   companiesGroup.style.display = (role === 'manager') ? 'block' : 'none';
   scriptsSection.style.display = (role === 'admin') ? 'none' : 'block';
+  document.getElementById('mailings-group').style.display = (role === 'admin') ? 'none' : 'block';
 }
 
 function selectAll() {
@@ -977,6 +996,7 @@ th { background: #28a745; color: white; }
     <td>{% if u.is_active %}Активен{% else %}Заблокирован{% endif %}</td>
     <td>
       <a href="/admin/user/{{ u.id }}/edit" class="btn btn-edit">Изменить</a>
+      <a href="/eds?user_id={{ u.id }}" class="btn btn-edit" style="background:#5a4b8a;">ЭЦП</a>
       {% if u.username != 'admin' %}
       <a href="/admin/user/{{ u.id }}/delete" class="btn btn-delete" onclick="return confirm('Удалить пользователя?')">Удалить</a>
       {% endif %}
@@ -1239,6 +1259,7 @@ def _resolve_active_company(current_user: User, session_id: Optional[str], reque
 @app.get("/", response_class=HTMLResponse)
 def index(
     company: Optional[str] = None,
+    page: int = 1,
     session_id: Optional[str] = Cookie(None, alias="session"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -1288,15 +1309,158 @@ def index(
     else:
         filtered_jobs = [j for j in all_jobs if j.get("company_id") == current_user.company_id]
 
+    # История запусков — по 20 записей на страницу
+    HISTORY_PAGE_SIZE = 20
+    total_jobs = len(filtered_jobs)
+    total_pages = max(1, -(-total_jobs // HISTORY_PAGE_SIZE))  # ceil
+    page = min(max(1, page), total_pages)
+    page_jobs = filtered_jobs[(page - 1) * HISTORY_PAGE_SIZE: page * HISTORY_PAGE_SIZE]
+
+    def history_url(p):
+        q = f"page={p}"
+        if company:
+            q = f"company={company}&" + q
+        return f"/?{q}#history"
+
     return render(
         INDEX_HTML,
         scripts=available_scripts,
-        jobs=filtered_jobs,
+        jobs=page_jobs,
+        total_jobs=total_jobs,
+        page=page,
+        total_pages=total_pages,
+        history_url=history_url,
         user=current_user,
         companies=companies,
         current_company=current_company,
         active_company=active_company,
     )
+
+
+# ═══════════════════════════════════════════════════════════════
+# ЛИЧНАЯ ЭЦП СОТРУДНИКА (user_eds.py) — вход на portal-sot.kz при подаче исков
+# ═══════════════════════════════════════════════════════════════
+
+EDS_HTML = """
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><title>ЭЦП — {{ target.full_name }}</title>
+<style>
+body{font-family:Arial,"Segoe UI",sans-serif;background:#f5f7fa;margin:0;color:#293238}
+.wrap{max-width:640px;margin:30px auto;padding:0 20px}
+.card{background:#fff;border-radius:8px;box-shadow:0 2px 7px rgba(0,0,0,.1);padding:22px 26px;margin-bottom:18px}
+h2{margin:0 0 14px} table{border-collapse:collapse} td{padding:4px 14px 4px 0;vertical-align:top} td:first-child{color:#72777b}
+label{display:block;margin:12px 0 4px;font-size:13px;color:#555} input[type=password],input[type=file]{width:100%;padding:8px;box-sizing:border-box}
+.btn{display:inline-block;padding:9px 18px;border:none;border-radius:4px;color:#fff;background:#0b4f6c;cursor:pointer;font-weight:700;text-decoration:none;margin-top:16px}
+.del{background:#dc3545}.ok{color:#2f7a45;font-weight:700}.bad{color:#b02a37;font-weight:700}
+.msg{padding:10px 14px;border-radius:4px;margin-bottom:16px}.msg.e{background:#f8d7da;color:#842029}.msg.s{background:#d1e7dd;color:#0f5132}
+.muted{color:#72777b;font-size:13px}
+</style></head><body><div class="wrap">
+<p><a href="{{ '/admin' if target.id != user.id else '/' }}">← Назад</a></p>
+{% if error %}<div class="msg e">⛔ {{ error }}</div>{% endif %}
+{% if saved %}<div class="msg s">✅ ЭЦП сохранена и проверена</div>{% endif %}
+<div class="card">
+  <h2>🔑 Личная ЭЦП{% if target.id != user.id %} — {{ target.full_name }} ({{ target.username }}){% endif %}</h2>
+  <p class="muted">Подача исков на portal-sot.kz выполняется под личной ЭЦП того, кто её запускает.
+  Представителем в иске указывается владелец этой ЭЦП.</p>
+  {% if eds %}
+  <table>
+    <tr><td>Владелец</td><td><b>{{ eds.full_name }}</b></td></tr>
+    <tr><td>ИИН</td><td>{{ eds.iin }}</td></tr>
+    <tr><td>БИН организации</td><td>{{ eds.org_bin or '— (сертификат физлица)' }}</td></tr>
+    <tr><td>Действует</td><td>{{ eds.valid_from.strftime('%d.%m.%Y') if eds.valid_from }} — {{ eds.valid_to.strftime('%d.%m.%Y') if eds.valid_to }}
+      {% if expired %}<span class="bad">просрочена</span>{% elif days_left is not none and days_left <= 30 %}<span class="bad">истекает через {{ days_left }} дн.</span>{% else %}<span class="ok">действует</span>{% endif %}</td></tr>
+    <tr><td>Файл</td><td>{{ eds.file_name }}</td></tr>
+    <tr><td>Загружена</td><td>{{ eds.uploaded_at.strftime('%d.%m.%Y %H:%M') if eds.uploaded_at }} ({{ eds.uploaded_by }})</td></tr>
+  </table>
+  <form method="post" action="/eds/delete" onsubmit="return confirm('Удалить ЭЦП? Подавать иски будет нельзя, пока не загрузите новую.')">
+    <input type="hidden" name="user_id" value="{{ target.id }}"><button class="btn del">Удалить ЭЦП</button>
+  </form>
+  {% else %}
+  <p class="bad">ЭЦП не загружена — запуск подачи исков недоступен.</p>
+  {% endif %}
+</div>
+<div class="card">
+  <h2>{{ 'Заменить' if eds else 'Загрузить' }} ЭЦП</h2>
+  <form method="post" action="/eds" enctype="multipart/form-data">
+    <input type="hidden" name="user_id" value="{{ target.id }}">
+    <label>Файл ЭЦП (.p12, обычно GOST512_… или AUTH_…)</label><input type="file" name="file" accept=".p12" required>
+    <label>Пароль от ЭЦП</label><input type="password" name="eds_password" autocomplete="off" required>
+    <label>Пароль от portal-sot.kz (личный кабинет владельца ЭЦП)</label><input type="password" name="portal_password" autocomplete="off" required>
+    <button class="btn">Проверить и сохранить</button>
+  </form>
+  <p class="muted">Пароль ЭЦП проверяется сразу при загрузке. Пароли хранятся на сервере в зашифрованном виде.</p>
+</div>
+</div></body></html>
+"""
+
+
+def _eds_target(current_user: User, user_id, db: Session):
+    """Свою ЭЦП видит/меняет любой; чужую — только админ."""
+    if user_id in (None, "", current_user.id, str(current_user.id)):
+        return current_user
+    if current_user.role != "admin":
+        return None
+    try:
+        return db.query(User).filter(User.id == int(user_id)).first()
+    except (TypeError, ValueError):
+        return None
+
+
+def _eds_page(current_user, target, db, error=None, saved=False, status_code=200):
+    eds = user_eds.get(db, target.id)
+    days_left = expired = None
+    if eds and eds.valid_to:
+        days_left = (eds.valid_to - datetime.now()).days
+        expired = eds.valid_to < datetime.now()
+    return HTMLResponse(render(EDS_HTML, user=current_user, target=target, eds=eds, error=error,
+                               saved=saved, days_left=days_left, expired=expired), status_code=status_code)
+
+
+@app.get("/eds", response_class=HTMLResponse)
+def eds_page(user_id: Optional[str] = None, current_user: User = Depends(get_current_user),
+             db: Session = Depends(get_db)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    target = _eds_target(current_user, user_id, db)
+    if target is None:
+        return HTMLResponse("⛔ Нет доступа", status_code=403)
+    return _eds_page(current_user, target, db)
+
+
+@app.post("/eds", response_class=HTMLResponse)
+async def eds_upload(
+    user_id: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    eds_password: str = Form(""),
+    portal_password: str = Form(""),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    target = _eds_target(current_user, user_id, db)
+    if target is None:
+        return HTMLResponse("⛔ Нет доступа", status_code=403)
+    data = await file.read(user_eds.MAX_P12_BYTES + 1)
+    try:
+        user_eds.save(db, target, data, file.filename, eds_password, portal_password,
+                      uploaded_by=current_user.username)
+    except user_eds.EdsError as e:
+        return _eds_page(current_user, target, db, error=str(e), status_code=400)
+    return _eds_page(current_user, target, db, saved=True)
+
+
+@app.post("/eds/delete")
+def eds_delete(user_id: Optional[str] = Form(None), current_user: User = Depends(get_current_user),
+               db: Session = Depends(get_db)):
+    if isinstance(current_user, RedirectResponse):
+        return current_user
+    target = _eds_target(current_user, user_id, db)
+    if target is None:
+        return HTMLResponse("⛔ Нет доступа", status_code=403)
+    user_eds.delete(db, target.id)
+    suffix = f"?user_id={target.id}" if target.id != current_user.id else ""
+    return RedirectResponse(f"/eds{suffix}", status_code=303)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1454,6 +1618,8 @@ async def aisoip_import(
     try:
         Path(tmp).write_bytes(contents)
         total = aisoip_web.import_xlsx(tmp, file.filename, resolved)
+        if total > 0:
+            aisoip_web.mark_updated(resolved, "import")
     except Exception as e:
         return {"ok": False, "error": str(e)}
     finally:
@@ -1550,6 +1716,16 @@ async def run_submit(
         return HTMLResponse("⛔ У вас нет доступа к этому скрипту", status_code=403)
 
     script = SCRIPTS[script_key]
+    if getattr(script, "requires_personal_eds", False):
+        try:
+            user_eds.job_env(db, current_user.username)
+        except user_eds.EdsMissing as e:
+            return HTMLResponse(
+                f"<p>⛔ {html_escape(str(e))}</p>"
+                f"<p>Подача исков идёт под личной ЭЦП того, кто её запускает. "
+                f"<a href='/eds'>Загрузить ЭЦП</a> · <a href='/'>На главную</a></p>",
+                status_code=400,
+            )
     form = await request.form()
     params = {}
 
@@ -1748,7 +1924,8 @@ async def add_user_submit(
         password_hash=hash_password(password),
         role=role,
         company_id=final_company_id,
-        is_active=bool(is_active)
+        is_active=bool(is_active),
+        can_mailings=(role != "admin" and bool(form.get("can_mailings"))),
     )
     db.add(new_user)
     db.commit()
@@ -1811,6 +1988,7 @@ async def edit_user_submit(
     user.role = role
     user.company_id = int(company_id) if (role == "operator" and company_id) else None
     user.is_active = bool(is_active)
+    user.can_mailings = role != "admin" and bool(form.get("can_mailings"))
 
     if password:
         user.password_hash = hash_password(password)
@@ -1983,11 +2161,26 @@ def execute_job(job_id: str):
             # stdout/stderr скрипта идут прямо в logs.txt (UTF-8); без
             # PYTHONIOENCODING stderr пишется в cp1251, и в логе вместо
             # кириллицы (пути, тексты ошибок Windows, tqdm) — «�����».
-            child_env = dict(os.environ, PYTHONIOENCODING="utf-8")
+            proc_env = dict(os.environ, PYTHONIOENCODING="utf-8")
+            if getattr(script, "requires_personal_eds", False):
+                # Личная ЭЦП того, кто запустил: только через окружение процесса —
+                # командная строка выше пишется в logs.txt.
+                _db = SessionLocal()
+                try:
+                    eds_env = user_eds.job_env(_db, job.get("username"))
+                except user_eds.EdsMissing as e:
+                    lf.write(f"❌ {e}\n")
+                    raise RuntimeError(str(e))
+                finally:
+                    _db.close()
+                proc_env.update(eds_env)
+                lf.write(f"ЭЦП: личная, {eds_env['PORTAL_PERSONAL_FIO']} "
+                         f"(ИИН {eds_env['PORTAL_PERSONAL_IIN']}, пользователь {job.get('username')})\n\n")
+                lf.flush()
+
             p = subprocess.Popen(
                 cmd, stdout=lf, stderr=lf, cwd=str(BASE_DIR),
-                text=True, encoding="utf-8", errors="replace",
-                env=child_env,
+                text=True, encoding="utf-8", errors="replace", env=proc_env,
             )
             PROCESSES[job_id] = p
             rc = p.wait()
@@ -2312,7 +2505,7 @@ textarea { font-family: Consolas, monospace; }
 MAILINGS_LIST_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Рассылки по отчётам</title>
 <style>""" + _MAIL_CSS + """</style></head><body>
-<a href="/admin">← Назад в админку</a>
+{% if is_admin %}<a href="/admin">← Назад в админку</a>{% else %}<a href="/">← На главную</a>{% endif %}
 <h2>📨 Рассылки по отчётам</h2>
 <p>
   <a href="/admin/mailings/new" class="btn b-add">➕ Новая рассылка</a>
@@ -2526,8 +2719,8 @@ MAILING_REPORT_FORM_HTML = """
   </div>
   <div class="form-group">
     <label>Компания</label>
-    <select name="company_id">
-      <option value="">— общий (для всех) —</option>
+    <select name="company_id" {% if not is_admin %}required{% endif %}>
+      {% if is_admin %}<option value="">— общий (для всех) —</option>{% endif %}
       {% for c in companies %}
         <option value="{{ c.id }}" {% if report and report.company_id == c.id %}selected{% endif %}>{{ c.name }}</option>
       {% endfor %}
@@ -2678,16 +2871,77 @@ def _mailing_company_map(db):
     return {c.id: c.name for c in db.query(Company).all()}
 
 
-def _mailing_form_common(db):
+def _mailing_form_common(db, user=None):
+    """Компании для форм рассылок: админу — все, остальным — только доступные."""
     companies = db.query(Company).order_by(Company.id).all()
+    scope = _mail_scope(user) if user is not None else None
+    if scope is not None:
+        companies = [c for c in companies if c.id in scope]
     return companies, {c.id: c.name for c in companies}
 
 
+# ── Доступ к рассылкам по компаниям ──────────────────────────
+# Админ видит всё. Сотрудник с «Доступом к рассылкам» — только то, что
+# относится к его компаниям (оператор — своя, менеджер — отмеченные).
+
+def _mail_scope(user):
+    """None = все компании (админ), иначе множество доступных ID."""
+    ids = get_user_allowed_company_ids(user)
+    return None if ids is None else set(ids)
+
+
+def _mail_company_ok(user, company_id) -> bool:
+    scope = _mail_scope(user)
+    if scope is None:
+        return True
+    try:
+        return company_id is not None and int(company_id) in scope
+    except (TypeError, ValueError):
+        return False
+
+
+def _mailing_ok(user, m) -> bool:
+    """Рассылка доступна, только если ВСЕ её компании доступны пользователю."""
+    scope = _mail_scope(user)
+    ids = set(m.company_id_list())
+    return scope is None or (bool(ids) and ids <= scope)
+
+
+def _report_view_ok(user, r) -> bool:
+    """Общие отчёты (без компании) видны всем, остальные — по компании."""
+    return r.company_id is None or _mail_company_ok(user, r.company_id)
+
+
+def _report_edit_ok(user, r) -> bool:
+    """Общие отчёты правит только админ."""
+    return _mail_scope(user) is None or (r.company_id is not None and _mail_company_ok(user, r.company_id))
+
+
+def _mail_forbidden():
+    return HTMLResponse(
+        "⛔ Нет доступа: это относится к компании, к которой у вас нет доступа. "
+        "<a href='/admin/mailings'>← к рассылкам</a>",
+        status_code=403,
+    )
+
+
+def _check_mailing_vals(user, vals):
+    """Проверка формы рассылки: все выбранные компании и отчёт — в доступе."""
+    ids = [vals["company_id"]] + [int(x) for x in (vals["extra_company_ids"] or "").split(",") if x]
+    if not all(_mail_company_ok(user, cid) for cid in ids):
+        return False
+    if vals["report_id"]:
+        r = get_mailing_report(vals["report_id"])
+        if not r or not _report_view_ok(user, r):
+            return False
+    return True
+
+
 @app.get("/admin/mailings", response_class=HTMLResponse)
-def mailings_list(current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+def mailings_list(current_user: User = Depends(get_mailing_user), db: Session = Depends(get_db)):
     if isinstance(current_user, RedirectResponse):
         return current_user
-    mailings = get_mailings()
+    mailings = [m for m in get_mailings() if _mailing_ok(current_user, m)]
     report_map = {r.id: r.name for r in get_mailing_reports()}
     cmap = _mailing_company_map(db)
     mailing_company_names = {
@@ -2701,18 +2955,20 @@ def mailings_list(current_user: User = Depends(get_admin_user), db: Session = De
         mailing_company_names=mailing_company_names,
         report_map=report_map,
         excl_counts=count_excluded_eids(),
+        is_admin=current_user.role == "admin",
     )
 
 
 @app.get("/admin/mailings/new", response_class=HTMLResponse)
-def mailing_new_form(current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+def mailing_new_form(current_user: User = Depends(get_mailing_user), db: Session = Depends(get_db)):
     if isinstance(current_user, RedirectResponse):
         return current_user
-    companies, cmap = _mailing_form_common(db)
+    companies, cmap = _mailing_form_common(db, current_user)
     return render(
         MAILING_FORM_HTML,
         mailing=None, companies=companies, company_map=cmap,
-        reports=get_mailing_reports(), placeholders=PLACEHOLDERS,
+        reports=[r for r in get_mailing_reports() if _report_view_ok(current_user, r)],
+        placeholders=PLACEHOLDERS,
         default_subject=MAILING_DEFAULT_SUBJECT, default_body=MAILING_DEFAULT_BODY,
     )
 
@@ -2759,57 +3015,77 @@ def _mailing_form_values(form):
 
 
 @app.post("/admin/mailings/new")
-async def mailing_new_submit(request: Request, current_user: User = Depends(get_admin_user)):
+async def mailing_new_submit(request: Request, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     form = await request.form()
     vals = _mailing_form_values(form)
     if not vals["company_id"]:
         return HTMLResponse("⛔ Не выбрана компания. <a href='javascript:history.back()'>назад</a>", status_code=400)
+    if not _check_mailing_vals(current_user, vals):
+        return _mail_forbidden()
     create_mailing(**vals)
     return RedirectResponse("/admin/mailings", status_code=303)
 
 
 @app.get("/admin/mailings/{mailing_id}/edit", response_class=HTMLResponse)
-def mailing_edit_form(mailing_id: int, current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+def mailing_edit_form(mailing_id: int, current_user: User = Depends(get_mailing_user), db: Session = Depends(get_db)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     m = get_mailing(mailing_id)
     if not m:
         return HTMLResponse("Рассылка не найдена", status_code=404)
-    companies, cmap = _mailing_form_common(db)
+    if not _mailing_ok(current_user, m):
+        return _mail_forbidden()
+    companies, cmap = _mailing_form_common(db, current_user)
     return render(
         MAILING_FORM_HTML,
         mailing=m, companies=companies, company_map=cmap,
-        reports=get_mailing_reports(), placeholders=PLACEHOLDERS,
+        reports=[r for r in get_mailing_reports() if _report_view_ok(current_user, r)],
+        placeholders=PLACEHOLDERS,
         default_subject=MAILING_DEFAULT_SUBJECT, default_body=MAILING_DEFAULT_BODY,
     )
 
 
 @app.post("/admin/mailings/{mailing_id}/edit")
-async def mailing_edit_submit(mailing_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+async def mailing_edit_submit(mailing_id: int, request: Request, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     form = await request.form()
     vals = _mailing_form_values(form)
     if not vals["company_id"]:
         return HTMLResponse("⛔ Не выбрана компания. <a href='javascript:history.back()'>назад</a>", status_code=400)
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    if not _mailing_ok(current_user, m) or not _check_mailing_vals(current_user, vals):
+        return _mail_forbidden()
     update_mailing(mailing_id, **vals)
     return RedirectResponse("/admin/mailings", status_code=303)
 
 
 @app.get("/admin/mailings/{mailing_id}/delete")
-def mailing_delete(mailing_id: int, current_user: User = Depends(get_admin_user)):
+def mailing_delete(mailing_id: int, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    if not _mailing_ok(current_user, m):
+        return _mail_forbidden()
     delete_mailing(mailing_id)
     return RedirectResponse("/admin/mailings", status_code=303)
 
 
 @app.get("/admin/mailings/{mailing_id}/toggle")
-def mailing_toggle(mailing_id: int, current_user: User = Depends(get_admin_user)):
+def mailing_toggle(mailing_id: int, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    if not _mailing_ok(current_user, m):
+        return _mail_forbidden()
     toggle_mailing(mailing_id)
     return RedirectResponse("/admin/mailings", status_code=303)
 
@@ -2842,12 +3118,14 @@ def _enqueue_mailing_job(mailing, mode: str, username: str) -> str:
 
 
 @app.post("/admin/mailings/{mailing_id}/test")
-def mailing_test(mailing_id: int, current_user: User = Depends(get_admin_user)):
+def mailing_test(mailing_id: int, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     m = get_mailing(mailing_id)
     if not m:
         return HTMLResponse("Рассылка не найдена", status_code=404)
+    if not _mailing_ok(current_user, m):
+        return _mail_forbidden()
     _enqueue_mailing_job(m, "test", getattr(current_user, "username", "—"))
     return RedirectResponse("/", status_code=303)
 
@@ -2864,12 +3142,14 @@ def mailing_check(mailing_id: int, current_user: User = Depends(get_admin_user))
 
 
 @app.get("/admin/mailings/{mailing_id}/send", response_class=HTMLResponse)
-def mailing_send_confirm(mailing_id: int, current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+def mailing_send_confirm(mailing_id: int, current_user: User = Depends(get_mailing_user), db: Session = Depends(get_db)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     m = get_mailing(mailing_id)
     if not m:
         return HTMLResponse("Рассылка не найдена", status_code=404)
+    if not _mailing_ok(current_user, m):
+        return _mail_forbidden()
     ids = m.company_id_list()
     companies = db.query(Company).filter(Company.id.in_(ids)).all()
     cname_by_id = {c.id: c.name for c in companies}
@@ -2890,12 +3170,14 @@ def mailing_send_confirm(mailing_id: int, current_user: User = Depends(get_admin
 
 
 @app.post("/admin/mailings/{mailing_id}/send")
-def mailing_send_run(mailing_id: int, current_user: User = Depends(get_admin_user)):
+def mailing_send_run(mailing_id: int, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     m = get_mailing(mailing_id)
     if not m:
         return HTMLResponse("Рассылка не найдена", status_code=404)
+    if not _mailing_ok(current_user, m):
+        return _mail_forbidden()
     _enqueue_mailing_job(m, "real", getattr(current_user, "username", "—"))
     return RedirectResponse("/", status_code=303)
 
@@ -2903,30 +3185,33 @@ def mailing_send_run(mailing_id: int, current_user: User = Depends(get_admin_use
 # ── Отчёты (SQL) ─────────────────────────────────────────────
 
 @app.get("/admin/mailings/reports", response_class=HTMLResponse)
-def mailing_reports_list(current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+def mailing_reports_list(current_user: User = Depends(get_mailing_user), db: Session = Depends(get_db)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     return render(
         MAILING_REPORTS_HTML,
-        reports=get_mailing_reports(),
+        reports=[r for r in get_mailing_reports() if _report_view_ok(current_user, r)],
         company_map=_mailing_company_map(db),
     )
 
 
 @app.get("/admin/mailings/reports/new", response_class=HTMLResponse)
-def mailing_report_new_form(current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+def mailing_report_new_form(current_user: User = Depends(get_mailing_user), db: Session = Depends(get_db)):
     if isinstance(current_user, RedirectResponse):
         return current_user
-    companies, _ = _mailing_form_common(db)
-    return render(MAILING_REPORT_FORM_HTML, report=None, companies=companies)
+    companies, _ = _mailing_form_common(db, current_user)
+    return render(MAILING_REPORT_FORM_HTML, report=None, companies=companies,
+                  is_admin=current_user.role == "admin")
 
 
 @app.post("/admin/mailings/reports/new")
-async def mailing_report_new_submit(request: Request, current_user: User = Depends(get_admin_user)):
+async def mailing_report_new_submit(request: Request, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     form = await request.form()
     cid = form.get("company_id")
+    if _mail_scope(current_user) is not None and not (cid and _mail_company_ok(current_user, cid)):
+        return _mail_forbidden()
     create_mailing_report(
         name=(form.get("name") or "").strip(),
         sql_text=form.get("sql_text") or "",
@@ -2936,22 +3221,31 @@ async def mailing_report_new_submit(request: Request, current_user: User = Depen
 
 
 @app.get("/admin/mailings/reports/{report_id}/edit", response_class=HTMLResponse)
-def mailing_report_edit_form(report_id: int, current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)):
+def mailing_report_edit_form(report_id: int, current_user: User = Depends(get_mailing_user), db: Session = Depends(get_db)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     r = get_mailing_report(report_id)
     if not r:
         return HTMLResponse("Отчёт не найден", status_code=404)
-    companies, _ = _mailing_form_common(db)
-    return render(MAILING_REPORT_FORM_HTML, report=r, companies=companies)
+    if not _report_edit_ok(current_user, r):
+        return _mail_forbidden()
+    companies, _ = _mailing_form_common(db, current_user)
+    return render(MAILING_REPORT_FORM_HTML, report=r, companies=companies,
+                  is_admin=current_user.role == "admin")
 
 
 @app.post("/admin/mailings/reports/{report_id}/edit")
-async def mailing_report_edit_submit(report_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+async def mailing_report_edit_submit(report_id: int, request: Request, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     form = await request.form()
     cid = form.get("company_id")
+    r = get_mailing_report(report_id)
+    if not r:
+        return HTMLResponse("Отчёт не найден", status_code=404)
+    if not _report_edit_ok(current_user, r) or (
+            _mail_scope(current_user) is not None and not (cid and _mail_company_ok(current_user, cid))):
+        return _mail_forbidden()
     update_mailing_report(
         report_id,
         name=(form.get("name") or "").strip(),
@@ -2962,25 +3256,41 @@ async def mailing_report_edit_submit(report_id: int, request: Request, current_u
 
 
 @app.get("/admin/mailings/reports/{report_id}/delete")
-def mailing_report_delete(report_id: int, current_user: User = Depends(get_admin_user)):
+def mailing_report_delete(report_id: int, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
+    r = get_mailing_report(report_id)
+    if r and not _report_edit_ok(current_user, r):
+        return _mail_forbidden()
     delete_mailing_report(report_id)
     return RedirectResponse("/admin/mailings/reports", status_code=303)
 
 
 # ── Справочник ЧСИ ───────────────────────────────────────────
 
+def _contact_ok(user, contact_id) -> bool:
+    """Контакт ЧСИ можно менять, только если его компания доступна."""
+    if _mail_scope(user) is None:
+        return True
+    db = SessionLocal()
+    try:
+        c = db.query(ChsiContact).filter(ChsiContact.id == contact_id).first()
+        return bool(c) and _mail_company_ok(user, c.company_id)
+    finally:
+        db.close()
+
 @app.get("/admin/mailings/contacts", response_class=HTMLResponse)
 def chsi_contacts_page(
     company_id: Optional[int] = None,
     imported: Optional[int] = None,
-    current_user: User = Depends(get_admin_user),
+    current_user: User = Depends(get_mailing_user),
     db: Session = Depends(get_db),
 ):
     if isinstance(current_user, RedirectResponse):
         return current_user
-    companies = db.query(Company).order_by(Company.id).all()
+    companies, _ = _mailing_form_common(db, current_user)
+    if company_id and not _mail_company_ok(current_user, company_id):
+        return _mail_forbidden()
     contacts = get_chsi_contacts(company_id) if company_id else []
     return render(
         CHSI_CONTACTS_HTML,
@@ -2990,21 +3300,25 @@ def chsi_contacts_page(
 
 
 @app.post("/admin/mailings/contacts/add")
-async def chsi_contact_add(request: Request, current_user: User = Depends(get_admin_user)):
+async def chsi_contact_add(request: Request, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     form = await request.form()
     cid = int(form.get("company_id"))
+    if not _mail_company_ok(current_user, cid):
+        return _mail_forbidden()
     create_chsi_contact(cid, (form.get("fio") or "").strip(), (form.get("email") or "").strip())
     return RedirectResponse(f"/admin/mailings/contacts?company_id={cid}", status_code=303)
 
 
 @app.post("/admin/mailings/contacts/{contact_id}/edit")
-async def chsi_contact_edit(contact_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+async def chsi_contact_edit(contact_id: int, request: Request, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     form = await request.form()
     cid = int(form.get("company_id"))
+    if not _contact_ok(current_user, contact_id):
+        return _mail_forbidden()
     update_chsi_contact(
         contact_id,
         fio=(form.get("fio") or "").strip(),
@@ -3015,20 +3329,24 @@ async def chsi_contact_edit(contact_id: int, request: Request, current_user: Use
 
 
 @app.get("/admin/mailings/contacts/{contact_id}/delete")
-def chsi_contact_delete(contact_id: int, company_id: int, current_user: User = Depends(get_admin_user)):
+def chsi_contact_delete(contact_id: int, company_id: int, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
+    if not _contact_ok(current_user, contact_id):
+        return _mail_forbidden()
     delete_chsi_contact(contact_id)
     return RedirectResponse(f"/admin/mailings/contacts?company_id={company_id}", status_code=303)
 
 
 @app.post("/admin/mailings/contacts/import")
-async def chsi_contacts_import(request: Request, current_user: User = Depends(get_admin_user)):
+async def chsi_contacts_import(request: Request, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     from openpyxl import load_workbook
     form = await request.form()
     cid = int(form.get("company_id"))
+    if not _mail_company_ok(current_user, cid):
+        return _mail_forbidden()
     upload = form.get("file")
     added = 0
     if upload is not None and getattr(upload, "filename", ""):
@@ -3078,21 +3396,26 @@ def _excl_url(mailing_id: int, msg: str = None) -> str:
 
 
 @app.get("/admin/mailings/{mailing_id}/exclusions", response_class=HTMLResponse)
-def mailing_exclusions_page(mailing_id: int, msg: Optional[str] = None, current_user: User = Depends(get_admin_user)):
+def mailing_exclusions_page(mailing_id: int, msg: Optional[str] = None, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
     m = get_mailing(mailing_id)
     if not m:
         return HTMLResponse("Рассылка не найдена", status_code=404)
+    if not _mailing_ok(current_user, m):
+        return _mail_forbidden()
     return render(MAILING_EXCLUSIONS_HTML, mailing=m, items=get_excluded_eids(mailing_id), msg=msg)
 
 
 @app.post("/admin/mailings/{mailing_id}/exclusions/add")
-async def mailing_exclusions_add(mailing_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+async def mailing_exclusions_add(mailing_id: int, request: Request, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
-    if not get_mailing(mailing_id):
+    m = get_mailing(mailing_id)
+    if not m:
         return HTMLResponse("Рассылка не найдена", status_code=404)
+    if not _mailing_ok(current_user, m):
+        return _mail_forbidden()
     form = await request.form()
     eids = parse_eid_list(form.get("eids") or "")
     added = add_excluded_eids(
@@ -3104,18 +3427,28 @@ async def mailing_exclusions_add(mailing_id: int, request: Request, current_user
 
 
 @app.post("/admin/mailings/{mailing_id}/exclusions/remove")
-async def mailing_exclusions_remove(mailing_id: int, request: Request, current_user: User = Depends(get_admin_user)):
+async def mailing_exclusions_remove(mailing_id: int, request: Request, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    if not _mailing_ok(current_user, m):
+        return _mail_forbidden()
     form = await request.form()
     n = delete_excluded_eids(mailing_id, parse_eid_list(form.get("eids") or ""))
     return RedirectResponse(_excl_url(mailing_id, f"Убрано из исключений: {n}"), status_code=303)
 
 
 @app.get("/admin/mailings/{mailing_id}/exclusions/{item_id}/delete")
-def mailing_exclusion_delete(mailing_id: int, item_id: int, current_user: User = Depends(get_admin_user)):
+def mailing_exclusion_delete(mailing_id: int, item_id: int, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
+    m = get_mailing(mailing_id)
+    if not m:
+        return HTMLResponse("Рассылка не найдена", status_code=404)
+    if not _mailing_ok(current_user, m):
+        return _mail_forbidden()
     delete_excluded_eid(mailing_id, item_id)
     return RedirectResponse(_excl_url(mailing_id), status_code=303)
 

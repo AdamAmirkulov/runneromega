@@ -29,9 +29,11 @@ from pathlib import Path
 import requests
 
 try:
-    from curl_cffi import requests as cf_requests, CurlMime
+    from curl_cffi import requests as cf_requests
+    from curl_cffi import CurlMime
 except ImportError:
-    cf_requests = CurlMime = None
+    cf_requests = None
+    CurlMime = None
 
 PORTAL_SOT_BASE = "https://portal-sot.kz"
 
@@ -316,24 +318,31 @@ class PortalSotHttp:
         return self.request("POST", url, **kwargs)
 
     def _send(self, method, url, kwargs):
-        """curl_cffi не принимает files= (NotImplementedError) — для него файлы
-        собираются в CurlMime. MIME строится заново на каждую попытку: после
-        401/5xx запрос повторяется."""
-        files = kwargs.get("files")
-        if not files or self.transport != "curl_cffi":
+        """Один запрос текущей сессией. curl_cffi не принимает files= (как requests) —
+        файлы и поля формы уходят через его multipart (CurlMime), собранный заново
+        на каждую попытку."""
+        if self.transport != "curl_cffi" or not kwargs.get("files"):
             return self.session.request(method, url, **kwargs)
-        mp = CurlMime()
-        for field, f in files.items():
-            filename, content, ctype = (tuple(f) + (None, None))[:3]
-            if hasattr(content, "read"):
-                content = content.read()
-            mp.addpart(name=field, filename=filename,
-                       content_type=ctype or "application/octet-stream", data=content)
+        kw = dict(kwargs)
+        files = kw.pop("files")
+        form = kw.pop("data", None) or {}
+        mime = CurlMime()
         try:
-            rest = {k: v for k, v in kwargs.items() if k != "files"}
-            return self.session.request(method, url, multipart=mp, **rest)
+            for name, value in form.items():
+                mime.addpart(name=name, data=str(value).encode("utf-8"))
+            for name, spec in files.items():
+                filename, content, content_type = (tuple(spec) + (None, None))[:3]
+                if hasattr(content, "read"):
+                    # файл могли уже прочитать прошлой попыткой — перематываем
+                    if hasattr(content, "seek"):
+                        content.seek(0)
+                    content = content.read()
+                if isinstance(content, str):
+                    content = content.encode("utf-8")
+                mime.addpart(name=name, filename=filename, content_type=content_type, data=content)
+            return self.session.request(method, url, multipart=mime, **kw)
         finally:
-            mp.close()
+            mime.close()
 
     def request(self, method, url, backoff=BACKOFF_429_5XX, **kwargs):
         """backoff — ожидания при 429/5xx. Свой короткий список нужен там, где
