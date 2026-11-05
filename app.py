@@ -2665,13 +2665,9 @@ MAILING_CONFIRM_HTML = """
 <div class="warn">
   <p>Письма уйдут <b>каждому ЧСИ</b> на его адрес из справочника. Действие необратимо.</p>
   <ul>
-    <li>Компани{{ 'я' if contacts_by_company|length == 1 else 'и' }}: <b>{{ company_name }}</b></li>
+    <li>Компани{{ 'я' if company_count == 1 else 'и' }}: <b>{{ company_name }}</b></li>
     <li>Источник: {% if mailing.sql_text and mailing.sql_text.strip() %}свой SQL{% else %}{{ report_name }}{% endif %}</li>
-    <li>Активных ЧСИ в справочнике: <b>{{ contacts_count }}</b>
-      {% if contacts_by_company|length > 1 %}
-      <ul>{% for cname, n in contacts_by_company.items() %}<li>{{ cname }}: {{ n }}</li>{% endfor %}</ul>
-      {% endif %}
-    </li>
+    <li>Активных ЧСИ в справочнике: <b>{{ contacts_count }}</b></li>
     <li>Вложение: {{ 'да' if mailing.attach_enabled else 'нет' }}</li>
     <li>BCC: {{ mailing.bcc or '—' }}</li>
   </ul>
@@ -2742,16 +2738,10 @@ CHSI_CONTACTS_HTML = """
 <style>""" + _MAIL_CSS + """</style></head><body>
 <a href="/admin/mailings">← Назад к рассылкам</a>
 <h2>📇 Справочник ЧСИ</h2>
-<div class="tabs">
-  {% for c in companies %}
-    <a href="/admin/mailings/contacts?company_id={{ c.id }}" class="{% if c.id == company_id %}active{% endif %}">{{ c.name }}</a>
-  {% endfor %}
-</div>
+<p class="hint">Справочник один на все компании — рассылки любой компании берут адреса отсюда.</p>
 
-{% if company_id %}
 <h3 style="margin-top:18px;">Добавить ЧСИ</h3>
 <form method="post" action="/admin/mailings/contacts/add">
-  <input type="hidden" name="company_id" value="{{ company_id }}">
   <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:end;">
     <div style="flex:2;"><label>ФИО ЧСИ</label><input type="text" name="fio" required></div>
     <div style="flex:2;"><label>Email</label><input type="text" name="email" required></div>
@@ -2761,7 +2751,6 @@ CHSI_CONTACTS_HTML = """
 
 <h3 style="margin-top:18px;">Загрузить из xlsx</h3>
 <form method="post" action="/admin/mailings/contacts/import" enctype="multipart/form-data">
-  <input type="hidden" name="company_id" value="{{ company_id }}">
   <div style="display:flex; gap:10px; align-items:end;">
     <div><input type="file" name="file" accept=".xlsx,.xls" required></div>
     <div><button type="submit" class="btn b-add">Импорт</button></div>
@@ -2774,20 +2763,16 @@ CHSI_CONTACTS_HTML = """
 {% for k in contacts %}
 <form method="post" action="/admin/mailings/contacts/{{ k.id }}/edit"
       style="display:flex; gap:10px; align-items:center; padding:6px 0; border-bottom:1px solid #eee; flex-wrap:wrap;">
-  <input type="hidden" name="company_id" value="{{ company_id }}">
   <input type="text" name="fio" value="{{ k.fio }}" style="flex:2; min-width:180px;">
   <input type="text" name="email" value="{{ k.email }}" style="flex:2; min-width:180px;">
   <label style="font-weight:normal; white-space:nowrap;">
     <input type="checkbox" name="is_active" value="1" {% if k.is_active %}checked{% endif %} style="width:auto;"> активен
   </label>
   <button type="submit" class="btn b-edit">Сохранить</button>
-  <a href="/admin/mailings/contacts/{{ k.id }}/delete?company_id={{ company_id }}" class="btn b-del" onclick="return confirm('Удалить?')">✕</a>
+  <a href="/admin/mailings/contacts/{{ k.id }}/delete" class="btn b-del" onclick="return confirm('Удалить?')">✕</a>
 </form>
 {% endfor %}
-{% if not contacts %}<p style="color:#666;">Пока нет контактов для этой компании.</p>{% endif %}
-{% else %}
-<p style="margin-top:18px; color:#666;">Выберите компанию.</p>
-{% endif %}
+{% if not contacts %}<p style="color:#666;">Пока нет контактов.</p>{% endif %}
 </body></html>
 """
 
@@ -3153,10 +3138,6 @@ def mailing_send_confirm(mailing_id: int, current_user: User = Depends(get_maili
     ids = m.company_id_list()
     companies = db.query(Company).filter(Company.id.in_(ids)).all()
     cname_by_id = {c.id: c.name for c in companies}
-    contacts_by_company = {
-        cname_by_id.get(cid, f"#{cid}"): len(get_chsi_contacts(cid, only_active=True))
-        for cid in ids
-    }
     report_name = "—"
     if m.report_id:
         r = get_mailing_report(m.report_id)
@@ -3164,8 +3145,8 @@ def mailing_send_confirm(mailing_id: int, current_user: User = Depends(get_maili
     return render(
         MAILING_CONFIRM_HTML,
         mailing=m, company_name=", ".join(cname_by_id.get(cid, f"#{cid}") for cid in ids),
-        contacts_by_company=contacts_by_company,
-        contacts_count=sum(contacts_by_company.values()), report_name=report_name,
+        company_count=len(ids),
+        contacts_count=len(get_chsi_contacts(None, only_active=True)), report_name=report_name,
     )
 
 
@@ -3268,35 +3249,16 @@ def mailing_report_delete(report_id: int, current_user: User = Depends(get_maili
 
 # ── Справочник ЧСИ ───────────────────────────────────────────
 
-def _contact_ok(user, contact_id) -> bool:
-    """Контакт ЧСИ можно менять, только если его компания доступна."""
-    if _mail_scope(user) is None:
-        return True
-    db = SessionLocal()
-    try:
-        c = db.query(ChsiContact).filter(ChsiContact.id == contact_id).first()
-        return bool(c) and _mail_company_ok(user, c.company_id)
-    finally:
-        db.close()
+# Справочник ЧСИ один на все компании — без вкладок и проверки компании.
 
 @app.get("/admin/mailings/contacts", response_class=HTMLResponse)
 def chsi_contacts_page(
-    company_id: Optional[int] = None,
     imported: Optional[int] = None,
     current_user: User = Depends(get_mailing_user),
-    db: Session = Depends(get_db),
 ):
     if isinstance(current_user, RedirectResponse):
         return current_user
-    companies, _ = _mailing_form_common(db, current_user)
-    if company_id and not _mail_company_ok(current_user, company_id):
-        return _mail_forbidden()
-    contacts = get_chsi_contacts(company_id) if company_id else []
-    return render(
-        CHSI_CONTACTS_HTML,
-        companies=companies, company_id=company_id,
-        contacts=contacts, imported=imported,
-    )
+    return render(CHSI_CONTACTS_HTML, contacts=get_chsi_contacts(None), imported=imported)
 
 
 @app.post("/admin/mailings/contacts/add")
@@ -3304,11 +3266,8 @@ async def chsi_contact_add(request: Request, current_user: User = Depends(get_ma
     if isinstance(current_user, RedirectResponse):
         return current_user
     form = await request.form()
-    cid = int(form.get("company_id"))
-    if not _mail_company_ok(current_user, cid):
-        return _mail_forbidden()
-    create_chsi_contact(cid, (form.get("fio") or "").strip(), (form.get("email") or "").strip())
-    return RedirectResponse(f"/admin/mailings/contacts?company_id={cid}", status_code=303)
+    create_chsi_contact(None, (form.get("fio") or "").strip(), (form.get("email") or "").strip())
+    return RedirectResponse("/admin/mailings/contacts", status_code=303)
 
 
 @app.post("/admin/mailings/contacts/{contact_id}/edit")
@@ -3316,26 +3275,21 @@ async def chsi_contact_edit(contact_id: int, request: Request, current_user: Use
     if isinstance(current_user, RedirectResponse):
         return current_user
     form = await request.form()
-    cid = int(form.get("company_id"))
-    if not _contact_ok(current_user, contact_id):
-        return _mail_forbidden()
     update_chsi_contact(
         contact_id,
         fio=(form.get("fio") or "").strip(),
         email=(form.get("email") or "").strip(),
         is_active=bool(form.get("is_active")),
     )
-    return RedirectResponse(f"/admin/mailings/contacts?company_id={cid}", status_code=303)
+    return RedirectResponse("/admin/mailings/contacts", status_code=303)
 
 
 @app.get("/admin/mailings/contacts/{contact_id}/delete")
-def chsi_contact_delete(contact_id: int, company_id: int, current_user: User = Depends(get_mailing_user)):
+def chsi_contact_delete(contact_id: int, current_user: User = Depends(get_mailing_user)):
     if isinstance(current_user, RedirectResponse):
         return current_user
-    if not _contact_ok(current_user, contact_id):
-        return _mail_forbidden()
     delete_chsi_contact(contact_id)
-    return RedirectResponse(f"/admin/mailings/contacts?company_id={company_id}", status_code=303)
+    return RedirectResponse("/admin/mailings/contacts", status_code=303)
 
 
 @app.post("/admin/mailings/contacts/import")
@@ -3344,9 +3298,6 @@ async def chsi_contacts_import(request: Request, current_user: User = Depends(ge
         return current_user
     from openpyxl import load_workbook
     form = await request.form()
-    cid = int(form.get("company_id"))
-    if not _mail_company_ok(current_user, cid):
-        return _mail_forbidden()
     upload = form.get("file")
     added = 0
     if upload is not None and getattr(upload, "filename", ""):
@@ -3379,13 +3330,13 @@ async def chsi_contacts_import(request: Request, current_user: User = Depends(ge
                 email = row[email_col] if len(row) > email_col else None
                 rows.append((str(fio or "").strip(), str(email or "").strip()))
             wb.close()
-            added = bulk_add_chsi_contacts(cid, rows)
+            added = bulk_add_chsi_contacts(None, rows)
         finally:
             try:
                 dest.unlink()
             except OSError:
                 pass
-    return RedirectResponse(f"/admin/mailings/contacts?company_id={cid}&imported={added}", status_code=303)
+    return RedirectResponse(f"/admin/mailings/contacts?imported={added}", status_code=303)
 
 
 # ── Исключённые EID (у каждой рассылки свои) ─────────────────
