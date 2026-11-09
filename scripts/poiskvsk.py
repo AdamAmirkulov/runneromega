@@ -2067,11 +2067,105 @@ def _portal_browser_login():
             pass
 
 
+class _BrowserResponse:
+    """Минимальный аналог requests.Response для ответа fetch() из браузера."""
+
+    def __init__(self, d):
+        self.status_code = int(d.get("status") or 0)
+        self.reason = d.get("statusText") or ""
+        self.url = d.get("url") or ""
+        self.headers = d.get("headers") or {}
+        self.text = d.get("body") or ""
+
+
+class _BrowserGbdfl:
+    """Запросы ГБД ФЛ из headless Firefox.
+
+    С 06.11.2026 portal-sot.kz обрывает соединение (curl 56 / RemoteDisconnected)
+    на /api/secure/gbdfl/* для любых HTTP-клиентов с этого сервера — requests,
+    curl_cffi (firefox/chrome-отпечатки), Invoke-WebRequest — независимо от
+    заголовков и cookies, а тот же запрос fetch() из настоящего Firefox проходит.
+    Остальные /api/secure/* для скрипта при этом работают. Поэтому, если HTTP-
+    запрос ГБД ФЛ обрывается, переключаемся на браузер до конца прогона.
+    ЭЦП не нужна: токен берём из PortalSotHttp и передаём в заголовке.
+    Профиль временный — ЭЦП-профили компаний и чужие окна Firefox не трогаем."""
+
+    _JS = r"""
+var cb = arguments[arguments.length - 1], url = arguments[0], tok = arguments[1];
+fetch(url, {headers: {'Accept': 'application/json, text/plain, */*',
+                      'Authorization': 'Bearer ' + tok}, credentials: 'include'})
+  .then(function (r) { return r.text().then(function (t) {
+      var h = {}; r.headers.forEach(function (v, k) { h[k] = v; });
+      cb({status: r.status, statusText: r.statusText, url: r.url, headers: h, body: t}); }); })
+  .catch(function (e) { cb({status: -1, statusText: String(e), url: url, headers: {}, body: ''}); });
+"""
+
+    def __init__(self):
+        self.active = False
+        self.driver = None
+
+    def _start(self):
+        from selenium.webdriver.firefox.options import Options as FirefoxOptions
+        from selenium.webdriver.firefox.service import Service as FirefoxService
+        from webdriver_manager.firefox import GeckoDriverManager
+        opts = FirefoxOptions()
+        opts.add_argument("-headless")
+        self.driver = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()),
+                                        options=opts)
+        self.driver.set_page_load_timeout(90)
+        self.driver.set_script_timeout(90)
+        self.driver.get(PORTAL_SOT_BASE + "/")
+
+    def get(self, portal, url):
+        """GET через fetch() в браузере с темпом и refresh-токеном PortalSotHttp.
+        401 после refresh возвращаем как есть — его обработает вызывающий код."""
+        if self.driver is None:
+            log4("🌐 запускаю фоновый Firefox для запросов ГБД ФЛ")
+            self._start()
+        import portal_sot_http as _psh
+        if _psh._jwt_exp(portal.tokens.get("access_token", "")) < time.time() + 30:
+            portal.renew()
+        for attempt in (1, 2):
+            portal._throttle()
+            d = self.driver.execute_async_script(self._JS, url, portal.tokens.get("access_token", ""))
+            if d.get("status") == -1:
+                raise ConnectionError(f"браузерный fetch не удался: {d.get('statusText')}")
+            if d.get("status") == 401 and attempt == 1:
+                portal.renew()
+                continue
+            return _BrowserResponse(d)
+
+    def close(self):
+        if self.driver is not None:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+
+
+_BROWSER_GBDFL = _BrowserGbdfl()
+
+
 def _portal_gbdfl_raw(session, iin):
-    """GET /api/secure/gbdfl/v2/byIin/<iin> через requests-сессию.
-    Возвращает dict {status, statusText, respURL, headers, bodyLen, body}."""
+    """GET /api/secure/gbdfl/v2/byIin/<iin> через PortalSotHttp, а если
+    portal-sot.kz обрывает HTTP-соединение — через фоновый Firefox (см.
+    _BrowserGbdfl). Возвращает dict {status, statusText, respURL, headers, bodyLen, body}."""
     url = PORTAL_SOT_BASE + "/api/secure/gbdfl/v2/byIin/" + str(iin)
-    r = session.get(url, timeout=(10, 60), allow_redirects=True)
+    if _BROWSER_GBDFL.active:
+        r = _BROWSER_GBDFL.get(session, url)
+    else:
+        try:
+            r = session.get(url, timeout=(10, 60), allow_redirects=True)
+        except PortalBlocked:
+            raise
+        except Exception as e:
+            if "ConnectionError" not in type(e).__name__ and "Connection" not in str(e):
+                raise
+            log4(f"   ⚠ HTTP-запрос ГБД ФЛ оборван ({type(e).__name__}) — "
+                 f"дальше запросы ГБД ФЛ идут через браузер")
+            _BROWSER_GBDFL.active = True
+            r = _BROWSER_GBDFL.get(session, url)
     body = r.text or ""
     return {
         "status": r.status_code,
@@ -2450,6 +2544,7 @@ def parse_people_via_portal_sot():
         log_err(f"⛔ {e} (обработано {processed}, результат сохранён)")
 
     finally:
+        _BROWSER_GBDFL.close()
         portal.__exit__(None, None, None)
         try:
             _safe_save(wb, OUT_XLSX)
