@@ -47,6 +47,7 @@ if not args.company_id or not args.company_id.strip():
     sys.exit(1)
 os.environ['COMPANY_ID'] = args.company_id.strip()
 
+import random
 import time
 import json
 import logging
