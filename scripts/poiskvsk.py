@@ -2100,9 +2100,17 @@ fetch(url, {headers: {'Accept': 'application/json, text/plain, */*',
   .catch(function (e) { cb({status: -1, statusText: String(e), url: url, headers: {}, body: ''}); });
 """
 
+    # portal-sot.kz ограничивает частоту запросов к ГБД: 6 ИИН подряд с паузой
+    # 2–3 с прошли, дальше соединение обрывалось и через 30 мин ещё не
+    # восстановилось (09.11.2026). Поэтому темп медленный, а на обрыв — одна
+    # длинная пауза и остановка, а не серия повторов в закрытый портал.
+    GAP_SECONDS = (12.0, 20.0)
+    COOLDOWN_SECONDS = 600
+
     def __init__(self):
         self.active = False
         self.driver = None
+        self._last_at = 0.0
 
     def _start(self):
         from selenium.webdriver.firefox.options import Options as FirefoxOptions
@@ -2125,12 +2133,28 @@ fetch(url, {headers: {'Accept': 'application/json, text/plain, */*',
         import portal_sot_http as _psh
         if _psh._jwt_exp(portal.tokens.get("access_token", "")) < time.time() + 30:
             portal.renew()
-        for attempt in (1, 2):
+        cooled = False
+        renewed = False
+        while True:
+            wait = self._last_at + random.uniform(*self.GAP_SECONDS) - time.time()
+            if wait > 0:
+                time.sleep(wait)
             portal._throttle()
             d = self.driver.execute_async_script(self._JS, url, portal.tokens.get("access_token", ""))
+            self._last_at = time.time()
             if d.get("status") == -1:
-                raise ConnectionError(f"браузерный fetch не удался: {d.get('statusText')}")
-            if d.get("status") == 401 and attempt == 1:
+                if cooled:
+                    raise PortalBlocked(
+                        "portal-sot.kz обрывает запросы ГБД ФЛ и после паузы "
+                        f"{self.COOLDOWN_SECONDS // 60} мин — похоже на лимит частоты. "
+                        "Поиск адресов остановлен, найденное сохранено. Запустите позже.")
+                cooled = True
+                log4(f"   ⏸ portal-sot.kz оборвал запрос ГБД ФЛ ({d.get('statusText')}) — "
+                     f"жду {self.COOLDOWN_SECONDS // 60} мин и пробую ещё раз")
+                time.sleep(self.COOLDOWN_SECONDS)
+                continue
+            if d.get("status") == 401 and not renewed:
+                renewed = True
                 portal.renew()
                 continue
             return _BrowserResponse(d)
