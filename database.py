@@ -190,6 +190,7 @@ class CompanyRequisites(Base):
 
     company_id = Column(Integer, ForeignKey("companies.id"), primary_key=True)
     text = Column(Text, nullable=True)
+    phone = Column(String, nullable=True)  # {{телефон}} в рассылках
     updated_by = Column(String, nullable=True)
     updated_at = Column(DateTime, default=datetime.now)
 
@@ -438,6 +439,7 @@ def _ensure_columns():
         "ALTER TABLE mailings ADD COLUMN schedule_anchor_date DATE",
         "ALTER TABLE company_requisites ADD COLUMN text TEXT",
         "ALTER TABLE company_requisites ADD COLUMN updated_by VARCHAR",
+        "ALTER TABLE company_requisites ADD COLUMN phone VARCHAR",
         # старая версия таблицы хранила блок реквизитов в full_text
         "UPDATE company_requisites SET text = full_text WHERE text IS NULL AND full_text IS NOT NULL",
         "ALTER TABLE users ADD COLUMN can_mailings BOOLEAN DEFAULT 0",
@@ -791,13 +793,20 @@ def get_company_requisites_text(company_id: int) -> str:
     return (r.text or "").strip() if r else ""
 
 
-def save_company_requisites(company_id: int, text_value: str, updated_by: str = None):
+def get_company_phone(company_id: int) -> str:
+    r = get_company_requisites(company_id)
+    return (r.phone or "").strip() if r else ""
+
+
+def save_company_requisites(company_id: int, text_value: str, updated_by: str = None, phone: str = None):
     db = SessionLocal()
     r = db.query(CompanyRequisites).filter(CompanyRequisites.company_id == company_id).first()
     if not r:
         r = CompanyRequisites(company_id=company_id)
         db.add(r)
     r.text = chr(10).join(line.rstrip() for line in (text_value or "").splitlines()).strip() or None
+    if phone is not None:
+        r.phone = " ".join(phone.split()) or None
     r.updated_by = updated_by
     r.updated_at = datetime.now()
     db.commit()

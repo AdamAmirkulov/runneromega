@@ -2843,6 +2843,9 @@ COMPANY_REQUISITES_HTML = """
   <label>Реквизиты</label>
   <textarea name="text" rows="6" placeholder="ТОО «…»&#10;БИН …&#10;IBAN … в АО «…»&#10;БИК …&#10;Адрес: …">{{ r.text if r and r.text else '' }}</textarea>
   <div class="hint">В тексте письма рассылки вставляются через <code>{{ '{{реквизиты}}' }}</code>.</div>
+  <label>Телефон компании</label>
+  <input type="text" name="phone" value="{{ r.phone if r and r.phone else '' }}" placeholder="+7 700 000 00 00">
+  <div class="hint">В тексте письма рассылки — <code>{{ '{{телефон}}' }}</code>. Если пусто, берётся из config.MAILING_SIGNATURE.</div>
   <p><button type="submit" class="btn b-add">💾 Сохранить</button>
   {% if saved %}<span style="color:#28a745; margin-left:10px;">✅ Сохранено</span>
   {% elif r and r.updated_at %}<span class="hint" style="margin-left:10px;">Изменено: {{ r.updated_by or '—' }}, {{ r.updated_at.strftime('%d.%m.%Y %H:%M') }}</span>{% endif %}</p>
@@ -3451,7 +3454,8 @@ async def company_requisites_save(company_id: int, request: Request, current_use
         return current_user
     form = await request.form()
     save_company_requisites(company_id, form.get("text") or "",
-                            updated_by=getattr(current_user, "username", None))
+                            updated_by=getattr(current_user, "username", None),
+                            phone=form.get("phone") or "")
     return RedirectResponse(f"/admin/companies?company_id={company_id}&saved=1", status_code=303)
 
 

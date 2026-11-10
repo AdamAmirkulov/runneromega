@@ -296,6 +296,7 @@ def run_for_company(cid: str, mailing, base_sql: str):
     today_str = datetime.now().strftime("%d.%m.%Y")
     signature = MAILING_SIGNATURE.get(cid, {})
     requisites = database.get_company_requisites_text(int(cid))
+    phone = database.get_company_phone(int(cid)) or signature.get("phone") or ""
 
     def make_ctx(fio, n):
         return {
@@ -304,7 +305,7 @@ def run_for_company(cid: str, mailing, base_sql: str):
             "компания": company_name,
             "компания_ru": signature.get("full_name_ru") or company_name,
             "компания_kz": signature.get("full_name_kz") or company_name,
-            "телефон": signature.get("phone") or "",
+            "телефон": phone,
             "реквизиты": requisites,
             "дата": today_str,
         }
