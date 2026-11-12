@@ -56,7 +56,7 @@ def _parse_args():
     p.add_argument("--max_rows", default=None, help="ограничить число сделок (тест)")
     p.add_argument("--no_sign", default=None, help="1 = только черновики, без подписи и отправки")
     p.add_argument("--excel_file", default=None,
-                   help="Excel со списком EID (первый столбец) — вместо SQL-отбора; только --kind reshenie")
+                   help="Excel со списком EID (первый столбец) — вместо SQL-отбора")
     return p.parse_args()
 
 
@@ -266,7 +266,7 @@ def log(message=""):
 # - F323 = "Судебное примерение"
 # В выборку также тянем: F157 = суд, F65 = № дела, F35 = сумма без госпошлины
 # ============================================================
-_SQL_OPREDELENIE = r"""
+_SQL_OPREDELENIE_HEAD = r"""
 SELECT
     l.ID                                  AS LoanID,
     l.EID                                 AS EID,
@@ -310,7 +310,8 @@ OUTER APPLY (
       AND LTRIM(RTRIM(p.F344)) = CONVERT(NVARCHAR(100), l.EID)
     ORDER BY p.ID DESC
 ) pLast
-
+"""
+_SQL_OPREDELENIE = _SQL_OPREDELENIE_HEAD + r"""
 WHERE
     l.F209 = N'{F209}'
     AND l.F220 = 1
@@ -426,13 +427,12 @@ SQL_QUERY = (_SQL_TEMPLATE
              .replace("{CREDITOR}", _SQL_CREDITOR))
 
 # Ручной список EID из Excel (--excel_file): берём сделки по списку, без условий
-# отбора (решение > 33 дней, F318, статусы). Остаются только фильтр компании
+# отбора (по решению — решение > 33 дней, F318; по определению — F220, F323,
+# процесс без F329/F326; статусы). Остаются только фильтр компании
 # (F209 + кредитор) и пропуск уже поданного (журнал / ProcessImport).
 EXCEL_FILE = (_args.excel_file or "").strip() or None
-if EXCEL_FILE and KIND != "reshenie":
-    print("❌ Список EID из Excel поддержан только для заявлений по решению (--kind reshenie).")
-    sys.exit(1)
-_SQL_BY_EIDS = (_SQL_RESHENIE_HEAD + r"""
+_SQL_HEAD = _SQL_RESHENIE_HEAD if KIND == "reshenie" else _SQL_OPREDELENIE_HEAD
+_SQL_BY_EIDS = (_SQL_HEAD + r"""
 WHERE
     l.F209 = N'{F209}'
     {CREDITOR}
@@ -479,7 +479,8 @@ def defendant_line(row):
             line += f", остаток задолженности {format_money_kz(debt)} тг"
         return line
     # В шаблоне «по определению» номер «1.» — часть списка Word, в бланк он дописывается отдельно.
-    return (f"{fio}, ИИН {iin}{case_part}, "
+    # Номер дела не пишем — как в шаблоне (FIO, ИИН, сумма задолженности).
+    return (f"{fio}, ИИН {iin}, "
             f"сумма задолженности {format_money_kz(row['DebtRestWithoutStateDuty'])} тенге")
 
 
@@ -678,13 +679,21 @@ def make_documents(row):
     if KIND == "reshenie":
         replacements["{Judge}"] = normalize_text(row.get("Judge", ""))
         replacements["{Pechat}"] = ""
+    else:
+        # Шаблон «по определению» (06.11): должник отдельными полями.
+        replacements["{FIO}"] = normalize_text(row["FIO"])
+        replacements["{IIN}"] = normalize_text(row["IIN"])
+        replacements["{DebtRestWithoutStateDuty}"] = format_money_kz(row["DebtRestWithoutStateDuty"])
 
     fill_docx_ooxml(IL_TEMPLATE, docx_path, replacements, stamp_image=STAMP_IMAGE)
 
     # Контроль: в сформированном document.xml не должны остаться placeholders.
     with zipfile.ZipFile(docx_path, "r") as z:
         xml_text = z.read("word/document.xml").decode("utf-8", errors="ignore")
-    leftovers = [k for k in replacements if k in xml_text]
+    # Любые {Поле}, а не только известные ключи — чтобы новый шаблон с
+    # незнакомой переменной не ушёл в суд с сырым {Поле} в тексте.
+    plain = re.sub(r"<[^>]+>", "", xml_text)
+    leftovers = sorted(set(re.findall(r"\{[A-Za-z_]+\}", plain)))
     if leftovers:
         raise RuntimeError("В DOCX остались незаменённые placeholders: " + ", ".join(leftovers))
 
@@ -864,6 +873,7 @@ def api_request(method, path, network_retries=3, **kwargs):
 # ============================================================
 def _court_norm(v):
     s = normalize_text(v).casefold().replace("ё", "е")
+    s = re.sub(r"№\s*", "№", s)          # CRM: «суд № 2», справочник: «суд №2»
     return re.sub(r"\s+", " ", s).strip()
 
 

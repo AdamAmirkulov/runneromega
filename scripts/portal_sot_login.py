@@ -106,7 +106,7 @@ class PortalSotLogin:
         self.log = log
         self.dump_dir = dump_dir or os.getcwd()
         self.browser = browser
-        profile_key = "chrome_profile" if browser == "chrome" else "firefox_profile"
+        profile_key = "chrome_profile" if browser in ("chrome", "chrome_bat") else "firefox_profile"
         self.profile = cfg.get(profile_key)
         if not self.profile:
             raise RuntimeError(
@@ -145,12 +145,46 @@ class PortalSotLogin:
         opts.add_argument("--no-default-browser-check")
         return webdriver.Chrome(options=opts)
 
-    def init_driver(self):
+    def debug_port(self) -> int:
+        """Порт отладки Chrome компании (browser="chrome_bat"): cfg
+        chrome_debug_port или 9300+N. 9222+N занят старым podacha_iska_v2."""
+        if self.cfg.get("chrome_debug_port"):
+            return int(self.cfg["chrome_debug_port"])
+        try:
+            return 9300 + int(self.company_id)
+        except ValueError:
+            return 9399
+
+    def _init_chrome_bat(self):
+        """Обычный Chrome, запущенный bat-файлом (chrome_portal_sot.bat) с
+        --remote-debugging-port; Selenium к нему только подключается. Нет
+        --enable-automation → navigator.webdriver = false. Окно уже открыто
+        на этом порту — подключаемся к нему; quit() браузер не закрывает,
+        вход по ЭЦП переживает перезапуск скрипта."""
+        port = self.debug_port()
+        if not _port_open(port):
+            bat = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_portal_sot.bat")
+            self.log(f"Запускаю Chrome через {os.path.basename(bat)} (порт {port})")
+            subprocess.Popen(["cmd", "/c", bat, self.profile, str(port)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            deadline = time.time() + 30
+            while time.time() < deadline and not _port_open(port):
+                time.sleep(0.5)
+            if not _port_open(port):
+                raise RuntimeError(
+                    f"Chrome не открыл порт отладки {port}. Скорее всего профиль {self.profile} "
+                    f"уже открыт в обычном окне Chrome без порта — закройте это окно и запустите снова.")
+        opts = ChromeOptions()
+        opts.debugger_address = f"127.0.0.1:{port}"
+        return webdriver.Chrome(options=opts)
+
+    def init_driver(self, extra_prefs=None):
         # Постоянный профиль компании (не копия!), где уже нажато «Разрешить»
         # для portal-sot.kz → NCALayer и принят self-signed сертификат NCALayer.
         os.makedirs(self.profile, exist_ok=True)
-        if self.browser == "chrome":
-            drv = self._init_chrome()
+        if self.browser in ("chrome", "chrome_bat"):
+            drv = self._init_chrome_bat() if self.browser == "chrome_bat" else self._init_chrome()
             caps = drv.capabilities or {}
             self.log(f"Браузер: {caps.get('browserName')} {caps.get('browserVersion')}, профиль: {self.profile}")
             drv.set_page_load_timeout(120)
@@ -165,6 +199,8 @@ class PortalSotLogin:
         # странице связаться с NCALayer (127.0.0.1:13579) — отключаем запрос.
         opts.set_preference("network.lna.blocking", False)
         opts.set_preference("network.lna.enabled", False)
+        for k, v in (extra_prefs or {}).items():
+            opts.set_preference(k, v)
         try:
             drv = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opts)
         except Exception as e:

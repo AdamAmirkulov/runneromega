@@ -242,6 +242,14 @@ SCRIPTS: Dict[str, ScriptDef] = {
                 {"name": "company_id", "label": "Компания", "type": "select"},
                 {"name": "max_rows", "label": "Макс. сделок (пусто = все; для теста поставьте 1)", "type": "text"},
                 {"name": "no_sign", "label": "Без подписи (1 = только черновики в кабинете; пусто = подписать и отправить)", "type": "text"},
+                {
+                    "name": "excel_file",
+                    "label": "Список EID (необязательно): Excel, EID в первом столбце. "
+                             "Если загружен — подаются сделки из списка вместо отбора из БД",
+                    "type": "file",
+                    "accept": ".xlsx",
+                    "save_to": "uploads/portal_sot_il_opredelenie_eids.xlsx",
+                },
             ],
         ),
 

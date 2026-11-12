@@ -78,6 +78,81 @@ def is_waf_block(r) -> bool:
     return "json" not in ctype
 
 
+TRACE_DIR = Path(__file__).resolve().parent.parent / "data" / "portal_trace"
+
+
+def _mask_token(v) -> str:
+    """Токен в трассировке: хвост + exp, целиком не пишем."""
+    v = str(v or "")
+    bearer = v.lower().startswith("bearer ")
+    tok = v.split(" ", 1)[1] if bearer else v
+    if len(tok) < 40:
+        return v
+    exp = _jwt_exp(tok)
+    left = int(exp - time.time()) if exp else None
+    return f"{'Bearer ' if bearer else ''}...{tok[-10:]} (exp={exp:.0f}, осталось {left} с)"
+
+
+class _Tracer:
+    """Полная трассировка запросов к portal-sot.kz: одна JSON-строка на запрос
+    (заголовки и тело запроса, статус, заголовки и ПОЛНОЕ тело ответа, время,
+    транспорт, исключение) + события (refresh, вход по ЭЦП, смена транспорта...).
+    Файл: data/portal_trace/<компания>_<дата-время>.jsonl."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.n = 0
+
+    def event(self, kind, **data):
+        self.n += 1
+        rec = {"n": self.n, "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+               "t": round(time.time(), 3), "kind": kind, **data}
+        try:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _hdrs(h):
+        out = {}
+        try:
+            items = dict(h or {}).items()
+        except Exception:
+            return {}
+        for k, v in items:
+            out[str(k)] = _mask_token(v) if str(k).lower() == "authorization" else str(v)
+        return out
+
+    def request(self, transport, method, url, req_headers, kwargs, r=None, exc=None, elapsed=0.0):
+        body = kwargs.get("json", kwargs.get("data"))
+        if isinstance(body, dict) and "refreshToken" in body:
+            body = {**body, "refreshToken": _mask_token(body["refreshToken"])}
+        rec = {"transport": transport, "method": method, "url": url,
+               "req_headers": self._hdrs(req_headers), "req_body": body,
+               "elapsed_s": round(elapsed, 3)}
+        if r is not None:
+            try:
+                text = r.text or ""
+            except Exception as e:
+                text = f"<не прочитать тело: {e}>"
+            try:
+                cookies = {k: str(v) for k, v in dict(r.cookies).items()}
+            except Exception:
+                cookies = {}
+            rec.update({
+                "status": r.status_code, "reason": getattr(r, "reason", ""),
+                "resp_url": str(getattr(r, "url", "")),
+                "resp_headers": {str(k): str(v) for k, v in dict(r.headers).items()},
+                "resp_cookies": cookies,
+                "body_len": len(text), "body": text,
+            })
+        if exc is not None:
+            rec.update({"exc_type": type(exc).__name__, "exc": repr(exc)})
+        self.event("http", **rec)
+
+
 BLOCK_MESSAGE = ("portal-sot.kz ответил 403 от WAF — похоже на блокировку. Прогон остановлен, "
                  "чтобы не продлевать бан. Подождите несколько часов, прежде чем запускать снова.")
 
@@ -132,7 +207,7 @@ class PortalSotHttp:
             r = portal.get("/api/secure/gbdfl/v2/byIin/123456789012")
     """
 
-    def __init__(self, company_id: str, browser_login, log=print):
+    def __init__(self, company_id: str, browser_login, log=print, trace=False):
         self.company_id = str(company_id)
         self.browser_login = browser_login
         self.log = log
@@ -143,6 +218,24 @@ class PortalSotHttp:
         self._count = 0
         self._browser_logins = 0
         self._lock = _ProcessLock(LOCK_PATH, log)
+        self.tracer = None
+        if trace or os.environ.get("PORTAL_SOT_TRACE"):
+            self.tracer = _Tracer(TRACE_DIR / f"{self.company_id}_{time.strftime('%Y%m%d_%H%M%S')}.jsonl")
+            self.log(f"🧾 portal-sot.kz: полная трассировка запросов → {self.tracer.path}")
+
+    def trace(self, kind, **data):
+        if self.tracer:
+            self.tracer.event(kind, **data)
+
+    def _token_state(self):
+        now = time.time()
+        a = _jwt_exp(self.tokens.get("access_token", ""))
+        rt = _jwt_exp(self.tokens.get("refresh_token", ""))
+        return {"transport": self.transport,
+                "access_left_s": int(a - now) if a else None,
+                "refresh_left_s": int(rt - now) if rt else None,
+                "cookies": [c.get("name") for c in self.tokens.get("cookies") or []],
+                "user_agent": self.tokens.get("user_agent", "")}
 
     # ---------- жизненный цикл ----------
     def __enter__(self):
@@ -183,12 +276,14 @@ class PortalSotHttp:
         s.headers["Accept-Encoding"] = "gzip, deflate"
         return s
 
-    def _switch_transport(self) -> bool:
-        """403 от WAF: перейти на второй транспорт. False — переключаться некуда."""
+    def _switch_transport(self, reason="403 от WAF") -> bool:
+        """403 от WAF / обрыв соединения: перейти на второй транспорт.
+        False — переключаться некуда."""
         others = [t for t in TRANSPORTS if t != self.transport]
         if not others:
             return False
-        self.log(f"⚠ portal-sot.kz: 403 от WAF на {self.transport} — пробую {others[0]}")
+        self.log(f"⚠ portal-sot.kz: {reason} на {self.transport} — пробую {others[0]}")
+        self.trace("switch_transport", reason=reason, frm=self.transport, to=others[0])
         self.tokens["transport"] = others[0]
         self._save_tokens()
         if self.tokens.get("access_token"):
@@ -217,6 +312,7 @@ class PortalSotHttp:
 
     def _ensure_session(self):
         self.tokens = self._load_tokens()
+        self.trace("session_start", **self._token_state())
         now = time.time()
         if self.tokens.get("access_token") and _jwt_exp(self.tokens["access_token"]) > now + 60:
             self.log("✅ portal-sot.kz: сохранённый access_token ещё действует — браузер не нужен")
@@ -233,8 +329,8 @@ class PortalSotHttp:
         try:
             while True:
                 self._throttle()
-                r = self._new_http().post(
-                    PORTAL_SOT_BASE + "/api/public/auth/refresh",
+                rurl = PORTAL_SOT_BASE + "/api/public/auth/refresh"
+                rkw = dict(
                     json={"refreshToken": self.tokens.get("refresh_token", "")},
                     headers={
                         "Accept": "*/*", "Accept-Language": "ru",
@@ -243,6 +339,17 @@ class PortalSotHttp:
                     },
                     timeout=30,
                 )
+                t0 = time.time()
+                try:
+                    r = self._new_http().post(rurl, **rkw)
+                except Exception as e:
+                    if self.tracer:
+                        self.tracer.request(self.transport, "POST", rurl, rkw["headers"], rkw,
+                                            exc=e, elapsed=time.time() - t0)
+                    raise
+                if self.tracer:
+                    self.tracer.request(self.transport, "POST", rurl, rkw["headers"], rkw,
+                                        r=r, elapsed=time.time() - t0)
                 if is_waf_block(r) and not switched and self._switch_transport():
                     switched = True
                     continue
@@ -250,6 +357,7 @@ class PortalSotHttp:
             js = r.json()
         except Exception as e:
             self.log(f"⚠ portal-sot.kz refresh не удался: {e}")
+            self.trace("refresh_failed", exc=repr(e))
             return False
         data = js.get("data") or {}
         if js.get("status") != 0 or not data.get("access_token"):
@@ -269,6 +377,7 @@ class PortalSotHttp:
                 f"за этот запуск — прогон остановлен. Проверьте вход на портал вручную."
             )
         self._browser_logins += 1
+        self.trace("browser_login_start", reason=reason, n=self._browser_logins, **self._token_state())
         self.log(f"🔐 portal-sot.kz: {reason} — вход через браузер + ЭЦП (браузер закроется сразу после входа)")
         got = self.browser_login()
         if not got or not got.get("access_token"):
@@ -284,10 +393,12 @@ class PortalSotHttp:
             "saved_at": time.time(),
         }
         self._save_tokens()
+        self.trace("browser_login_done", **self._token_state())
 
     def renew(self, full=False):
         """Токен не принят (401 / пустой 200): сначала refresh, потом браузер.
         full=True — сразу вход по ЭЦП (refresh уже пробовали, и он не помог)."""
+        self.trace("renew", full=full, **self._token_state())
         if full:
             self._login_via_browser("токен после refresh всё равно не принят (401)")
         elif not self._refresh():
@@ -302,6 +413,7 @@ class PortalSotHttp:
         if self._count > 1 and self._count % LONG_PAUSE_EVERY == 0:
             pause = random.uniform(*LONG_PAUSE_SECONDS)
             self.log(f"☕ {self._count} запросов к portal-sot.kz — передышка {pause:.0f} с")
+            self.trace("long_pause", count=self._count, pause_s=round(pause, 1))
             time.sleep(pause)
         wait = self._last_request_at + random.uniform(*MIN_GAP_SECONDS) - time.time()
         if wait > 0:
@@ -318,6 +430,23 @@ class PortalSotHttp:
         return self.request("POST", url, **kwargs)
 
     def _send(self, method, url, kwargs):
+        t0 = time.time()
+        try:
+            r = self._send_raw(method, url, kwargs)
+        except Exception as e:
+            if self.tracer:
+                self.tracer.request(self.transport, method, url, getattr(self.session, "headers", {}),
+                                    kwargs, exc=e, elapsed=time.time() - t0)
+            raise
+        if self.tracer:
+            try:
+                hdrs = dict(r.request.headers)
+            except Exception:
+                hdrs = getattr(self.session, "headers", {})
+            self.tracer.request(self.transport, method, url, hdrs, kwargs, r=r, elapsed=time.time() - t0)
+        return r
+
+    def _send_raw(self, method, url, kwargs):
         """Один запрос текущей сессией. curl_cffi не принимает files= (как requests) —
         файлы и поля формы уходят через его multipart (CurlMime), собранный заново
         на каждую попытку."""
@@ -357,7 +486,16 @@ class PortalSotHttp:
         backoff = list(backoff)
         while True:
             self._throttle()
-            r = self._send(method, url, kwargs)
+            try:
+                r = self._send(method, url, kwargs)
+            except Exception as e:
+                # Сервер рвёт соединение одному транспорту (curl: (56) Connection
+                # closed abruptly у curl_cffi, 09.11 InvestWay) — как и на 403,
+                # один раз пробуем второй.
+                if not switched and "timeout" not in type(e).__name__.lower()                         and self._switch_transport(f"обрыв соединения ({type(e).__name__})"):
+                    switched = True
+                    continue
+                raise
 
             if r.status_code == 401:
                 if renew_stage == 0:
@@ -389,6 +527,7 @@ class PortalSotHttp:
                 if ra.isdigit():
                     wait = max(wait, int(ra))
                 self.log(f"⏸ portal-sot.kz ответил {r.status_code} — жду {wait} с")
+                self.trace("backoff", status=r.status_code, wait_s=wait)
                 time.sleep(wait)
                 continue
 

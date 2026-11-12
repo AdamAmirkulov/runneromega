@@ -90,6 +90,8 @@ data/portal_sot_tokens/
 
 # Отладочные дампы portal-sot.kz (cookies, подписанные XML, данные сертификата) и копии БД
 data/portal_debug/
+data/portal_trace/
+data/ui_probe/
 *.db.bak_*
 
 # Личные ЭЦП сотрудников (файлы .p12 и ключ шифрования паролей) — секреты

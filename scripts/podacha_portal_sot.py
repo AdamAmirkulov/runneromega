@@ -1623,10 +1623,11 @@ def run_one(row):
     second_pass_only = bool(is_ready and declaration_id and stage in REGISTRY_SECOND_PASS_PENDING)
 
     if is_ready and not second_pass_only:
-        log(f"ПРОПУСК №{unique_no}: уже {status} | declarationId={declaration_id or '-'} | "
-            f"номер документа={document_number or '-'}")
-        return {"declaration_id": declaration_id, "document_number": document_number,
-                "unique_no": unique_no, "skipped": True}
+        # Уже подготовленные сделки не пропускаем: создаём новый иск, старый
+        # черновик остаётся в кабинете как есть (запись в реестре перезапишется).
+        log(f"№{unique_no}: в реестре уже {status} (declarationId={declaration_id or '-'}, "
+            f"номер документа={document_number or '-'}) — создаю НОВЫЙ иск")
+        declaration_id, document_number = "", ""
 
     folder = find_case_folder(ctx["UNIQUE_NO"], ctx["FIO"], ctx["IIN"])
     files = classify_case_files(folder)
@@ -1916,7 +1917,7 @@ def main():
 
     log("=" * 80)
     log(f"ПОДГОТОВКА БЕЗ ПОДПИСИ. Строк к обработке: {len(rows)}. Начинаем с Excel №{rows[0]}")
-    log("Сделки из реестра со статусом READY_TO_SIGN повторно не создаются.")
+    log("Сделки из реестра со статусом READY_TO_SIGN создаются заново (новый иск).")
     log("Пауза 30–60 секунд между сделками. При неудаче строки после 3 попыток — стоп пачки.")
     log("=" * 80)
 

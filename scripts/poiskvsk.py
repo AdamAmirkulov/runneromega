@@ -2059,6 +2059,11 @@ def _portal_browser_login():
             cookies = driver.get_cookies()
         except Exception:
             cookies = []
+        try:
+            log4(f"   [вход] url={driver.current_url} | access claims={_portal_jwt_claims(access)} | "
+                 f"refresh={'есть' if refresh else 'НЕТ'} | cookies={[c.get('name') for c in cookies]} | ua={ua!r}")
+        except Exception:
+            pass
         return {"access_token": access, "refresh_token": refresh,
                 "cookies": cookies, "user_agent": ua}
     finally:
@@ -2364,6 +2369,16 @@ def _portal_build_address(result: dict) -> str:
     return ", ".join(parts)
 
 
+def _ptrace(session, kind, **data):
+    """Событие в трассировку portal-sot.kz (если она включена)."""
+    fn = getattr(session, "trace", None)
+    if fn:
+        try:
+            fn(kind, **data)
+        except Exception:
+            pass
+
+
 def _portal_fetch_by_iin(session, iin, retries=2):
     """Аналог fillPersonData() на portal-sot.kz — GET /api/secure/gbdfl/v2/byIin/{iin}.
     При 401 бросает RuntimeError('PORTAL_TOKEN_EXPIRED'); при стабильном пустом
@@ -2383,6 +2398,8 @@ def _portal_fetch_by_iin(session, iin, retries=2):
         except Exception as e:
             last_error = e
             empty_200_only = False
+            _ptrace(session, "gbdfl_exception", iin=iin, attempt=attempt,
+                    exc_type=type(e).__name__, exc=repr(e))
             log4(f"   ⚠ запрос ГБД ФЛ упал (попытка {attempt}/{retries}): "
                  f"{type(e).__name__}: {e}")
             time.sleep(min(1.5 * attempt, 5))
@@ -2391,6 +2408,11 @@ def _portal_fetch_by_iin(session, iin, retries=2):
         status = int(env.get("status", 0) or 0)
         body = env.get("body") or ""
         body_stripped = body.strip()
+        log4(f"   ГБД ФЛ: попытка {attempt}/{retries} → status={status} "
+             f"{env.get('statusText','')!r} bodyLen={env.get('bodyLen')}")
+        _ptrace(session, "gbdfl_response", iin=iin, attempt=attempt, status=status,
+                statusText=env.get("statusText", ""), bodyLen=env.get("bodyLen"),
+                respURL=env.get("respURL", ""))
 
         if status == 401:
             raise RuntimeError("PORTAL_TOKEN_EXPIRED")
@@ -2422,6 +2444,9 @@ def _portal_fetch_by_iin(session, iin, retries=2):
 
         result = js.get("result") or {}
         code = str((js.get("status") or {}).get("code") or "").strip()
+        _ptrace(session, "gbdfl_parsed", iin=iin, code=code, has_result=bool(result),
+                address=_portal_build_address(result) if result else "",
+                top_keys=list(js.keys()) if isinstance(js, dict) else None)
         if not result:
             log4(f"   ✗ ИИН не найден в ГБД ФЛ (status={status}, code={code})")
             return {"iin": iin, "sur": "", "name": "", "patr": "",
@@ -2470,7 +2495,9 @@ def parse_people_via_portal_sot():
     # сохранит свою (старую) копию поверх — и найденные адреса пропадут.
     # Браузер поднимается только если нет живого access/refresh токена,
     # и закрывается сразу после входа. Дальше — только HTTP.
-    portal = PortalSotHttp(company_id, _portal_browser_login, log=log4)
+    # ДИАГНОСТИКА: все запросы/ответы portal-sot.kz пишутся полностью в
+    # data/portal_trace/<компания>_<время>.jsonl (путь — в логе при старте).
+    portal = PortalSotHttp(company_id, _portal_browser_login, log=log4, trace=True)
     portal.__enter__()
     try:
         wb = load_workbook(INPUT_XLSX)
@@ -2503,6 +2530,7 @@ def parse_people_via_portal_sot():
 
             processed += 1
             log4(f"#{processed} (Excel row {r}) → ИИН: {src_iin}")
+            _ptrace(portal, "row_start", row=r, iin=src_iin, processed=processed)
             success = False
 
             for attempt in range(1, MAX_TOTAL_ATTEMPTS_PER_ROW + 1):
@@ -2526,10 +2554,13 @@ def parse_people_via_portal_sot():
 
                     log4(f"   ⚠ адрес не получен, попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW}")
 
-                except PortalBlocked:
+                except PortalBlocked as e:
+                    _ptrace(portal, "row_blocked", row=r, iin=src_iin, exc=repr(e))
                     raise
                 except RuntimeError as e:
                     msg = str(e)
+                    _ptrace(portal, "row_error", row=r, iin=src_iin, attempt=attempt,
+                            exc_type="RuntimeError", exc=msg)
                     if msg == "PORTAL_EMPTY_200":
                         if renewed_on_empty:
                             raise RuntimeError(
@@ -2547,8 +2578,13 @@ def parse_people_via_portal_sot():
                         log4(f"   ⚠ RuntimeError: {e} (попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW})")
 
                 except Exception as e:
+                    _ptrace(portal, "row_error", row=r, iin=src_iin, attempt=attempt,
+                            exc_type=type(e).__name__, exc=repr(e))
+                    logging.exception(f"row {r} ИИН {src_iin}: {type(e).__name__}")
                     log4(f"   ⚠ {type(e).__name__}: {e} (попытка {attempt}/{MAX_TOTAL_ATTEMPTS_PER_ROW})")
 
+            _ptrace(portal, "row_done", row=r, iin=src_iin, success=success,
+                    address=ws.cell(row=r, column=15).value if success else "")
             if success:
                 consecutive_fail = 0
             else:
@@ -2576,11 +2612,655 @@ def parse_people_via_portal_sot():
         except Exception:
             pass
 
+    _ptrace(portal, "run_end", processed=processed, failed=len(failed_rows), failed_rows=failed_rows)
+    if getattr(portal, "tracer", None):
+        log4(f"🧾 трассировка portal-sot.kz: {portal.tracer.path}")
     log4(f"=== END parse_people_via_portal_sot: processed={processed}, failed={len(failed_rows)} ===")
     return processed, failed_rows
 
 # ========= БЛОК 5: логика выбора суда =========
 ADDR_COL_NAME   = "Актуальный адрес с Судебного кабинета"
+# ========= БЛОК 4 (PORTAL-SOT.KZ, SELENIUM): адрес по ИИН через форму сайта =========
+# Как делает человек: Firefox → «Иск» (step=create) → «Добавить участника
+# процесса» → ввести ИИН → лупа → портал сам заполняет ФИО и «Место жительства».
+# Без своих HTTP-запросов к API: запрос к ГБД ФЛ шлёт сам сайт (SPA), поэтому
+# проблемы с токеном/Origin/WAF у requests нас не касаются.
+#
+# Адрес берём из ответа, который сайт получил на поиск (перехват XHR/fetch
+# /gbdfl/ на странице), а если перехват ничего не поймал — из поля «Место
+# жительства». Портал маскирует улицу/дом/кв. звёздочками
+# ("КАЗАХСТАН, АЛМАТЫ, БОСТАНДЫКСКИЙ, ***, ***, ***") — «***» и страну
+# выкидываем, для региона и суда (блоки 5–6) хватает области и района.
+#
+# После поиска поле ИИН становится readonly, а лупа пропадает — поэтому на
+# каждый ИИН окно закрывается и открывается заново. Черновик заявления не
+# создаётся: ничего не сохраняем, «Добавить»/«Следующий шаг» не нажимаем.
+# Откат на HTTP-вариант: в run() вызвать parse_people_via_portal_sot().
+
+_UI_WIZARD_URL = (
+    PORTAL_SOT_BASE +
+    "/cabinet/declarations/REQUEST_TYPE2?step=create&caseType=CIVIL&instanceType=FIRSTINSTANCE&uuid={uuid}"
+)
+# Как человек: шаг «Описание» → «Следующий шаг» — uuid черновика формы сайт
+# создаёт сам. С прямой ссылкой step=create и нашим случайным uuid (10.11)
+# окно участника открывалось, но лупа не слала запрос к ГБД ФЛ.
+_UI_DESCRIPTION_URL = (
+    PORTAL_SOT_BASE +
+    "/cabinet/declarations/REQUEST_TYPE2?step=description&caseType=CIVIL&instanceType=FIRSTINSTANCE"
+)
+_UI_ADD_PARTICIPANT_XP = "//button[normalize-space(.)='Добавить участника процесса']"
+_UI_DIALOG_XP = "//div[@role='dialog' and @data-state='open']"
+_UI_IIN_XP = _UI_DIALOG_XP + "//input[@name='iin']"
+_UI_SEARCH_BTN_XP = _UI_DIALOG_XP + "//input[@name='iin']/following-sibling::button"
+_UI_CLOSE_BTN_XP = _UI_DIALOG_XP + "//button[.//span[normalize-space(.)='Close']]"
+
+_UI_GAP_SECONDS = (2.0, 4.0)         # пауза между поисками
+_UI_LONG_PAUSE_EVERY = 40            # каждые N поисков — передышка
+_UI_LONG_PAUSE_SECONDS = (20, 40)
+_UI_RELOAD_EVERY = 100               # каждые N поисков — открыть форму заново
+_UI_SEARCH_TIMEOUT = 40              # ждать результат поиска, с
+_UI_DUMP_DIR = Path(__file__).resolve().parent.parent / "data" / "ui_probe"
+
+# Перехват ответов /gbdfl/ на странице (сайт ходит через axios = XHR; fetch —
+# на всякий случай). Ставится после каждой загрузки страницы.
+_UI_HOOK_JS = r"""
+if (!window.__gbdflHook) {
+  window.__gbdflHook = true;
+  window.__gbdfl = [];
+  const push = (u, st, body) => { try { window.__gbdfl.push({url: String(u), status: st, body: body || ''}); } catch (e) {} };
+  const oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (m, u) { this.__u = String(u || ''); return oo.apply(this, arguments); };
+  window.__xhrAll = [];
+  XMLHttpRequest.prototype.send = function () {
+    const rec = {url: this.__u, t: Date.now(), status: 'pending', len: null};
+    try { window.__xhrAll.push(rec); if (window.__xhrAll.length > 200) window.__xhrAll.shift(); } catch (e) {}
+    this.addEventListener('loadend', () => {
+      rec.status = this.status; rec.ms = Date.now() - rec.t;
+      try { rec.len = (this.responseText || '').length; rec.head = (this.responseText || '').slice(0, 300); } catch (e) {}
+    });
+    if ((this.__u || '').indexOf('/gbdfl/') >= 0) {
+      this.addEventListener('loadend', () => {
+        let b = '';
+        try { b = (this.responseType === '' || this.responseType === 'text') ? this.responseText : JSON.stringify(this.response); } catch (e) {}
+        push(this.__u, this.status, b);
+      });
+    }
+    return os.apply(this, arguments);
+  };
+  const of = window.fetch;
+  if (of) window.fetch = async function (...a) {
+    const r = await of.apply(this, a);
+    try {
+      const u = String((a[0] && a[0].url) || a[0]);
+      try { window.__xhrAll.push({url: u, t: Date.now(), status: r.status, fetch: true}); } catch (e) {}
+      if (u.indexOf('/gbdfl/') >= 0) r.clone().text().then(t => push(u, r.status, t)).catch(() => {});
+    } catch (e) {}
+    return r;
+  };
+}
+return true;
+"""
+
+
+def _ui_dump(driver, tag):
+    """Скрин + HTML страницы при сбое — чтобы понять, что изменилось на сайте."""
+    try:
+        _UI_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        stem = _UI_DUMP_DIR / f"poiskvsk_{tag}_{time.strftime('%Y%m%d_%H%M%S')}"
+        driver.save_screenshot(str(stem) + ".png")
+        with open(str(stem) + ".html", "w", encoding="utf-8") as fh:
+            fh.write(driver.page_source or "")
+        log4(f"   снимок страницы: {stem}.png / .html")
+    except Exception as e:
+        log4(f"   (снимок страницы не сохранился: {e})")
+
+
+def _ui_visible(driver, xpath):
+    for el in driver.find_elements(By.XPATH, xpath):
+        try:
+            if el.is_displayed():
+                return el
+        except Exception:
+            pass
+    return None
+
+
+def _ui_click(driver, el):
+    # Свёрнутое окно Chrome (visibilityState=hidden): обычный клик Selenium
+    # до страницы не доходит, JS-клик — доходит (12.11).
+    try:
+        hidden = driver.execute_script("return document.visibilityState") == "hidden"
+    except Exception:
+        hidden = False
+    if hidden:
+        driver.execute_script("arguments[0].click();", el)
+        return
+    try:
+        el.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", el)
+
+
+def _ui_open_wizard(driver):
+    """Открыть пустую форму «Иск» на шаге с «Добавить участника процесса»."""
+    import uuid as _uuid
+    driver.get(_UI_DESCRIPTION_URL)
+    direct_tried = False
+    nxt_clicks = 0
+    t0 = time.time()
+    end = t0 + 60
+    while time.time() < end:
+        # Шаг «Описание» не открылся (не та ссылка) — запасной путь: прямая ссылка.
+        if (not direct_tried and time.time() - t0 > 20
+                and not _ui_visible(driver, "//button[normalize-space(.)='Следующий шаг']")):
+            log4("   шаг «Описание» не открылся — открываю форму прямой ссылкой")
+            direct_tried = True
+            driver.get(_UI_WIZARD_URL.format(uuid=_uuid.uuid4()))
+        if "/cabinet" not in (driver.current_url or "").lower() or driver.find_elements(
+                By.XPATH, "//input[@type='password']"):
+            raise RuntimeError("PORTAL_UI_LOGGED_OUT")
+        if _ui_visible(driver, _UI_ADD_PARTICIPANT_XP):
+            break
+        # Открылся шаг «Описание» — один раз «Следующий шаг».
+        nxt = _ui_visible(driver, "//button[normalize-space(.)='Следующий шаг']")
+        if nxt and not _ui_visible(driver, _UI_ADD_PARTICIPANT_XP):
+            # Через раз — JS-клик: в фоновом окне Chrome (visibilityState=hidden)
+            # обычный клик Selenium до React не доходит (12.11 14:20).
+            nxt_clicks += 1
+            if nxt_clicks % 2:
+                _ui_click(driver, nxt)
+            else:
+                driver.execute_script("arguments[0].click();", nxt)
+        time.sleep(1)
+    else:
+        _ui_dump(driver, "no_add_button")
+        raise RuntimeError("На форме иска не найдена кнопка «Добавить участника процесса»")
+    log4(f"   форма иска: {driver.current_url}")
+    driver.execute_script(_UI_HOOK_JS)
+
+
+def _ui_close_dialog(driver):
+    if not _ui_visible(driver, _UI_DIALOG_XP):
+        return
+    btn = _ui_visible(driver, _UI_CLOSE_BTN_XP)
+    if btn:
+        _ui_click(driver, btn)
+    else:
+        from selenium.webdriver.common.keys import Keys
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+    try:
+        WebDriverWait(driver, 10).until(lambda d: not _ui_visible(d, _UI_DIALOG_XP))
+    except TimeoutException:
+        raise RuntimeError("Окно «Добавить участника процесса» не закрылось")
+
+
+def _ui_select(driver, label, option_text):
+    """Radix-select в окне: по подписи поля выбрать пункт (если уже выбран — ничего)."""
+    cb_xp = (_UI_DIALOG_XP + f"//label[starts-with(normalize-space(.),'{label}')]"
+             "/following-sibling::button[@role='combobox'][1]")
+    cb = _ui_visible(driver, cb_xp)
+    if not cb:
+        raise RuntimeError(f"В окне участника нет поля «{label}»")
+    if (cb.text or "").strip().lower() == option_text.lower():
+        return
+    _ui_click(driver, cb)
+    opt_xp = f"//*[@role='option'][normalize-space(.)='{option_text}']"
+    try:
+        opt = WebDriverWait(driver, 5).until(lambda d: _ui_visible(d, opt_xp))
+    except TimeoutException:
+        # Radix открывает список по клавише, если клик не сработал.
+        from selenium.webdriver.common.keys import Keys
+        cb.send_keys(Keys.SPACE)
+        opt = WebDriverWait(driver, 5).until(lambda d: _ui_visible(d, opt_xp))
+    _ui_click(driver, opt)
+    WebDriverWait(driver, 5).until(
+        lambda d: (d.find_element(By.XPATH, cb_xp).text or "").strip().lower() == option_text.lower())
+
+
+def _ui_first_step(driver):
+    """Тип лица = Физ лицо, Сторона процесса = ответчик, Резидент = Да → «Далее»."""
+    _ui_select(driver, "Тип лица", "Физ лицо")
+    _ui_select(driver, "Сторона процесса", "ответчик")
+    _ui_select(driver, "Резидент", "Да")
+    nxt = _ui_visible(driver, _UI_DIALOG_XP + "//button[@type='submit' and normalize-space(.)='Далее']")
+    if nxt:
+        _ui_click(driver, nxt)
+    WebDriverWait(driver, 10).until(lambda d: _ui_visible(d, _UI_IIN_XP))
+
+
+def _ui_open_dialog(driver):
+    """Открыть окно участника; вернуть пустое редактируемое поле ИИН."""
+    _ui_close_dialog(driver)
+    add = _ui_visible(driver, _UI_ADD_PARTICIPANT_XP)
+    if not add:
+        raise RuntimeError("PORTAL_UI_RELOAD")
+    _ui_click(driver, add)
+    end = time.time() + 15
+    while time.time() < end:
+        inp = _ui_visible(driver, _UI_IIN_XP)
+        if inp:
+            if inp.get_attribute("readonly") is not None:
+                # Окно открылось с прошлым результатом — форма не сбросилась.
+                raise RuntimeError("PORTAL_UI_RELOAD")
+            return inp
+        # Первый шаг окна: Тип лица / Сторона процесса / Резидент → «Далее».
+        if _ui_visible(driver, _UI_DIALOG_XP + "//button[@type='submit' and normalize-space(.)='Далее']"):
+            _ui_first_step(driver)
+            continue
+        time.sleep(0.5)
+    _ui_dump(driver, "no_iin_field")
+    raise RuntimeError("Не открылось окно с полем ИИН после «Добавить участника процесса»")
+
+
+def _ui_clean_address(addr: str) -> str:
+    """Выкинуть маску «***», null и страну в начале."""
+    parts = []
+    for p in str(addr or "").split(","):
+        s = p.strip()
+        # "***", "дом ***", "кв. ***", "null" — маска/пусто
+        if s.lower() == "null" or re.fullmatch(r"(?i)(?:дом|кв\.?)?[\s*]*", s):
+            continue
+        parts.append(s)
+    if parts and normalize_kz_text(parts[0]) == "казахстан":
+        parts = parts[1:]
+    return ", ".join(parts)
+
+
+def _ui_search_iin(driver, iin):
+    """Один поиск через форму. Возвращает dict как _portal_fetch_by_iin:
+    iin/sur/name/patr/live/raw/status_code. not_found=True — ИИН в ГБД ФЛ нет."""
+    inp = _ui_open_dialog(driver)
+    driver.execute_script("window.__gbdfl = [];")
+    _ui_click(driver, inp)
+    from selenium.webdriver.common.keys import Keys
+    inp.send_keys(Keys.CONTROL, "a")
+    inp.send_keys(Keys.BACKSPACE)
+    inp.send_keys(iin)
+    btn = _ui_visible(driver, _UI_SEARCH_BTN_XP)
+    if not btn:
+        _ui_dump(driver, "no_search_button")
+        raise RuntimeError("Нет кнопки поиска (лупа) рядом с полем ИИН")
+    t_click = driver.execute_script("return Date.now();")
+    _ui_click(driver, btn)
+
+    def requests_since():
+        try:
+            return driver.execute_script(
+                "return (window.__xhrAll||[]).filter(x=>x.t>=arguments[0]);", t_click) or []
+        except Exception:
+            return []
+
+    def page_messages():
+        try:
+            return driver.execute_script(
+                "return Array.from(document.querySelectorAll(\"[role=status],[role=alert],"
+                "[data-sonner-toast],.Toastify__toast,[aria-invalid=true]\"))"
+                ".map(e=>(e.innerText||e.getAttribute('name')||'').trim()).filter(Boolean).slice(0,10);") or []
+        except Exception:
+            return []
+
+    # Клик по лупе мог не дойти до React — если за 5 с запрос к ГБД ФЛ не ушёл,
+    # жмём ещё раз через JS. (Enter не жмём: он отправляет форму «Добавить».)
+    for fallback in ("js",):
+        t_wait = time.time() + 5
+        while time.time() < t_wait and not any("/gbdfl/" in (x.get("url") or "") for x in requests_since()):
+            time.sleep(0.3)
+        if any("/gbdfl/" in (x.get("url") or "") for x in requests_since()):
+            break
+        log4(f"   запрос к ГБД ФЛ после клика по лупе не ушёл — пробую {fallback}")
+        if fallback == "js":
+            b2 = _ui_visible(driver, _UI_SEARCH_BTN_XP)
+            if b2:
+                driver.execute_script("arguments[0].click();", b2)
+        else:
+            i2 = _ui_visible(driver, _UI_IIN_XP)
+            if i2 and i2.get_attribute("readonly") is None:
+                i2.send_keys(Keys.ENTER)
+
+    def fields(d):
+        return d.execute_script(
+            "const q=n=>{const e=document.querySelector(\"div[role='dialog'] input[name='\"+n+\"']\");"
+            "return e?e.value:null};"
+            "return {iin:q('iin'),sur:q('surname'),name:q('firstname'),patr:q('patronymic'),"
+            "addr:q('address'),ro:!!(document.querySelector(\"div[role='dialog'] input[name='iin']\")||{}).readOnly,"
+            "cap:(window.__gbdfl||[]).filter(x=>x.url.indexOf(arguments[0])>=0)};", iin)
+
+    st, end = None, time.time() + _UI_SEARCH_TIMEOUT
+    while time.time() < end:
+        st = fields(driver)
+        if st.get("sur") or st.get("addr"):
+            time.sleep(0.5)          # дать дописаться остальным полям
+            st = fields(driver)
+            break
+        if st.get("cap"):
+            break                    # ответ пришёл, но форма пустая — смотрим ответ
+        time.sleep(0.5)
+    else:
+        reqs = requests_since()
+        log4(f"   запросы сайта после клика ({len(reqs)}): " + "; ".join(
+            f"{x.get('url')} → {x.get('status')} ({x.get('ms')} мс, {x.get('len')} б)" for x in reqs[-10:]))
+        for x in reqs[-3:]:
+            if x.get("head"):
+                log4(f"      {x.get('url')}: {x.get('head')!r}")
+        msgs = page_messages()
+        if msgs:
+            log4(f"   сообщения на странице: {msgs}")
+        _ui_dump(driver, f"timeout_{iin}")
+        if not any("/gbdfl/" in (x.get("url") or "") for x in reqs):
+            raise RuntimeError("Поиск не запустился: сайт не отправил запрос к ГБД ФЛ")
+        raise RuntimeError(f"Портал не ответил на поиск за {_UI_SEARCH_TIMEOUT} с")
+
+    raw, code, status = {}, "", None
+    for c in reversed(st.get("cap") or []):
+        status = c.get("status")
+        try:
+            js = json.loads(c.get("body") or "")
+        except Exception:
+            continue
+        if isinstance(js, dict):
+            raw = js.get("result") or {}
+            code = str((js.get("status") or {}).get("code") or "").strip() if isinstance(js.get("status"), dict) else ""
+            break
+
+    if status == 401:
+        raise RuntimeError("PORTAL_UI_LOGGED_OUT")
+    if status not in (None, 200):
+        last = (st.get("cap") or [{}])[-1]
+        log4(f"   ГБД ФЛ ответил HTTP {status}: {(last.get('body') or '')[:300]!r}")
+
+    live = _ui_clean_address(_portal_build_address(raw)) if raw else ""
+    if not live:
+        live = _ui_clean_address(st.get("addr") or "")
+    found = bool(raw or st.get("sur") or st.get("addr"))
+    return {
+        "iin":  iin,
+        "sur":  (st.get("sur") or str(raw.get("lastName") or "")).strip(),
+        "name": (st.get("name") or str(raw.get("firstName") or "")).strip(),
+        "patr": (st.get("patr") or str(raw.get("patronymic") or "")).strip(),
+        "live": live,
+        "raw":  raw,
+        "status_code": code,
+        "http_status": status,
+        "not_found": not found and status == 200,
+    }
+
+
+# Режим «fetch» (POISKVSK_MODE=fetch, по умолчанию выключен): тот же GET /api/secure/gbdfl/v2/byIin/<ИИН>,
+# что шлёт лупа, но fetch() со страницы портала в Chrome, запущенном
+# chrome_portal_sot.bat. Токен берём из localStorage сайта. requests и Firefox
+# под Selenium получали пустые 200, обычный Chrome получает полный ответ
+# (проверено 12.11), и без формы на ИИН уходит ~0.5 с вместо ~5 с.
+# 12.11 в прогоне сайт банил /gbdfl/ на 4+ мин после ~5–10 запросов — вернулись на форму.
+# 12.11: запрос сразу за предыдущим (<1 с) → сайт на ~3–4 мин обрывает
+# соединения к /gbdfl/ (fetch: «Failed to fetch», статус 0), остальной сайт
+# работает. С паузой 2 с бана не было.
+_FETCH_GAP_SECONDS = (2.0, 4.0)
+_FETCH_BLOCK_WAIT = 240              # ждать снятия бана /gbdfl/, с
+# Лимит portal-sot.kz на ГБД ФЛ (прогон 12.11, форма и fetch одинаково):
+# ровно 10 удачных поисков, затем блок до ~10.3–10.8 мин от первого из них.
+_QUOTA_MAX = 10
+_QUOTA_WINDOW = 660                  # с, от первого поиска в окне
+
+_FETCH_GBDFL_JS = r"""
+var cb = arguments[arguments.length - 1], iin = arguments[0];
+var tok = null; try { tok = localStorage.getItem('access_token'); } catch (e) {}
+var h = {'Accept': 'application/json, text/plain, */*'};
+if (tok) h['Authorization'] = 'Bearer ' + tok;
+fetch('/api/secure/gbdfl/v2/byIin/' + encodeURIComponent(iin), {headers: h, credentials: 'include'})
+  .then(function (r) { return r.text().then(function (t) { cb({status: r.status, body: t, tok: !!tok}); }); })
+  .catch(function (e) { cb({status: -1, body: String(e), tok: !!tok}); });
+"""
+
+
+def _fetch_ensure_page(driver):
+    """fetch должен идти со страницы portal-sot.kz (тот же origin и куки)."""
+    try:
+        url = driver.current_url or ""
+    except Exception:
+        url = ""
+    if not url.startswith(PORTAL_SOT_BASE + "/cabinet"):
+        driver.get(PORTAL_SOT_BASE + "/cabinet")
+        time.sleep(2)
+    if "/login" in (driver.current_url or "") or not driver.execute_script(
+            "return localStorage.getItem('access_token');"):
+        raise RuntimeError("PORTAL_UI_LOGGED_OUT")
+
+
+def _fetch_search_iin(driver, iin):
+    """Один поиск через fetch. Формат ответа как у _ui_search_iin."""
+    driver.set_script_timeout(60)
+    res = driver.execute_async_script(_FETCH_GBDFL_JS, iin) or {}
+    status = int(res.get("status") or 0)
+    body = (res.get("body") or "").strip()
+    if status == 401 or (status == 200 and not body) or not res.get("tok"):
+        raise RuntimeError("PORTAL_UI_LOGGED_OUT")
+    if status == -1:
+        raise RuntimeError("PORTAL_GBDFL_BLOCKED")
+    if status != 200:
+        raise RuntimeError(f"ГБД ФЛ ответил HTTP {status}: {body[:200]!r}")
+    try:
+        js = json.loads(body)
+    except Exception:
+        raise RuntimeError(f"ГБД ФЛ вернул не JSON: {body[:200]!r}")
+    raw = (js.get("result") or {}) if isinstance(js, dict) else {}
+    st = js.get("status") if isinstance(js, dict) else None
+    code = str(st.get("code") or "").strip() if isinstance(st, dict) else ""
+    return {
+        "iin":  iin,
+        "sur":  str(raw.get("lastName") or "").strip(),
+        "name": str(raw.get("firstName") or "").strip(),
+        "patr": str(raw.get("patronymic") or "").strip(),
+        "live": _ui_clean_address(_portal_build_address(raw)) if raw else "",
+        "raw":  raw,
+        "status_code": code,
+        "http_status": status,
+        "not_found": not raw,
+    }
+
+
+def parse_people_via_portal_ui():
+    """Блок 4 через Selenium: ИИН из колонки D листа «Отмены» → поиск в форме
+    «Добавить участника процесса» на portal-sot.kz → адрес в колонку O, регион
+    в колонку P. Возвращает (processed, failed_rows)."""
+    import random
+    company_id = _PORTAL_COMPANY_ID
+    if not _portal_cfg:
+        raise RuntimeError(
+            f"Для компании {company_id} не настроен вход на portal-sot.kz "
+            f"(нет записи в PORTAL_SOT_BY_COMPANY в scripts/config.py)."
+        )
+
+    MAX_ATTEMPTS_PER_ROW = 3
+    MAX_CONSECUTIVE_FAIL = 5
+    MAX_RELOGINS = 3
+
+    log4("=== START parse_people_via_portal_ui (portal-sot.kz, форма в браузере) ===")
+    log4(f"Файл-источник: {INPUT_XLSX}")
+
+    # Общий лок с остальными скриптами portal-sot.kz; книгу читаем после него
+    # (см. комментарий в parse_people_via_portal_sot).
+    from portal_sot_http import portal_lock
+    lock = portal_lock(log4)
+    lock.acquire()
+    driver = None
+    wb = None
+    failed_rows, processed, searches, relogins = [], 0, 0, 0
+    try:
+        wb = load_workbook(INPUT_XLSX)
+        try:
+            ws = wb["Отмены"]
+        except KeyError:
+            ws = wb.active
+        if not str(ws.cell(row=1, column=15).value or "").strip():
+            ws.cell(row=1, column=15, value="Актуальный адрес с Судебного кабинета")
+        if not str(ws.cell(row=1, column=16).value or "").strip():
+            ws.cell(row=1, column=16, value="Регион с Судебного кабинета")
+
+        # Вход — общий PortalSotLogin (как подача/ИЛ): он переключает NCALayer
+        # на сертификат ЭТОЙ компании (ensure_ncalayer_cert) и сохраняет снимок
+        # страницы при сбое. Старая копия _portal_login этого не делает —
+        # компания 2 из-за этого не входила (11:29 10.11, нет перехода в кабинет).
+        from portal_sot_login import PortalSotLogin
+        # Браузер: по умолчанию обычный Chrome через chrome_portal_sot.bat
+        # (navigator.webdriver = false). Откат на Firefox под Selenium:
+        # переменная окружения POISKVSK_BROWSER=firefox.
+        ui_browser = (os.environ.get("POISKVSK_BROWSER") or "chrome_bat").strip().lower()
+        log4(f"   браузер для поиска: {ui_browser}")
+        login_helper = PortalSotLogin(company_id, _portal_cfg, log=log4,
+                                      dump_dir=str(_UI_DUMP_DIR), browser=ui_browser)
+        driver = login_helper.init_driver(extra_prefs={
+            "dom.webdriver.enabled": False,
+            "useAutomationExtension": False,
+        })
+        login_helper.login(driver)
+        try:
+            log4(f"   navigator.webdriver = {driver.execute_script('return navigator.webdriver')}")
+        except Exception:
+            pass
+        ui_mode = (os.environ.get("POISKVSK_MODE") or "form").strip().lower()
+        if ui_mode != "form" and not ui_browser.startswith("chrome"):
+            log4("   режим fetch работает только в Chrome — переключаюсь на форму")
+            ui_mode = "form"
+        log4(f"   режим поиска: {ui_mode}")
+        open_page = _fetch_ensure_page if ui_mode == "fetch" else _ui_open_wizard
+        search = _fetch_search_iin if ui_mode == "fetch" else _ui_search_iin
+        gap = _FETCH_GAP_SECONDS if ui_mode == "fetch" else _UI_GAP_SECONDS
+        open_page(driver)
+
+        def recover(reason):
+            """Открыть форму заново; если вылетели из кабинета — перевойти."""
+            try:
+                open_page(driver)
+            except RuntimeError as e:
+                if str(e) != "PORTAL_UI_LOGGED_OUT":
+                    raise
+                relogin(reason)
+
+        def relogin(reason):
+            nonlocal relogins
+            relogins += 1
+            if relogins > MAX_RELOGINS:
+                raise RuntimeError(f"portal-sot.kz: {relogins - 1} перевходов за запуск — останавливаюсь ({reason})")
+            log4(f"   🔐 {reason} — вход заново по ЭЦП")
+            login_helper.login(driver, force_fresh=True)
+            open_page(driver)
+
+        from collections import deque
+        quota_times = deque()        # время удачных поисков в текущем окне
+
+        def wait_quota(reason):
+            """Ждём, пока самый старый поиск из окна выйдет за _QUOTA_WINDOW."""
+            if not quota_times:
+                return
+            wait = quota_times[0] + _QUOTA_WINDOW - time.time()
+            if wait > 0:
+                _safe_save(wb, OUT_XLSX)
+                log4(f"   ⏳ {reason} — жду {wait / 60:.1f} мин (лимит сайта "
+                     f"{_QUOTA_MAX} поисков за ~10 мин), прогресс сохранён")
+                time.sleep(wait)
+            quota_times.clear()
+            recover("вылетели из кабинета")
+
+        consecutive_fail = 0
+        for r in range(2, ws.max_row + 1):
+            src_iin = _norm_iin(ws.cell(row=r, column=4).value)
+            if not src_iin or len(src_iin) != 12:
+                continue
+
+            processed += 1
+            log4(f"#{processed} (Excel row {r}) → ИИН: {src_iin}")
+            success = False
+
+            attempt, quota_waits = 0, 0
+            while attempt < MAX_ATTEMPTS_PER_ROW:
+                attempt += 1
+                while quota_times and time.time() - quota_times[0] >= _QUOTA_WINDOW:
+                    quota_times.popleft()
+                if len(quota_times) >= _QUOTA_MAX:
+                    wait_quota(f"{_QUOTA_MAX} поисков")
+                # темп как у человека
+                if searches:
+                    if searches % _UI_LONG_PAUSE_EVERY == 0:
+                        pause = random.uniform(*_UI_LONG_PAUSE_SECONDS)
+                        log4(f"☕ {searches} поисков — передышка {pause:.0f} с")
+                        time.sleep(pause)
+                    else:
+                        time.sleep(random.uniform(*gap))
+                    if searches % _UI_RELOAD_EVERY == 0:
+                        recover("вылетели из кабинета")
+                searches += 1
+                try:
+                    data = search(driver, src_iin)
+                    quota_times.append(time.time())
+                    live = data["live"]
+                    log4(f"   {'fetch' if ui_mode == 'fetch' else 'форма'}: ФИО='{data['sur']} {data['name']} {data['patr']}', "
+                         f"address='{live}' (ответ сайта: HTTP {data['http_status']})")
+                    if live:
+                        region = extract_region_from_address(live)
+                        ws.cell(row=r, column=15, value=live)
+                        ws.cell(row=r, column=16, value=region)
+                        log4(f"   → SAVE: row {r}, address='{live}', region='{region}'")
+                        success = True
+                        break
+                    if data["not_found"]:
+                        log4("   ✗ ИИН не найден в ГБД ФЛ")
+                        break
+                    log4(f"   ⚠ адрес не получен, попытка {attempt}/{MAX_ATTEMPTS_PER_ROW}")
+                except RuntimeError as e:
+                    msg = str(e)
+                    blocked = (msg == "PORTAL_GBDFL_BLOCKED"
+                               or msg.startswith("Поиск не запустился"))
+                    if blocked and quota_waits < 3:
+                        # Лимит сайта: ждём окно, попытку строки не тратим.
+                        quota_waits += 1
+                        attempt -= 1
+                        if not quota_times:      # блок с прошлого запуска
+                            quota_times.append(time.time())
+                        wait_quota("сайт не пускает к ГБД ФЛ")
+                    elif msg == "PORTAL_UI_LOGGED_OUT":
+                        relogin("сессия на портале закончилась")
+                    else:
+                        if msg == "PORTAL_UI_RELOAD":
+                            log4("   🔄 форма в странном состоянии — открываю заново")
+                        else:
+                            log4(f"   ⚠ {msg} (попытка {attempt}/{MAX_ATTEMPTS_PER_ROW})")
+                        recover("вылетели из кабинета")
+                except Exception as e:
+                    logging.exception(f"row {r} ИИН {src_iin}: {type(e).__name__}")
+                    log4(f"   ⚠ {type(e).__name__}: {e} (попытка {attempt}/{MAX_ATTEMPTS_PER_ROW})")
+                    recover("вылетели из кабинета")
+
+            if success:
+                consecutive_fail = 0
+            else:
+                failed_rows.append(r)
+                consecutive_fail += 1
+                if consecutive_fail >= MAX_CONSECUTIVE_FAIL:
+                    log_err(f"{consecutive_fail} строк подряд без адреса — портал не отвечает, "
+                            f"останавливаю обход (обработано {processed}).")
+                    break
+
+            if processed % AUTOSAVE_EVERY == 0:
+                _safe_save(wb, OUT_XLSX)
+
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        lock.release()
+        if wb is not None:
+            try:
+                _safe_save(wb, OUT_XLSX)
+            except Exception:
+                pass
+
+    log4(f"=== END parse_people_via_portal_ui: processed={processed}, failed={len(failed_rows)} ===")
+    return processed, failed_rows
+
+
+
 REGION_COL_NAME = "Регион с Судебного кабинета"
 COURT_COL_NAME  = "Судебный орган с Судебного кабинета"
 
@@ -3660,7 +4340,8 @@ def run(df_main):
     processed, failed_rows = 0, []
 
     try:
-        result = parse_people_via_portal_sot()
+        # Поиск через форму сайта в Firefox. Откат на HTTP API: parse_people_via_portal_sot()
+        result = parse_people_via_portal_ui()
         if result is not None:
             processed, failed_rows = result
     except Exception as e:
