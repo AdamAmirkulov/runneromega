@@ -4375,4 +4375,8 @@ def run(df_main):
 
 
 if __name__ == "__main__":
+    if not INPUT_XLSX or not os.path.isfile(INPUT_XLSX):
+        print("❌ Не загружен Excel-файл с должниками (поле «Excel файл»): "
+              "ИИН берутся из листа «Отмены» этого файла. Загрузите отчёт и запустите снова.")
+        sys.exit(1)
     run(None)
